@@ -20,14 +20,36 @@ STATE_VERSION = "itqan.agent_a_state/1.0"
 DocKind = Literal["pdf_text", "pdf_scanned", "image", "text", "unsupported"]
 
 
-class DocRecord(TypedDict, total=False):
+class DocPart(TypedDict, total=False):
+    """One input file. A document may be spread across several of them."""
+
     path: str
-    role: Literal["cv", "transcript"]
     kind: DocKind
     text: str
-    ocr_json_path: Optional[str]
-    mean_confidence: Optional[float]
     pages: int
+    mean_confidence: Optional[float]
+    blocks: list[dict[str, Any]]
+
+
+class DocRecord(TypedDict, total=False):
+    """A logical document — a CV or a transcript — assembled from its parts.
+
+    A candidate photographing a three-page CV produces three files, and they are
+    one document. ``parts`` keeps them individually addressable (each file has
+    its own type and OCR confidence) while ``text`` and ``blocks`` are the
+    concatenation every downstream node actually reads.
+
+    Part order is argument order, and it is load-bearing: it decides page order in
+    the reconstructed text, which is what the LLM sees.
+    """
+
+    role: Literal["cv", "transcript"]
+    parts: list[DocPart]
+    kind: DocKind                       # the dominant kind, for routing decisions
+    text: str                           # all parts joined, in order
+    ocr_json_path: Optional[str]
+    mean_confidence: Optional[float]    # block-weighted across parts
+    pages: int                          # summed across parts
     # Per-block OCR output, kept in state so gap detection can map a weakly
     # recognised region back to the field it produced.
     blocks: list[dict[str, Any]]
@@ -43,8 +65,10 @@ class Gap(TypedDict, total=False):
 
 class AgentState(TypedDict, total=False):
     # ---- inputs ----------------------------------------------------------
-    cv_path: str
-    transcript_path: Optional[str]
+    # Lists: a document may arrive as several files (one photo per page). Order
+    # is significant — it is the page order.
+    cv_paths: list[str]
+    transcript_paths: list[str]
     run_id: str
     output_dir: str
     interactive: bool          # False under --no-hitl: gaps are recorded, not asked

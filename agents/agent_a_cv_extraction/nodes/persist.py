@@ -73,21 +73,26 @@ def make_persist_node(config: Config):
             else None,
         }
 
+        # One entry per input file, not per document: a CV submitted as three
+        # photos should show all three, each with its own type and confidence, so
+        # a consumer can tell which page was the badly-lit one.
         documents: list[SourceDocument] = []
         for doc in (state.get("cv_doc"), state.get("transcript_doc")):
             if not doc:
                 continue
-            kind = doc.get("kind")
-            documents.append(
-                SourceDocument(
-                    path=doc.get("path", ""),
-                    kind=kind if kind in {"pdf_text", "pdf_scanned", "image", "text"} else "text",
-                    role=doc.get("role", "cv"),
-                    ocr_json_path=doc.get("ocr_json_path"),
-                    mean_confidence=doc.get("mean_confidence"),
-                    pages=doc.get("pages", 0),
+            role = doc.get("role", "cv")
+            for part in doc.get("parts") or []:
+                kind = part.get("kind")
+                documents.append(
+                    SourceDocument(
+                        path=part.get("path", ""),
+                        kind=kind if kind in {"pdf_text", "pdf_scanned", "image", "text"} else "text",
+                        role=role,
+                        ocr_json_path=doc.get("ocr_json_path"),
+                        mean_confidence=part.get("mean_confidence"),
+                        pages=part.get("pages", 0),
+                    )
                 )
-            )
 
         grounding = {
             path: FieldProvenance(

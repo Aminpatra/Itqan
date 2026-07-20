@@ -101,8 +101,23 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agent-a",
         description="Extract a structured, verified candidate profile from a CV and transcript.",
     )
-    parser.add_argument("--cv", required=True, help="Path to the CV (PDF or image)")
-    parser.add_argument("--transcript", help="Path to the transcript (PDF or image)")
+    parser.add_argument(
+        "--cv",
+        required=True,
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "CV file(s), PDF or image. Pass several for a multi-page document "
+            "photographed a page at a time — they are read in the order given, "
+            "so list them in page order."
+        ),
+    )
+    parser.add_argument(
+        "--transcript",
+        nargs="+",
+        metavar="PATH",
+        help="Transcript file(s), PDF or image. Several are joined in the order given.",
+    )
     parser.add_argument("--output-dir", help="Where run artifacts go (default: ./output)")
     parser.add_argument("--model", help="OpenAI chat model (default: gpt-4o-mini)")
     parser.add_argument(
@@ -126,12 +141,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    cv_path = Path(args.cv).expanduser()
-    if not cv_path.exists():
-        print(f"error: CV not found: {cv_path}", file=sys.stderr)
-        return 2
-    if args.transcript and not Path(args.transcript).expanduser().exists():
-        print(f"error: transcript not found: {args.transcript}", file=sys.stderr)
+    cv_paths = [Path(p).expanduser() for p in args.cv]
+    transcript_paths = [Path(p).expanduser() for p in (args.transcript or [])]
+
+    # Check every file up front. Failing on page three after OCR-ing pages one
+    # and two wastes real time on a scanned document.
+    missing = [p for p in cv_paths + transcript_paths if not p.exists()]
+    if missing:
+        for path in missing:
+            print(f"error: file not found: {path}", file=sys.stderr)
         return 2
 
     config = Config()
@@ -162,17 +180,23 @@ def main(argv: list[str] | None = None) -> int:
     graph_config = {"configurable": {"thread_id": run_id}}
 
     initial = {
-        "cv_path": str(cv_path),
-        "transcript_path": str(Path(args.transcript).expanduser()) if args.transcript else None,
+        "cv_paths": [str(p) for p in cv_paths],
+        "transcript_paths": [str(p) for p in transcript_paths],
         "run_id": run_id,
         "output_dir": str(output_dir),
         "interactive": not args.no_hitl,
         "review_rounds": 0,
     }
 
+    def _describe(paths: list[Path]) -> str:
+        names = ", ".join(p.name for p in paths)
+        return f"{names} ({len(paths)} files)" if len(paths) > 1 else names
+
     print("\n  Itqan | Agent A - CV extraction")
     print(f"  run {run_id}")
-    print(f"  cv: {cv_path.name}" + (f"   transcript: {Path(args.transcript).name}" if args.transcript else ""))
+    print(f"  cv: {_describe(cv_paths)}")
+    if transcript_paths:
+        print(f"  transcript: {_describe(transcript_paths)}")
 
     state = app.invoke(initial, config=graph_config)
 

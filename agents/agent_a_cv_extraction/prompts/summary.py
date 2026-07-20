@@ -46,8 +46,11 @@ RULES
   agent than a polished one with invented detail.
 - core_strengths must be drawn only from the accepted skills given. Do not pad the list
   to a target length.
-- Write in the third person. Use the candidate's name once, then pronouns. If pronouns
-  are not stated in the profile, use they/them.
+- Write in the third person. Use the candidate's name once, then pronouns.
+- PRONOUNS: use they/them unless the documents explicitly state otherwise. Never infer
+  pronouns from a name. A name does not tell you someone's gender, and guessing wrong
+  misgenders a real person in a way the neutral default never does. This applies no
+  matter how strongly a name reads as gendered to you.
 
 Below are examples of the expected output."""
 
@@ -63,11 +66,11 @@ accepted_skills: Python (high/project), PyTorch (high/project), SQL (medium/expe
   Power BI (high/experience), Arabic NLP (high/project)""",
         "output_summary": """headline: Computer Science graduate with applied NLP and data analytics experience
 profile: Sara Al-Balushi holds a BSc in Computer Science from Sultan Qaboos University
-  (2024) with a 3.71/4.0 GPA. Her work centres on Python-based data engineering and Arabic
-  NLP. During a 2023 internship at Omantel she built Power BI churn dashboards and automated
-  a monthly ETL pipeline, reducing manual preparation from two days to three hours. Her
-  ArabicNER project applied PyTorch and HuggingFace Transformers to named-entity recognition
-  on Arabic news text.
+  (2024) with a 3.71/4.0 GPA. Their work centres on Python-based data engineering and
+  Arabic NLP. During a 2023 internship at Omantel they built Power BI churn dashboards and
+  automated a monthly ETL pipeline, reducing manual preparation from two days to three
+  hours. Their ArabicNER project applied PyTorch and HuggingFace Transformers to
+  named-entity recognition on Arabic news text.
 core_strengths: ["Python data engineering", "Arabic NLP with PyTorch/Transformers",
   "BI reporting and ETL automation", "SQL and database fundamentals"]
 education_summary: BSc Computer Science, Sultan Qaboos University, 2020-2024, GPA 3.71/4.0.
@@ -114,9 +117,9 @@ accepted_skills: medication administration (high/experience), patient assessment
 low_confidence_fields: ["contact.phone"]""",
         "output_summary": """headline: Registered nurse with four years on a medical-surgical ward
 profile: Mariam Haddad holds a BSc in Nursing from the University of Jordan (2021, CGPA
-  3.15/4.0). She has worked as a Staff Nurse at Al-Bashir Hospital since 2021 on a
-  medical-surgical ward, where her responsibilities cover medication administration,
-  patient assessment and wound care. She holds a current BLS certification.
+  3.15/4.0). They have worked as a Staff Nurse at Al-Bashir Hospital since 2021 on a
+  medical-surgical ward, where their responsibilities cover medication administration,
+  patient assessment and wound care. They hold a current BLS certification.
 core_strengths: ["Medication administration", "Patient assessment", "Wound care",
   "Pharmacology", "BLS-certified"]
 education_summary: BSc Nursing, University of Jordan, 2017-2021, CGPA 3.15/4.0.

@@ -23,6 +23,19 @@ python main.py agent-a --cv cv.pdf --transcript transcript.pdf
 python main.py agent-a --cv cv.pdf --no-hitl
 ```
 
+**Multi-page documents.** A CV or transcript photographed a page at a time is several files but one
+document. Pass them all — they are read in the order given, so list them in page order (filenames are not
+sorted for you, because they are not reliably page-ordered):
+
+```bash
+python main.py agent-a --cv cv1.png cv2.png --transcript t1.png t2.png
+```
+
+Pages may mix types freely (`--cv page1.pdf page2.png`). Each file is classified, read and confidence-scored
+independently, then concatenated; every one of them appears separately in `source_documents` with its own
+OCR confidence, so you can tell which page was the badly-lit one. An unreadable page is skipped with a
+warning rather than failing the run — only losing *every* CV page is fatal.
+
 Try it with no API key and no documents at all:
 
 ```bash
@@ -33,8 +46,8 @@ python main.py agent-a --cv tests/fixtures/sample_cv.txt --fake-llm --no-hitl
 
 | Flag | Meaning |
 |---|---|
-| `--cv PATH` | **Required.** CV as PDF or image |
-| `--transcript PATH` | Optional transcript; supplies courses, grades and CGPA |
+| `--cv PATH...` | **Required.** CV as PDF or image. Accepts several files for a multi-page document, read in the order given |
+| `--transcript PATH...` | Optional transcript; supplies courses, grades and CGPA. Also accepts several files |
 | `--no-hitl` | Never prompt. Gaps are recorded in the output instead. For scripted runs |
 | `--fake-llm` | Canned offline LLM — no API key, no network |
 | `--model NAME` | OpenAI chat model (default `gpt-4o-mini`) |
@@ -171,9 +184,9 @@ Everything lands in `output/<run_id>/`:
 | File | Contents |
 |---|---|
 | `candidate_profile.json` | **The deliverable.** The envelope defined in `shared/contracts.py` |
-| `ocr_cv.json` | Raw OCR: every block with text, confidence and bbox, plus reconstructed text |
+| `ocr_cv.json` | Raw OCR: every block with text, confidence and bbox, plus reconstructed text. One file per document, covering every page of every part |
 | `ocr_transcript.json` | Same, for the transcript |
-| `cv_pages/`, `transcript_pages/` | PNGs rendered from scanned PDFs |
+| `cv_part00_pages/`, … | PNGs rendered from scanned PDFs, one directory per input file |
 
 The envelope:
 
@@ -271,7 +284,7 @@ profile = load_profile(path_from_agent_a)
 ## Testing
 
 ```bash
-python -m pytest tests/ -q            # 43 tests, no network, no API key, no Paddle
+python -m pytest tests/ -q            # 53 tests, no network, no API key, no Paddle
 ```
 
 The suite runs the entire graph — routing, reducers, the interrupt/resume cycle, envelope validation —

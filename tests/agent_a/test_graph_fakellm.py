@@ -35,8 +35,8 @@ def run(
     config = {"configurable": {"thread_id": f"test-{interactive}-{tmp_path.name}"}}
     state = app.invoke(
         {
-            "cv_path": str(FIXTURE),
-            "transcript_path": str(transcript) if transcript else None,
+            "cv_paths": [str(FIXTURE)],
+            "transcript_paths": [str(transcript)] if transcript else [],
             "run_id": "testrun",
             "output_dir": str(tmp_path),
             "interactive": interactive,
@@ -136,7 +136,7 @@ def test_empty_resume_would_hang_so_sentinel_is_required(tmp_path):
     config = {"configurable": {"thread_id": f"sentinel-{tmp_path.name}"}}
     state = app.invoke(
         {
-            "cv_path": str(FIXTURE),
+            "cv_paths": [str(FIXTURE)],
             "run_id": "sentinel",
             "output_dir": str(tmp_path),
             "interactive": True,
@@ -176,8 +176,8 @@ def test_transcript_is_optional_and_routing_skips_it(tmp_path):
     config = {"configurable": {"thread_id": f"no-transcript-{tmp_path.name}"}}
     app.invoke(
         {
-            "cv_path": str(FIXTURE),
-            "transcript_path": None,
+            "cv_paths": [str(FIXTURE)],
+            "transcript_paths": [],
             "run_id": "no-t",
             "output_dir": str(tmp_path),
             "interactive": False,

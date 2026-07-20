@@ -230,8 +230,8 @@ def test_curriculum_is_published_in_provenance(tmp_path):
     config = {"configurable": {"thread_id": f"curric-{tmp_path.name}"}}
     state = app.invoke(
         {
-            "cv_path": str(FIXTURE),
-            "transcript_path": str(TRANSCRIPT),
+            "cv_paths": [str(FIXTURE)],
+            "transcript_paths": [str(TRANSCRIPT)],
             "run_id": "curric",
             "output_dir": str(tmp_path),
             "interactive": False,
@@ -249,3 +249,24 @@ def test_curriculum_is_published_in_provenance(tmp_path):
     assert {"credential_name", "typical_skills"} <= set(researched[0])
     # The consumer must never see an unrecognised credential presented as researched.
     assert all(entry["typical_skills"] or entry["typical_concepts"] for entry in researched)
+
+
+def test_summary_examples_do_not_infer_gender_from_names():
+    """The prefix says use they/them when pronouns are unstated, but the gold
+    outputs originally said "Her work centres on..." for a female-reading name —
+    teaching the model exactly the inference the rule forbids. On a real run it
+    then called a candidate "she" from her name alone.
+    """
+    import re
+
+    from agents.agent_a_cv_extraction.prompts.summary import EXAMPLES, PREFIX
+
+    # Whitespace-insensitive: the rule is wrapped across lines in the prompt.
+    assert "never infer pronouns from a name" in re.sub(r"\s+", " ", PREFIX).casefold()
+    for example in EXAMPLES:
+        body = example["output_summary"]
+        for pronoun in (" She ", " she ", " Her ", " her ", " He ", " his "):
+            assert pronoun not in body, (
+                f"few-shot example uses {pronoun.strip()!r}, which teaches the model to "
+                "infer gender from a name"
+            )
