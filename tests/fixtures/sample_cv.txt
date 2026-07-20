@@ -1,0 +1,14 @@
+Sara Al-Balushi
+Muscat, Oman
+Email: sara.b@squ.edu.om
+
+EDUCATION
+BSc Computer Science, Sultan Qaboos University, 2020-2024
+GPA: 3.71 / 4.0
+
+PROJECTS
+ArabicNER - named entity recognition for Arabic news articles.
+Built with Python and PyTorch using HuggingFace Transformers.
+
+SKILLS
+Python, PyTorch, Teamwork

@@ -1,0 +1,16 @@
+# Secrets — the repo root resolves to the home directory, so this matters.
+.env
+.env.*
+!.env.example
+
+# Per-run artifacts
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/

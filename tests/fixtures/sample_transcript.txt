@@ -1,0 +1,14 @@
+SULTAN QABOOS UNIVERSITY
+Official Academic Transcript
+
+Student Name: Sara Al-Balushi
+Programme: BSc Computer Science
+Cumulative GPA: 3.71 / 4.00
+
+Code      Course Title                      Credits   Grade
+COMP2101  Data Structures                   3         A
+COMP3202  Machine Learning                  3         A-
+COMP3105  Database Systems                  3         B+
+COMP3410  Computer Networks                 3         A
+COMP4501  Natural Language Processing       3         A
+STAT2100  Probability and Statistics        3         B+
