@@ -110,14 +110,26 @@ Qaboos University … Skills: Python, PyTorch, SQL`:
 ### Curriculum research
 
 Before judging, the agent expands each course and certificate into what it typically teaches, so that
-credentials count as evidence instead of being ignored as bare titles. Without it, a candidate who had
-completed a database course and a machine-learning certification still had their SQL and scikit-learn
-scored as unevidenced claims — the evidence was in the transcript, it just needed unpacking.
+credentials count as evidence instead of being ignored as bare titles. Without it, a candidate's transcript
+contributed nothing to their skill ratings — the evidence was there, it just needed unpacking.
+
+The step is given **the candidate's claimed skills** and asked, per credential, which of *those specific
+skills* its normal syllabus covers. That direct question replaced an earlier design that emitted a generic
+syllabus and hoped its wording overlapped the candidate's. It usually didn't: a syllabus saying "data
+ingestion tools" and a CV saying "Apache Sqoop" describe the same thing and share no words, so real
+corroboration was missed. Matching is on meaning — product names against generic terms, components against
+the platform that teaches them, techniques against the subject assessed through them — which is why it works
+the same for a nurse's clinical skills or a lawyer's coursework as for an engineer's.
+
+Grades ride along where the transcript recorded one, passed through **verbatim and never interpreted in
+code**. Grading scales differ too much between countries and institutions — letters, 4.0, 5.0, ten-point,
+percentages, honours classes — for any threshold here to be right everywhere.
 
 This is the one stage where the model contributes knowledge from outside the documents, so it is fenced in:
 
 - **It cannot introduce a skill.** Curriculum only ever corroborates a skill the candidate already claimed.
-  If a syllabus covers something they did not claim, it is ignored.
+  The corroboration list is intersected in code with what was actually claimed, so a syllabus covering
+  something they never listed is dropped rather than added.
 - **Unrecognised credentials are discarded.** The model must declare when it does not know a credential —
   local hackathons, one-day events, club competitions — and those are dropped rather than passed on with a
   guessed syllabus. Attending an event is not evidence of a curriculum.
@@ -284,7 +296,7 @@ profile = load_profile(path_from_agent_a)
 ## Testing
 
 ```bash
-python -m pytest tests/ -q            # 53 tests, no network, no API key, no Paddle
+python -m pytest tests/ -q            # 58 tests, no network, no API key, no Paddle
 ```
 
 The suite runs the entire graph — routing, reducers, the interrupt/resume cycle, envelope validation —

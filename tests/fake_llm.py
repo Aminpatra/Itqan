@@ -105,6 +105,9 @@ class FakeStructuredLLM:
                         recognized=True,
                         typical_skills=["scikit-learn", "NumPy", "PyTorch"],
                         typical_concepts=["supervised learning", "gradient descent"],
+                        # "Teamwork" was never claimed as a skill in this fixture's
+                        # CV — the node must filter it out rather than pass it on.
+                        covers_claimed_skills=["PyTorch", "Teamwork"],
                     ),
                     CredentialCurriculum(
                         credential_name="Campus Coding Marathon 2024",
@@ -119,6 +122,7 @@ class FakeStructuredLLM:
                         recognized=True,
                         typical_skills=["Kubernetes"],
                         typical_concepts=["orchestration"],
+                        covers_claimed_skills=["Kubernetes"],
                     ),
                 ]
             )

@@ -270,3 +270,99 @@ def test_summary_examples_do_not_infer_gender_from_names():
                 f"few-shot example uses {pronoun.strip()!r}, which teaches the model to "
                 "infer gender from a name"
             )
+
+
+# ---------------------------------------------------------------------------
+# covers_claimed_skills — the field that makes transcript evidence land.
+#
+# Placeholder names throughout. What is under test is plumbing — filtering,
+# normalisation, pass-through — and that behaviour is identical whatever the
+# candidate studied. Real domain terms here would read as tuning for a field and
+# would test the model's knowledge rather than this code.
+# ---------------------------------------------------------------------------
+from agents.agent_a_cv_extraction.schemas import (  # noqa: E402
+    CredentialCurriculum,
+    CurriculumResearch,
+)
+
+
+def _research(covers, claimed, credential="Course One"):
+    llm = FakeStructuredLLM(
+        CurriculumResearch=CurriculumResearch(
+            credentials=[
+                CredentialCurriculum(
+                    credential_name=credential,
+                    credential_kind="course",
+                    recognized=True,
+                    typical_skills=["Topic One"],
+                    typical_concepts=["Concept One"],
+                    covers_claimed_skills=covers,
+                )
+            ]
+        )
+    )
+    node = make_research_curriculum_node(llm, Config())
+    return node(
+        {
+            "cv_extraction": {
+                "skills": [{"name": s} for s in claimed],
+                "courses": [{"title": credential}],
+            }
+        }
+    )
+
+
+def test_covered_skills_cannot_include_anything_unclaimed():
+    """The decisive field still cannot introduce a skill."""
+    result = _research(covers=["Skill Alpha", "Never Claimed"], claimed=["Skill Alpha"])
+    assert result["curriculum"][0]["covers_claimed_skills"] == ["Skill Alpha"]
+
+
+def test_covered_skills_are_normalised_to_the_candidates_wording():
+    """Downstream matching is by name, so casing drift would silently break it."""
+    result = _research(covers=["SKILL ALPHA"], claimed=["Skill Alpha"])
+    assert result["curriculum"][0]["covers_claimed_skills"] == ["Skill Alpha"]
+
+
+def test_grades_pass_through_uninterpreted():
+    """Grading scales differ by country and institution — letters, points out of
+    4 or 5, percentages, honours classes. Any threshold applied in code would be
+    wrong somewhere, so the grade is carried verbatim for the model to weigh."""
+    for grade in ["A", "3.8", "78%", "First", "1.3", "Pass"]:
+        found = collect_credentials(
+            {
+                "cv_extraction": {"skills": [{"name": "Skill Alpha"}]},
+                "transcript_extraction": {"courses": [{"title": "Course One", "grade": grade}]},
+            }
+        )
+        assert found[0]["grade_achieved"] == grade
+
+
+def test_evidence_context_states_corroboration_explicitly():
+    """The judge must not have to re-derive the match itself. Leaving it implicit
+    — a syllabus phrased one way, the claim phrased another — is what made
+    transcript evidence unreliable."""
+    context = build_evidence_context(
+        {"skills": [{"name": "Skill Alpha"}]},
+        {"courses": [{"title": "Course One", "grade": "A"}]},
+        [
+            {
+                "credential_name": "Course One",
+                "credential_kind": "course",
+                "typical_skills": ["A Differently Worded Topic"],
+                "typical_concepts": ["Concept One"],
+                "covers_claimed_skills": ["Skill Alpha"],
+                "grade_achieved": "A",
+            }
+        ],
+    )
+    assert "CORROBORATES THESE CLAIMED SKILLS: Skill Alpha" in context
+    assert "completed with grade A" in context
+
+
+def test_curriculum_research_is_told_what_was_claimed():
+    """Researching blind was the root cause: a generic syllabus was emitted, then
+    matched by luck against the candidate's wording."""
+    from agents.agent_a_cv_extraction.prompts import CURRICULUM_RESEARCH_PROMPT
+
+    assert "claimed_skills" in CURRICULUM_RESEARCH_PROMPT.input_variables

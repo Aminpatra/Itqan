@@ -57,21 +57,31 @@ def _priority(credential: dict[str, str], claimed: set[str]) -> int:
 
 
 def collect_credentials(state: AgentState) -> list[dict[str, str]]:
-    """Every named course and certificate available, de-duplicated."""
+    """Every named course and certificate available, de-duplicated.
+
+    Grades ride along where the transcript recorded one. They are passed through
+    verbatim and never interpreted here: grading scales differ wildly between
+    institutions and countries (letters, 4.0, 5.0, 10-point, percentages, UK
+    honours classes), so any threshold this code applied would be wrong
+    somewhere. The model sees the grade as written and weighs it in context.
+    """
     extraction = state.get("cv_extraction") or {}
     transcript = state.get("transcript_extraction") or {}
 
     credentials: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    def add(name: Any, kind: str) -> None:
+    def add(name: Any, kind: str, grade: Any = None) -> None:
         if not isinstance(name, str):
             return
         title = name.strip()
         if len(title) < MIN_TITLE_LEN or title.casefold() in seen:
             return
         seen.add(title.casefold())
-        credentials.append({"credential_name": title, "credential_kind": kind})
+        entry = {"credential_name": title, "credential_kind": kind}
+        if isinstance(grade, str) and grade.strip():
+            entry["grade_achieved"] = grade.strip()
+        credentials.append(entry)
 
     for cert in extraction.get("certifications") or []:
         if isinstance(cert, dict):
@@ -79,7 +89,7 @@ def collect_credentials(state: AgentState) -> list[dict[str, str]]:
 
     for course in list(extraction.get("courses") or []) + list(transcript.get("courses") or []):
         if isinstance(course, dict):
-            add(course.get("title"), "course")
+            add(course.get("title"), "course", course.get("grade"))
 
     # Words from the claimed skills, used to float likely corroborators to the top.
     claimed = {
@@ -103,14 +113,22 @@ def make_research_curriculum_node(llm: Any, config: Config):
         if not credentials:
             return {"curriculum": [], "trace": ["research_curriculum(none)"]}
 
+        claimed = [
+            s["name"]
+            for s in (state.get("cv_extraction") or {}).get("skills") or []
+            if isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"].strip()
+        ]
         # Nothing to corroborate means nothing to research.
-        if not (state.get("cv_extraction") or {}).get("skills"):
+        if not claimed:
             return {"curriculum": [], "trace": ["research_curriculum(no skills)"]}
 
         try:
             result = as_dict(
                 chain.invoke(
-                    {"credentials": json.dumps(credentials, indent=2, ensure_ascii=False)}
+                    {
+                        "credentials": json.dumps(credentials, indent=2, ensure_ascii=False),
+                        "claimed_skills": json.dumps(claimed, indent=2, ensure_ascii=False),
+                    }
                 )
             )
         except Exception as exc:
@@ -122,22 +140,41 @@ def make_research_curriculum_node(llm: Any, config: Config):
             }
 
         known_titles = {c["credential_name"].casefold() for c in credentials}
-        entries = [
-            entry
-            for entry in result.get("credentials", [])
+        claimed_by_key = {name.casefold(): name for name in claimed}
+        grade_by_title = {
+            c["credential_name"].casefold(): c.get("grade_achieved") for c in credentials
+        }
+
+        entries: list[dict[str, Any]] = []
+        for entry in result.get("credentials", []):
+            title_key = entry.get("credential_name", "").casefold()
             # Drop anything the model invented rather than was asked about, and
             # anything it admitted not knowing — an unrecognised credential
             # carries no curriculum and must not reach the judge as if it did.
-            if entry.get("credential_name", "").casefold() in known_titles
-            and entry.get("recognized")
-            and (entry.get("typical_skills") or entry.get("typical_concepts"))
-        ]
+            if title_key not in known_titles or not entry.get("recognized"):
+                continue
+            if not (entry.get("typical_skills") or entry.get("typical_concepts")):
+                continue
+
+            # The guardrail that keeps this stage unable to invent a skill:
+            # covers_claimed_skills is intersected with what was actually
+            # claimed, and normalised back to the candidate's own wording.
+            covered = []
+            for name in entry.get("covers_claimed_skills") or []:
+                canonical = claimed_by_key.get(str(name).casefold())
+                if canonical and canonical not in covered:
+                    covered.append(canonical)
+            entry["covers_claimed_skills"] = covered
+            entry["grade_achieved"] = grade_by_title.get(title_key)
+            entries.append(entry)
 
         unrecognised = len(credentials) - len(entries)
+        corroborated = {s for e in entries for s in e["covers_claimed_skills"]}
         return {
             "curriculum": entries,
             "trace": [
-                f"research_curriculum({len(entries)} known / {unrecognised} unknown)"
+                f"research_curriculum({len(entries)} known / {unrecognised} unknown, "
+                f"{len(corroborated)} claimed skill(s) covered)"
             ],
         }
 

@@ -24,10 +24,11 @@ no matching signal:
   flexibility, adaptability, work under pressure, Microsoft Word, Microsoft Office,
   "computer skills", "internet", "email", typing
 
-KEEP (keep = true) — skills that are specific and verifiable:
-  named technologies, languages, frameworks, tools (Python, PyTorch, Siemens TIA Portal)
-  named methods or domains (finite element analysis, Arabic NLP, IFRS reporting)
-  certifications and licensed competencies (CCNA, PMP, forklift licence)
+KEEP (keep = true) — skills that are specific and verifiable, in ANY profession:
+  named tools, technologies, instruments, equipment or software
+  named methods, procedures, techniques, assays or analyses
+  named standards, frameworks, regulations or bodies of practice
+  certifications, licences and registrations
   spoken languages (category "language")
 
 EVIDENCE CROSS-CHECK — set `evidence_type` from where the skill is actually corroborated
@@ -35,7 +36,7 @@ in EVIDENCE CONTEXT, and quote it in `evidence_quote`:
   "project"       - used in a named project
   "experience"    - used in a role's responsibilities
   "course"        - taught in a completed course, or in a certification's curriculum
-  "certification" - the certification itself IS the skill (e.g. claimed skill "CCNA")
+  "certification" - the claimed skill IS a certification the candidate holds
   "claim_only"    - appears only in a skills list, nothing corroborates it
 
 EVIDENCE PRECEDENCE — check the strongest source first, and stop there:
@@ -51,11 +52,18 @@ nothing there covers the skill.
 
 CURRICULUM ENTRIES are background about what a credential normally teaches. They are
 NOT statements from the candidate's documents. Use them like this:
-- A claimed skill that appears in the curriculum of a course or certification the
-  candidate completed IS corroborated. Set evidence_type = "course", set
-  `corroborating_credential` to that credential's name, and say so in the rationale.
-  Example: claimed "SQL" + curriculum of "Introduction to Database" lists SQL
-  -> keep, evidence_type "course", quality "medium".
+- A "CORROBORATES THESE CLAIMED SKILLS" line has already been checked for you. Every
+  skill it names IS corroborated by that credential, which the candidate completed.
+  Set evidence_type = "course", quality = "medium", and `corroborating_credential` to
+  that credential's name. Do this even when the skill's exact wording does not appear in
+  the "usually teaches" list — the semantic match was the point of that line, and
+  re-litigating it by looking for the literal string undoes the work.
+- A skill named there must NOT be left as claim_only/low. Completing a course that
+  teaches something is real evidence, and a transcript is the strongest documentary
+  evidence a student has. Ignoring it discards the main reason the transcript was asked
+  for at all.
+- Where a grade is shown, the candidate completed the course to that standard. Weigh it
+  as you would reading the transcript yourself; do not assume any particular scale.
 - Curriculum corroboration caps quality at "medium". Only a project, a job, or the
   certification being the skill itself can justify "high". Having studied a tool is
   real evidence, and it is weaker than having built something with it — preserve that
@@ -77,9 +85,15 @@ TWO REJECTION REASONS, AND ONLY TWO:
       "programming", "databases", "software", "engineering", "IT", "design".
 
 "Too vague" is a judgement about the WORDING OF THE NAME, never about whether
-evidence was found. A named language, product, standard or tool is never vague:
-MATLAB, Siemens TIA Portal, SCADA, AutoCAD, PyTorch, IFRS and CCNA are all
-specific, and all of them are KEEP even with no corroborating evidence at all.
+evidence was found.
+
+The test: could a recruiter search for this term and get meaningfully filtered
+results? A named product, tool, language, standard, procedure, statute or clinical
+technique passes and is never vague. A whole field or department name fails.
+Judge every profession by that same test — a clinical procedure, a named legal
+instrument, a laboratory assay, a teaching methodology and a machine-tool
+operation are all as specific as any software library, and are all KEEP even with
+no corroborating evidence at all.
 
 MISSING EVIDENCE IS NOT A REJECTION REASON. Many CVs list real skills without
 describing where they were used, and a skills section is often all a short CV has.

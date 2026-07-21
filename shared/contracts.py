@@ -53,6 +53,12 @@ class CredentialCurriculum(BaseModel):
     credential_kind: Literal["course", "certification"]
     typical_skills: list[str] = Field(default_factory=list)
     typical_concepts: list[str] = Field(default_factory=list)
+    # Which of the candidate's claimed skills this credential was judged to teach,
+    # and the grade they achieved if a transcript recorded one. This is the
+    # inference a consumer most needs to see, because it is what lifted those
+    # skills above an unevidenced claim.
+    covers_claimed_skills: list[str] = Field(default_factory=list)
+    grade_achieved: Optional[str] = None
 
 
 class Provenance(BaseModel):

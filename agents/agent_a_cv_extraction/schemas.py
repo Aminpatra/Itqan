@@ -132,6 +132,13 @@ class CredentialCurriculum(BaseModel):
     recognized: bool
     typical_skills: list[str] = Field(default_factory=list)
     typical_concepts: list[str] = Field(default_factory=list)
+    # The decisive field. Which of the skills the candidate ACTUALLY CLAIMED does
+    # this credential normally teach? Asking directly beats emitting a generic
+    # syllabus and hoping its vocabulary happens to match the candidate's wording
+    # — "Data ingestion tools" and "Apache Sqoop" are the same thing and share no
+    # words. Entries are validated against the claimed list, so this cannot
+    # introduce a skill.
+    covers_claimed_skills: list[str] = Field(default_factory=list)
 
 
 class CurriculumResearch(BaseModel):

@@ -66,16 +66,24 @@ def build_evidence_context(
     for entry in curriculum or []:
         if not isinstance(entry, dict):
             continue
-        skills = ", ".join(entry.get("typical_skills") or [])
-        concepts = ", ".join(entry.get("typical_concepts") or [])
         label = entry.get("credential_kind", "credential").upper()
-        lines.append(
-            f"CURRICULUM OF {label} \"{entry.get('credential_name')}\" "
-            f"(typical syllabus, not stated in the CV):"
-        )
-        if skills:
+        grade = entry.get("grade_achieved")
+        header = f"CURRICULUM OF {label} \"{entry.get('credential_name')}\""
+        if grade:
+            header += f" - completed with grade {grade}"
+        lines.append(header + " (typical syllabus, not stated in the CV):")
+
+        # Stated first and explicitly: this is the finding the judge acts on.
+        # Leaving it to infer a match between "Data ingestion tools" and a
+        # claimed "Apache Sqoop" is what made corroboration unreliable before.
+        covered = entry.get("covers_claimed_skills") or []
+        if covered:
+            lines.append(
+                "  CORROBORATES THESE CLAIMED SKILLS: " + ", ".join(covered)
+            )
+        if skills := ", ".join(entry.get("typical_skills") or []):
             lines.append(f"  usually teaches: {skills}")
-        if concepts:
+        if concepts := ", ".join(entry.get("typical_concepts") or []):
             lines.append(f"  concepts: {concepts}")
 
     return "\n".join(lines) if lines else "(no corroborating evidence found in the documents)"
