@@ -185,6 +185,50 @@ class FakeStructuredLLM:
                 ]
             )
 
+        # ---- Agent B ----
+        # Kept in the one fake, per the established convention. Imported lazily so
+        # Agent A's tests do not pull in Agent B's schema module.
+        if schema.__name__ == "JobExtraction":
+            from agents.agent_b_job_ingest.schemas import JobExtraction
+
+            title = getattr(payload, "text", "") if payload is not None else ""
+            body = str(payload)
+            # A minimal, honest extraction driven by what the posting says. The
+            # employer is echoed only when the fixture text contains a marker, so
+            # tests can exercise both the "employer named" and "no employer"
+            # legitimacy paths without a network call.
+            company = None
+            for marker in ("Baker Hughes", "Example Engineering Co", "Example Trading LLC"):
+                if marker.casefold() in body.casefold():
+                    company = marker
+                    break
+            intent = "seeking" if "looking for a job" in body.casefold() else "vacancy"
+            return JobExtraction(
+                sector="2",
+                company=company,
+                required_skills=["Python", "SQL"],
+                seniority_level=None,
+                location="Muscat" if "muscat" in body.casefold() else None,
+                country="OM" if "muscat" in body.casefold() or "oman" in body.casefold() else None,
+                listing_intent=intent,
+                poster_type="company" if company else "unknown",
+            )
+
+        if schema.__name__ == "LegitimacyVerdict":
+            from agents.agent_b_job_ingest.schemas import LegitimacyVerdict
+
+            body = str(payload)
+            # Quote a real span so verify_quote passes. Default to "not a scam":
+            # the adjudicator only sees the uncertain band, and the safe lean is
+            # legitimate. A test that needs a scam verdict overrides this schema.
+            quote = body.strip().split("\n")[0][:40] if body.strip() else "posting"
+            return LegitimacyVerdict(
+                is_scam=False,
+                evidence_quote=quote,
+                reasoning="No fee, deposit, or fraud indicator is present in the text.",
+                scam_confidence=0.1,
+            )
+
         if schema is CandidateSummary:
             return CandidateSummary(
                 headline="Computer Science graduate with applied NLP experience",

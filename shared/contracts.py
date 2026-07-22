@@ -1,10 +1,17 @@
 """The inter-agent contract.
 
-This is the ONLY thing a downstream agent should import from this project.
-Agent B reads ``CandidateProfile``; it must never reach into
-``agents.agent_a_cv_extraction.*``. That boundary is what lets Agent A be
-rewritten — or have its OCR stack swapped out entirely — without touching
-anything downstream.
+``CandidateProfile`` is Agent A's output and **Agent C's** input — Agent C does
+the matching, and is the only consumer that reads it. Agent B never touches it:
+Agent B ingests job postings and its outputs are the ``job_postings`` and
+``skill_demand_stats`` tables. Wiring Agent B to a candidate profile would be a
+category error, and it is written here explicitly because the earlier version of
+this docstring said "Agent B reads CandidateProfile" and would have led someone
+straight into it.
+
+No agent may reach into ``agents.agent_a_cv_extraction.*``. That boundary is
+what lets Agent A be rewritten — or have its OCR stack swapped out entirely —
+without touching anything downstream. Anything genuinely shared moves into
+``shared/`` first; ``shared/grounding.py`` is the precedent.
 
 ``provenance`` is the part that makes this genuinely useful to another agent:
 it can tell which facts came from OCR, which a human typed in, and which the

@@ -1,0 +1,33 @@
+<!--
+  Structurally faithful to a live Dubizzle jobs listing page, with synthetic
+  content. The details that matter and why:
+
+    * CSS classes are build hashes (c0b6be79, _948d9e0a) that change on every
+      frontend deploy, so nothing may select on them
+    * aria-label is the only stable hook: Title, Location, Creation date
+    * "Creation date" is RELATIVE ("2 days ago"), never an absolute timestamp
+    * one card has no /ad/ link at all (an inline promo) and must be skipped
+-->
+<main>
+  <article class="c0b6be79">
+    <div class="_948d9e0a"><span aria-label="Featured">Featured</span></div>
+    <a href="/en/ad/warehouse-supervisor-ID131290001.html" class="_02b46ab0">
+      <div class="f65fa7cc" aria-label="Title">Warehouse Supervisor</div>
+      <span class="be462f54">OMR 300 - OMR 450</span>
+      <span aria-label="Location">Sohar, Al Batinah</span>
+      <span aria-label="Creation date">2 days ago</span>
+    </a>
+  </article>
+
+  <article class="c0b6be79">
+    <a href="/en/ad/looking-for-job-as-draughtsman-ID131290002.html" class="_02b46ab0">
+      <div class="f65fa7cc" aria-label="Title">Looking for job as Draughtsman</div>
+      <span aria-label="Location">Al Khoud, Muscat</span>
+      <span aria-label="Creation date">14 hours ago</span>
+    </a>
+  </article>
+
+  <article class="c0b6be79">
+    <div class="promo">Download the app</div>
+  </article>
+</main>

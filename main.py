@@ -31,6 +31,10 @@ AGENTS = {
         "agents.agent_a_cv_extraction.cli",
         "Extract a verified candidate profile from a CV and transcript",
     ),
+    "agent-b": (
+        "agents.agent_b_job_ingest.cli",
+        "Ingest public job postings into the job-demand tables (12h cycle)",
+    ),
 }
 
 

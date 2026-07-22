@@ -16,7 +16,7 @@ from typing import Any
 from shared.config import Config
 from shared.llm import as_dict, structured
 
-from ..grounding import compact_nulls
+from shared.grounding import compact_nulls
 from ..prompts import SUMMARY_PROMPT
 from ..schemas import CandidateSummary
 from ..state import AgentState

@@ -1,9 +1,16 @@
 # Itqan
 
-A LangGraph agent that turns a candidate's **CV** (required) and **transcript** (optional) — PDF or image —
-into a verified, provenance-tagged JSON profile for a downstream agent to consume.
+Two independent LangGraph agents that share nothing but `shared/`:
 
-Built with LangChain + LangGraph, PaddleOCR for scanned documents, and OpenAI for extraction.
+- **Agent A** turns a candidate's **CV** (required) and **transcript** (optional) — PDF or image —
+  into a verified, provenance-tagged JSON profile.
+- **Agent B** ingests **public job postings** every 12 hours into two Postgres tables — a searchable
+  posting store and an aggregated skill-demand table — filtering scams and never fabricating a count.
+
+A future Agent C reads both. Built with LangChain + LangGraph, PaddleOCR for scanned documents,
+OpenAI for extraction and embeddings, and Postgres + pgvector for Agent B's store.
+
+Agent A is documented first; **[Agent B has its own section below](#agent-b--scheduled-job-ingestion).**
 
 ---
 
@@ -260,35 +267,169 @@ for skill in profile.skills["accepted"]:
 
 ---
 
+## Agent B — scheduled job ingestion
+
+A second, fully independent agent. Every 12 hours it ingests **public, logged-out** job postings,
+filters out scams, extracts structured skills, deduplicates, and maintains an aggregated
+skill-demand table. Its only outputs are two Postgres tables that Agent C (not built) will read —
+it never calls Agent A or any user-facing code.
+
+### Setup
+
+Agent B needs Postgres with the **pgvector** extension. A local container is enough:
+
+```bash
+docker run -d --name itqan-pg -p 5432:5432 \
+  -e POSTGRES_PASSWORD=itqan_dev -e POSTGRES_DB=itqan \
+  -v itqan_pgdata:/var/lib/postgresql/data pgvector/pgvector:pg16
+
+# in .env:
+ITQAN_DATABASE_URL=postgresql://postgres:itqan_dev@localhost:5432/itqan
+ITQAN_USER_AGENT=ItqanJobBot/0.1 (+you@example.com)   # a real contact; sent on every request
+```
+
+The user agent is **required before any live run** — a scraper that does not identify itself gives
+a site operator no way to reach you, so the code refuses to start with the placeholder.
+
+```bash
+python main.py agent-b --migrate          # create/upgrade the schema (idempotent)
+python main.py agent-b --check            # connectivity, schema, row counts
+python main.py agent-b --dry-run --sources el7far --limit 5   # fetch + score, write nothing
+python main.py agent-b --once             # one real cycle
+python main.py agent-b --once --fake-llm  # a full cycle with no API key and no spend
+```
+
+### The cycle
+
+```
+plan_sources  choose which sources run (config-validated)
+  -> Send(scrape)   ONE concurrent branch per source — fetch and parse only, no DB
+  -> ingest         change-detect -> legitimacy gate -> extract -> link-dedup -> embed
+                    -> near-dup -> upsert, per source batch, each in its own transaction
+  -> staleness      age by CYCLES not clock; stale at 3 missed, hard-delete at 60 days
+  -> aggregate      recompute skill_demand_stats for the current window
+  -> runlog         record per-source health, write output/<run_id>/ingest_cycle.json
+```
+
+The ordering exists to make a warm cycle cheap: an **unchanged** posting costs one `UPDATE` and no
+LLM or embedding; a **rejected** one costs no extraction and no embedding; a Telegram repost that
+**links** to its blog original is resolved by URL and never embedded. Run the same cycle twice and
+the second does zero LLM and zero embedding work.
+
+### Not fabricating the numbers
+
+The demand table is a claim about the labour market someone may plan a career around, so the whole
+agent is built so a number is never invented:
+
+- **Legitimacy is deterministic first.** Rules (bilingual Arabic/English) score each posting with
+  **noisy-OR**, not a sum — five weak signals reach 0.67, not certainty. Only the genuinely
+  uncertain band (0.40–0.70 risk) costs an LLM call, and that call must quote verbatim text which is
+  re-checked in Python; a fabricated quote is discarded and the rule score stands. Rejected postings
+  are kept for audit, never deleted, and excluded from every statistic.
+- **Country is not a scam signal.** A regional feed legitimately carries postings for neighbouring
+  countries; scoring "not Oman" as fraud would silently delete real jobs. Scope is a *separate* axis,
+  filtered only at aggregation.
+- **Only real vacancies aggregate.** A classifieds site is full of job *seekers* advertising
+  themselves — counting those measures supply and reports it as demand. A posting contributes to
+  `skill_demand_stats` only if it is `active`, not a duplicate, in scope, `listing_intent='vacancy'`
+  **and** `poster_type='company'`. Everything else is stored and retrievable, just not counted.
+- **Trends are conservative.** Below 5 postings a skill's trend is pinned to `stable`, because 1→2 is
+  +100% noise, not a rising trend, and a sector with fewer than 10 postings flags `low_confidence` on
+  every row.
+- **A blocked source never ages its inventory.** A partial fetch (a 429 mid-cycle) still ingests what
+  it got, but its un-fetched postings are left alone rather than aged toward deletion.
+
+### The two tables (the Agent C contract)
+
+`job_postings` (retrievable postings, with a 1536-d embedding) and `skill_demand_stats` (aggregated
+fallback). Everything else — `source_health`, `schema_migrations` — is internal bookkeeping, not part
+of the contract. **Agent C must filter `skill_demand_stats` to the latest window**
+(`WHERE window_end = (SELECT max(window_end) …)`); a sector absent from that window has no current
+demand data, which is a normal state, not an error.
+
+### Sources
+
+`oman.el7far.com` (a Blogger Atom feed) and `@omanjob1` (a Telegram channel, read via its public
+`t.me/s/` preview) are live. A Telegram channel stays disabled until a human sets `terms_reviewed=True`
+for it in `sources/config.py` — confirming a channel renders is not the same as having reviewed its
+terms. Dubizzle (`html_scrape`) is built but shipped disabled: it exposes no poster identity, so
+nothing it produces can be classified `company` and therefore nothing it produces can aggregate yet.
+
+### Scheduling (Windows Task Scheduler)
+
+`--once` is crash- and reboot-safe and reports failure through its exit code (non-zero on a partial
+fetch), so a scheduler running `--once` beats the in-process `--loop` (demos only). An advisory lock
+means a second cycle that overlaps the first exits cleanly rather than double-counting.
+
+```powershell
+# every 12 hours; adjust the path and python
+schtasks /create /tn "ItqanAgentB" /sc hourly /mo 12 ^
+  /tr "cmd /c cd /d C:\path\to\Itqan && python main.py agent-b --once >> output\cron.log 2>&1"
+```
+
+Remember `docker start itqan-pg` after a reboot — the container does not auto-start.
+
+### Operator commands
+
+| Flag | Meaning |
+|---|---|
+| `--dry-run` | Fetch, parse and score; write nothing. For vetting a source before trusting it |
+| `--fake-llm` | Run a real cycle with offline doubles — no API key, no spend |
+| `--no-embed` | Skip embedding (disables similarity-based near-dup; link dedup still runs) |
+| `--sources A,B` | Run only these sources |
+| `--limit N` | Cap postings per source |
+| `--label-sample N` | Export N ingested postings (gitignored) for a human to label, to measure the reject filter's precision — the one number the rules cannot self-report |
+| `--purge-source S` | Delete a decommissioned source's postings. Never automatic |
+
+---
+
 ## Layout
 
 ```
 Itqan/
   main.py                    dispatcher: `python main.py <agent> ...`
-  shared/                    cross-agent: config, LLM factory, contract, artifacts
+  shared/                    cross-agent: config, LLM + embedding factories, contract, grounding
     contracts.py             <- the inter-agent interface
   agents/
     agent_a_cv_extraction/
-      graph.py  state.py  schemas.py  grounding.py  cli.py
+      graph.py  state.py  schemas.py  cli.py
       prompts/   extraction, verification, curriculum, skills, human_validation, summary
       ingestion/ detect, pdf_text, ocr
       nodes/     one module per graph node
+    agent_b_job_ingest/
+      graph.py  state.py  nodes.py  runner.py  cli.py
+      pipeline.py            the ingest tail: dedup -> legitimacy -> extract -> embed -> neardup -> upsert
+      legitimacy.py  aggregate.py  hashing.py  schemas.py  records.py
+      prompts/   extraction, legitimacy
+      sources/   base, http, robots, config, factory, el7far, telegram, dubizzle
+      db/        store.py (all SQL), migrate.py, migrations/*.sql
   tests/
 ```
 
-### Adding Agent B
+### Adding an agent
 
-1. Create `agents/agent_b_job_match/` with a `cli.py` exposing `main(argv)`.
-2. Import `shared.contracts` and `shared.llm`. **Never import `agents.agent_a_cv_extraction.*`** — the
-   envelope JSON is the only interface between agents, which is what lets Agent A be rewritten (or have its
-   OCR stack swapped) without touching anything downstream.
-3. Register it in `AGENTS` in `main.py`.
+1. Create `agents/<agent_name>/` with a `cli.py` exposing `main(argv) -> int`.
+2. Import from `shared/` only. **Never import `agents.agent_a_cv_extraction.*`** — that boundary is what
+   lets Agent A be rewritten (or have its OCR stack swapped) without touching anything downstream. If you
+   need something that currently lives inside an agent, move it into `shared/` first;
+   `shared/grounding.py` is the precedent.
+3. Register it in `AGENTS` in `main.py` — one dict entry, no base class or plugin protocol.
+
+The agents in play:
+
+| Agent | Reads | Writes |
+|---|---|---|
+| **A** — `agent_a_cv_extraction` | CV + transcript files | `candidate_profile.json` |
+| **B** — `agent_b_job_ingest` | Public job sources (feed, Telegram, HTML) | `job_postings`, `skill_demand_stats` (Postgres) |
+| **C** — matching *(not built)* | Agent A's profile **and** Agent B's tables | — |
+
+Agent B does **not** read `CandidateProfile`; that is Agent C's job. Agent B and Agent A share nothing but
+`shared/`, and neither knows the other exists.
 
 ```python
-from shared.contracts import load_profile
+from shared.contracts import load_profile   # Agent C
+from shared.embeddings import build_embedder
 from shared.llm import build_llm
-
-profile = load_profile(path_from_agent_a)
 ```
 
 ---
@@ -296,13 +437,28 @@ profile = load_profile(path_from_agent_a)
 ## Testing
 
 ```bash
-python -m pytest tests/ -q            # 58 tests, no network, no API key, no Paddle
+python -m pytest tests/ -q            # ~290 tests, no network, no API key, no Paddle, no Postgres
 ```
 
-The suite runs the entire graph — routing, reducers, the interrupt/resume cycle, envelope validation —
-against a canned LLM, then attacks the grounding matcher with deliberately hallucinated extractions.
+The suite runs Agent A's entire graph — routing, reducers, the interrupt/resume cycle, envelope
+validation — against a canned LLM, attacks the grounding matcher with deliberately hallucinated
+extractions, and exercises Agent B's adapters (against saved fixtures), legitimacy rules, and the
+whole ingest pipeline (against an in-memory store). Nothing hits a live site or a database.
 
-To check OCR in isolation before trusting it inside the graph:
+Agent B's SQL — the FK-ordered upsert, the pgvector cosine search, and above all the aggregation
+query whose counts are the fabrication-prone core — can only be verified against real Postgres, so
+those tests are opt-in and skip cleanly when no database is configured:
+
+```bash
+docker exec itqan-pg psql -U postgres -c "CREATE DATABASE itqan_test;"
+ITQAN_TEST_DATABASE_URL=postgresql://postgres:itqan_dev@localhost:5432/itqan_test \
+  python -m pytest tests/ -q          # ~365 tests including the database suite
+```
+
+The database tests use a **separate** database from `ITQAN_DATABASE_URL` — they truncate between
+cases, and pointing them at the working database would destroy real ingested postings.
+
+To check OCR in isolation before trusting it inside Agent A's graph:
 
 ```bash
 python -m agents.agent_a_cv_extraction.ingestion.ocr some_image.png

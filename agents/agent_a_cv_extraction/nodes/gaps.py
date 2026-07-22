@@ -13,7 +13,7 @@ from typing import Any
 
 from shared.config import Config
 
-from ..grounding import normalize
+from shared.grounding import normalize
 from ..state import AgentState, Gap
 
 # field_path -> (human label, hint shown at the prompt)

@@ -18,7 +18,7 @@ from typing import Any
 from shared.config import Config
 from shared.llm import as_dict, structured
 
-from ..grounding import ground_extraction, prune_field, verify_quote
+from shared.grounding import ground_extraction, prune_field, verify_quote
 from ..prompts import GROUNDING_ADJUDICATION_PROMPT
 from ..schemas import GroundingReport
 from ..state import AgentState

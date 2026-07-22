@@ -6,6 +6,12 @@
 # Per-run artifacts
 output/
 
+# Legitimacy labels — real ingested postings a human labelled to measure filter
+# precision. Never commit: a realistic scam posting in the repo is a working
+# template. Covered by output/ above, repeated here so a relocated output dir
+# cannot leak it.
+**/legitimacy_labels*.jsonl
+
 # Python
 __pycache__/
 *.py[cod]

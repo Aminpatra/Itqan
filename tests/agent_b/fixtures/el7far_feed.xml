@@ -1,0 +1,64 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+  Structurally faithful to the live Blogger Atom feed (element names, namespaces,
+  link rels, date format), with synthetic content. Written by hand rather than
+  saved from the wire so the fixture stays small and carries no third-party post
+  text, while still reproducing the two shapes that have bitten this adapter:
+
+    * <author><name> is a PERSON (the blogger), never the employer
+    * several <link> elements are type="text/html"; only rel="alternate" is the post
+-->
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:openSearch="http://a9.com/-/spec/opensearchrss/1.0/"
+      xmlns:thr="http://purl.org/syndication/thread/1.0">
+  <id>tag:blogger.com,1999:blog-1111111111111111111</id>
+  <updated>2026-07-21T10:18:24.984+03:00</updated>
+  <title type="text">Example Jobs Blog</title>
+  <openSearch:totalResults>56493</openSearch:totalResults>
+  <openSearch:startIndex>1</openSearch:startIndex>
+  <openSearch:itemsPerPage>25</openSearch:itemsPerPage>
+
+  <entry>
+    <id>tag:blogger.com,1999:blog-1111111111111111111.post-2222222222222222222</id>
+    <published>2026-07-21T10:18:24.984+03:00</published>
+    <updated>2026-07-21T10:18:24.984+03:00</updated>
+    <category scheme="http://www.blogger.com/atom/ns#" term="Engineering Jobs"/>
+    <category scheme="http://www.blogger.com/atom/ns#" term="Muscat"/>
+    <title type="text">Example Engineering Co - Control Systems Engineer</title>
+    <content type="html">&lt;div&gt;&lt;p&gt;Example Engineering Co is hiring a Control Systems Engineer in Muscat.&lt;/p&gt;
+      &lt;p&gt;Requirements: five years of experience with industrial control systems.&lt;/p&gt;
+      &lt;p&gt;Apply here: &lt;a href="https://careers.example.test/roles/4821"&gt;Application form&lt;/a&gt;&lt;/p&gt;
+      &lt;p&gt;See also: &lt;a href="/2026/07/another-unrelated-role.html"&gt;Another role&lt;/a&gt;&lt;/p&gt;
+      &lt;script&gt;var tracking = 1;&lt;/script&gt;&lt;style&gt;.x{color:red}&lt;/style&gt;
+      &lt;/div&gt;</content>
+    <link rel="replies" type="application/atom+xml"
+          href="https://example.test/feeds/2222222222222222222/comments/default"/>
+    <link rel="replies" type="text/html"
+          href="https://example.test/2026/07/control-systems-engineer.html#comment-form"/>
+    <link rel="edit" type="application/atom+xml"
+          href="https://www.blogger.com/feeds/1111/posts/default/2222"/>
+    <link rel="self" type="application/atom+xml"
+          href="https://www.blogger.com/feeds/1111/posts/default/2222"/>
+    <link rel="alternate" type="text/html"
+          href="https://example.test/2026/07/control-systems-engineer.html"/>
+    <author>
+      <name>Mahmoud</name>
+      <uri>https://www.blogger.com/profile/0000</uri>
+    </author>
+    <thr:total>0</thr:total>
+  </entry>
+
+  <entry>
+    <id>tag:blogger.com,1999:blog-1111111111111111111.post-3333333333333333333</id>
+    <published>2026-07-20T09:00:00.000+03:00</published>
+    <updated>2026-07-20T09:00:00.000+03:00</updated>
+    <category scheme="http://www.blogger.com/atom/ns#" term="Administration"/>
+    <title type="text">Example Trading LLC - Office Administrator</title>
+    <content type="html">&lt;p&gt;Example Trading LLC seeks an Office Administrator. Duties include scheduling and record keeping. Contact hr@example.test&lt;/p&gt;</content>
+    <link rel="alternate" type="text/html"
+          href="https://example.test/2026/07/office-administrator.html?utm_source=rss"/>
+    <author>
+      <name>Mahmoud</name>
+    </author>
+  </entry>
+</feed>

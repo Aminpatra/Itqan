@@ -30,17 +30,22 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 @dataclass
 class Config:
-    """Tunables.
+    """Tunables shared by every agent.
 
     Defaults suit English-language documents. ``ocr_lang`` is the one to change
     for CVs in another script — PaddleOCR's English models will misread Arabic,
     Chinese or Devanagari rather than fail loudly. Exposed as ``--ocr-lang``.
+
+    Fields are grouped by the agent that reads them. Agent A ignores the Agent B
+    block entirely and vice versa; they share one class because both are process
+    configuration and splitting them would mean two dotenv loads and two objects
+    threaded through every factory.
     """
 
     model: str = field(default_factory=lambda: os.getenv("ITQAN_MODEL", "gpt-4o-mini"))
     temperature: float = 0.0
 
-    # --- grounding thresholds (see agents/agent_a_cv_extraction/grounding.py) ---
+    # --- grounding thresholds (see shared/grounding.py) ---
     # >= grounded_threshold          -> accepted outright
     # adjudicate_threshold .. below  -> escalated to the LLM adjudicator
     # < adjudicate_threshold         -> dropped as ungrounded
@@ -63,6 +68,76 @@ class Config:
 
     output_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "output")
 
+    # ------------------------------------------------------------------
+    # Agent B — job ingestion
+    # ------------------------------------------------------------------
+    database_url: str = field(
+        default_factory=lambda: os.getenv("ITQAN_DATABASE_URL", "")
+    )
+
+    # Schema, not tunables: the pgvector column has a fixed dimension, and
+    # vectors from different models are not comparable. Changing either after
+    # anything is written requires re-embedding the corpus.
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dims: int = 1536
+
+    cycle_hours: int = 12
+
+    # Staleness counts CYCLES, not elapsed time — a skipped cycle (machine
+    # asleep, source blocked) must not age postings that were never checked.
+    stale_after_cycles: int = 3
+    prune_after_days: int = 60
+    degraded_after_cycles: int = 3
+
+    # --- aggregation ---
+    window_days: int = 30
+    # Per-skill floor for the trend label. Without it, 1 -> 2 reads as +100%
+    # "rising", which is noise published as a finding.
+    trend_min_volume: int = 5
+    trend_rising_ratio: float = 1.20
+    trend_falling_ratio: float = 0.80
+    # Per-SECTOR floor, distinct from trend_min_volume above: below this many
+    # deduped postings, no number in the row is trustworthy and every row for
+    # that sector is flagged low_confidence.
+    low_confidence_min_postings: int = 10
+    # Postings outside this set are stored and retrievable but not aggregated.
+    # Scope is deliberately NOT a legitimacy signal — see agents/agent_b/legitimacy.
+    in_scope_countries: tuple[str, ...] = ("OM",)
+
+    # --- near-duplicate detection ---
+    # Asymmetric on purpose. In-group (one publisher republishing itself) a
+    # wrong merge is cheap; cross-group it would erase a real demand signal from
+    # a different employer, so that path also requires human review.
+    #
+    # 0.97, raised from the originally-approved 0.93 after the first full live
+    # run: at 0.93 on this template-heavy source, ~28 of 29 auto-merges were
+    # DIFFERENT vacancies (a CFO merged into a CEO), undercounting demand.
+    # Similarity now runs on essence embeddings (title + extracted skills +
+    # seniority + location, see pipeline._essence_text), where true reposts
+    # score ~0.99 and different jobs at one employer separate cleanly.
+    neardup_in_group_threshold: float = 0.97
+    neardup_cross_group_threshold: float = 0.97
+    # Not 30: a repost more than two weeks apart is plausibly a genuine
+    # re-advertisement, and merging it erases the sustained-demand signal.
+    neardup_recent_days: int = 14
+    neardup_candidates: int = 5
+
+    # --- legitimacy filter (score is 1.0 clean .. 0.0 certainly scam) ---
+    legitimacy_reject_at: float = 0.30
+    legitimacy_adjudicate_low: float = 0.30
+    legitimacy_adjudicate_high: float = 0.60
+
+    # --- scraping ---
+    user_agent: str = field(
+        default_factory=lambda: os.getenv(
+            "ITQAN_USER_AGENT", "ItqanJobBot/0.1 (+contact-not-configured)"
+        )
+    )
+    max_response_bytes: int = 5_000_000
+    blogger_max_pages: int = 8
+    blogger_lookback_days: int = 21
+    telegram_max_pages: int = 3
+
     def require_api_key(self) -> str:
         key = os.getenv("OPENAI_API_KEY")
         if not key:
@@ -70,3 +145,27 @@ class Config:
                 "OPENAI_API_KEY is not set. Copy .env.example to .env and fill it in."
             )
         return key
+
+    def require_database_url(self) -> str:
+        if not self.database_url:
+            raise RuntimeError(
+                "ITQAN_DATABASE_URL is not set. Agent B needs Postgres with pgvector:\n"
+                "  docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=x pgvector/pgvector:pg16\n"
+                "  ITQAN_DATABASE_URL=postgresql://postgres:x@localhost:5432/postgres"
+            )
+        return self.database_url
+
+    def require_identified_user_agent(self) -> str:
+        """Refuse to make live requests without a real contact string.
+
+        A scraper that does not identify itself gives a site operator no option
+        except to block it, and no way to reach us if our cadence is a problem.
+        Enforced here rather than documented, so it cannot be missed — dry runs
+        are exempt because they make no requests.
+        """
+        if "contact-not-configured" in self.user_agent:
+            raise RuntimeError(
+                "ITQAN_USER_AGENT has no contact address. Set it before any live run, e.g.\n"
+                '  ITQAN_USER_AGENT="ItqanJobBot/0.1 (+you@example.com)"'
+            )
+        return self.user_agent

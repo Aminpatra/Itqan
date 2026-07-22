@@ -22,7 +22,7 @@ from shared.contracts import (
     SourceDocument,
 )
 
-from ..grounding import compact_nulls
+from shared.grounding import compact_nulls
 from ..state import AgentState
 
 

@@ -1,0 +1,78 @@
+<!--
+  Structurally faithful to a live t.me/s/<channel> page (class names, data-post
+  format, time[datetime], the views span's position in the footer, the
+  tme_messages_more pagination link), with synthetic content.
+
+  Three shapes here exist because each has a specific failure attached:
+
+    * the views span sits in the FOOTER, a sibling of the text div — a selector
+      that widened to the whole message would pull the count into
+      raw_description and re-hash every posting on every cycle
+    * a post carries TWO outbound blog links: its own subject first, then an
+      unrelated next job. Merging on "any outbound link" would collapse two
+      distinct vacancies into one
+    * a photo-only post has no text div at all and must be skipped, not OCR'd
+-->
+<main>
+<section class="tgme_channel_history js-message_history">
+
+  <div class="tgme_widget_message_wrap js-widget_message_wrap">
+    <div class="tgme_widget_message text_not_supported_wrap js-widget_message"
+         data-post="examplechannel/31803">
+      <div class="tgme_widget_message_text js-message_text">
+        Example Engineering Co - Control Systems Engineer<br/>
+        Requirements: five years of experience with industrial control systems.<br/>
+        <a href="https://example.test/2026/07/control-systems-engineer.html?utm_source=telegram">Details</a>
+        <a href="https://example.test/2026/07/office-administrator.html?utm_source=telegram">Next job</a>
+      </div>
+      <div class="tgme_widget_message_footer compact js-message_footer">
+        <div class="tgme_widget_message_info short js-message_info">
+          <span class="tgme_widget_message_views">57</span>
+          <span class="copyonly"> views</span>
+          <a class="tgme_widget_message_date" href="https://t.me/examplechannel/31803">
+            <time datetime="2026-07-19T11:01:31+00:00" class="time">14:01</time>
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tgme_widget_message_wrap js-widget_message_wrap">
+    <div class="tgme_widget_message text_not_supported_wrap js-widget_message"
+         data-post="examplechannel/31804">
+      <a class="tgme_widget_message_photo_wrap"
+         href="https://t.me/examplechannel/31804"
+         style="background-image:url('https://cdn.example.test/photo.jpg')"></a>
+      <div class="tgme_widget_message_footer compact js-message_footer">
+        <div class="tgme_widget_message_info short js-message_info">
+          <span class="tgme_widget_message_views">1.2K</span>
+          <a class="tgme_widget_message_date" href="https://t.me/examplechannel/31804">
+            <time datetime="2026-07-19T11:31:41+00:00" class="time">14:31</time>
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tgme_widget_message_wrap js-widget_message_wrap">
+    <div class="tgme_widget_message text_not_supported_wrap js-widget_message"
+         data-post="examplechannel/31805">
+      <div class="tgme_widget_message_text js-message_text">
+        Example Trading LLC - Office Administrator<br/>
+        Duties include scheduling and record keeping. Contact hr@example.test
+      </div>
+      <div class="tgme_widget_message_footer compact js-message_footer">
+        <div class="tgme_widget_message_info short js-message_info">
+          <span class="tgme_widget_message_views">402</span>
+          <a class="tgme_widget_message_date" href="https://t.me/examplechannel/31805">
+            <time datetime="2026-07-19T12:01:34+00:00" class="time">15:01</time>
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <a class="tme_messages_more js-messages_more" data-before="31803"
+     href="/s/examplechannel?before=31803">Load more</a>
+</section>
+</main>

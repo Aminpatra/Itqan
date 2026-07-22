@@ -12,6 +12,14 @@ Three outcomes per field, driven by ``Config`` thresholds:
 
 The middle band is intentionally narrow. Most fields resolve deterministically;
 only the genuinely ambiguous handful cost a model call.
+
+Lives in ``shared/`` because it is genuinely cross-agent and entirely
+domain-neutral — it takes an arbitrary nested dict and an arbitrary source
+string, and knows nothing about CVs. Agent A grounds extracted fields against a
+CV; Agent B reuses ``normalize()`` for content hashing and ``verify_quote()`` as
+the backstop that stops its legitimacy classifier self-certifying. The coupling
+rule forbids Agent B importing Agent A's internals, so anything shared has to
+live here.
 """
 
 from __future__ import annotations

@@ -3,11 +3,14 @@
 These are the tests that matter most: grounding is the layer that actually stops
 hallucinations reaching the output, so it gets adversarial input rather than
 happy-path input.
+
+Lives at the top of ``tests/`` rather than under ``tests/agent_a/`` because
+``shared.grounding`` is no longer Agent A's — Agent B depends on it too.
 """
 
 from __future__ import annotations
 
-from agents.agent_a_cv_extraction.grounding import (
+from shared.grounding import (
     compact_nulls,
     ground_extraction,
     normalize,

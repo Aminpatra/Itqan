@@ -10,3 +10,13 @@ filetype>=1.2
 python-dotenv>=1.1
 numpy>=2.0
 pytest>=8.0
+
+# --- Agent B ---
+# httpx is already pulled in transitively by openai, but Agent B depends on it
+# directly — declare it, or an openai upgrade could drop it out from under us.
+httpx>=0.28
+psycopg[binary]>=3.2
+pgvector>=0.3
+# Parses both the Blogger post bodies (HTML inside Atom <content>) and the
+# t.me/s channel pages. The Atom envelope itself uses stdlib ElementTree.
+selectolax>=0.3
