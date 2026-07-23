@@ -32,6 +32,7 @@ def test_real_migrations_are_discoverable_and_ordered():
         "source_health",
         "indexes",
         "listing_provenance",
+        "esco",
     ]
 
 

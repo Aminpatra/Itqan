@@ -127,6 +127,19 @@ class Config:
     legitimacy_adjudicate_low: float = 0.30
     legitimacy_adjudicate_high: float = 0.60
 
+    # --- ESCO mapping ---
+    # Minimum cosine similarity for an embedding-based skill->ESCO mapping.
+    # 0.80, lowered from the initial 0.85 guess on first-corpus evidence
+    # (2026-07-23): ESCO phrases skills as verbs ("prepare cost estimates"),
+    # postings as nouns ("cost estimation"), and that equivalence lands at
+    # 0.80-0.85 — an audited sample of that band was 13/14 correct, so 0.85 was
+    # rejecting real matches. NOTE: lowering this further does not retroactively
+    # remap; clear the affected method='unmapped' rows (or bump the taxonomy
+    # version) and the next cycle re-tries them.
+    esco_map_threshold: float = 0.80
+    # Where the user-downloaded ESCO bundle lives (gitignored; EU dataset).
+    esco_csv_path: Path = field(default_factory=lambda: PROJECT_ROOT / "ESCO" / "skills_en.csv")
+
     # --- scraping ---
     user_agent: str = field(
         default_factory=lambda: os.getenv(

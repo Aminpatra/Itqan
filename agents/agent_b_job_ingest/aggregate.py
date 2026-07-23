@@ -83,7 +83,7 @@ eligible AS (
 
 _AGGREGATE_SQL = f"""
 INSERT INTO skill_demand_stats (
-    sector, skill, skill_key, window_start, window_end,
+    sector, skill, skill_key, esco_code, window_start, window_end,
     frequency_count, prior_frequency_count, trend,
     co_occurring_skills, sample_postings, low_confidence, computed_at
 )
@@ -121,6 +121,7 @@ SELECT
     cc.sector,
     cc.skill,
     cc.skill_key,
+    esco.esco_uri,
     %(w_start)s::date,
     %(w_end)s::date,
     cc.freq,
@@ -164,8 +165,15 @@ SELECT
 FROM cur_counts cc
 JOIN sector_volume sv ON sv.sector = cc.sector
 LEFT JOIN prior_counts pc ON pc.sector = cc.sector AND pc.skill_key = cc.skill_key
+-- The ESCO canonicalization: raw rows stay one-per-raw-skill (the audit trail),
+-- and esco_code carries the concept URI so a consumer can GROUP BY it to merge
+-- "prioritization" and "priority organization" into one count. NULL means the
+-- mapper found no concept (or has not run) — never a guess.
+LEFT JOIN skill_esco_map esco
+       ON esco.skill_key = cc.skill_key AND esco.esco_uri IS NOT NULL
 ON CONFLICT (sector, skill_key, window_end) DO UPDATE SET
     skill = EXCLUDED.skill,
+    esco_code = EXCLUDED.esco_code,
     window_start = EXCLUDED.window_start,
     frequency_count = EXCLUDED.frequency_count,
     prior_frequency_count = EXCLUDED.prior_frequency_count,

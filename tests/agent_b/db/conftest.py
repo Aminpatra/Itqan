@@ -74,7 +74,8 @@ def store(migrated_dsn: str):
         conn = s.connect()
         with conn.cursor() as cur:
             cur.execute(
-                "TRUNCATE job_postings, skill_demand_stats, source_health RESTART IDENTITY CASCADE"
+                "TRUNCATE job_postings, skill_demand_stats, source_health, "
+                "skill_esco_map, esco_labels, esco_skills RESTART IDENTITY CASCADE"
             )
         conn.commit()
         yield s

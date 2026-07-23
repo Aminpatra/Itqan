@@ -355,6 +355,28 @@ for it in `sources/config.py` — confirming a channel renders is not the same a
 terms. Dubizzle (`html_scrape`) is built but shipped disabled: it exposes no poster identity, so
 nothing it produces can be classified `company` and therefore nothing it produces can aggregate yet.
 
+### The ESCO layer — one vocabulary for skills
+
+Free-text skills fragment ("prioritization", "priority organization", "task organization" — one
+concept, three counts). The ESCO layer maps each raw skill key to a concept in the EU's
+[ESCO classification](https://esco.ec.europa.eu) (~13,900 skills), and aggregation fills the
+`esco_code` column from that map. Raw rows stay as the audit trail; a consumer groups by
+`esco_code` to get canonical counts. Mapping is deterministic and auditable — exact label match,
+then alt-label match, then nearest-label embedding above `esco_map_threshold`, else honestly
+`unmapped` with the near-miss score stored as tuning evidence. No LLM is involved.
+
+One-time setup: download the ESCO skills CSV bundle (English) from the
+[ESCO download page](https://esco.ec.europa.eu/en/use-esco/download) into `ESCO/`, then:
+
+```bash
+python main.py agent-b --esco-sync            # load + embed the taxonomy (one-off, a few cents)
+```
+
+Each cycle then maps only genuinely new skill phrases. Bump `--esco-version` when loading a newer
+release; previously-unmapped skills are retried against it.
+
+*This project uses the ESCO classification of the European Commission.*
+
 ### Scheduling (Windows Task Scheduler)
 
 `--once` is crash- and reboot-safe and reports failure through its exit code (non-zero on a partial

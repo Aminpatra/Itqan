@@ -76,6 +76,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report database connectivity, schema state and row counts, then exit",
     )
     ops.add_argument(
+        "--esco-sync",
+        nargs="?",
+        const="__default__",
+        metavar="CSV",
+        help="Load the ESCO skills taxonomy from a downloaded CSV (default: ESCO/skills_en.csv) "
+        "and embed its labels (one-off, a few cents). Idempotent and resumable",
+    )
+    ops.add_argument(
+        "--esco-version",
+        default="1.2",
+        help="Taxonomy version recorded with --esco-sync (default: 1.2). Bump it when "
+        "loading a newer ESCO release; 'unmapped' skills are then retried",
+    )
+    ops.add_argument(
         "--label-sample",
         type=int,
         metavar="N",
@@ -360,6 +374,44 @@ def _purge_source(config: Config, args) -> int:
         return 2
 
 
+def _esco_sync(config: Config, args) -> int:
+    from pathlib import Path
+
+    from shared.embeddings import build_embedder
+
+    from .db import JobStore, apply_migrations
+    from .esco_map import sync_taxonomy
+
+    path = config.esco_csv_path if args.esco_sync == "__default__" else Path(args.esco_sync)
+    if not path.exists():
+        print(f"  {path} not found.", file=sys.stderr)
+        print("  Download the ESCO skills CSV bundle (English) from", file=sys.stderr)
+        print("  https://esco.ec.europa.eu/en/use-esco/download and place skills_en.csv there,",
+              file=sys.stderr)
+        print("  or pass the file path: --esco-sync path\\to\\skills_en.csv", file=sys.stderr)
+        return 2
+
+    try:
+        dsn = config.require_database_url()
+        apply_migrations(dsn)
+        embedder = build_embedder(config)
+    except RuntimeError as exc:
+        print(f"  {exc}", file=sys.stderr)
+        return 2
+
+    with JobStore(dsn) as store:
+        # No outer transaction: sync_taxonomy commits per batch, which is what
+        # makes an interrupted run resumable instead of voided.
+        summary = sync_taxonomy(store, embedder, path=path, version=args.esco_version)
+        status = store.esco_status()
+
+    print(f"  parsed   {summary.skills:,} concepts / {summary.labels:,} labels from {path.name}")
+    print(f"  embedded {summary.embedded:,} labels this run")
+    print(f"  taxonomy now: {status['skills']:,} skills, {status['labels']:,} labels "
+          f"({status['embedded']:,} embedded), version {status['version']}\n")
+    return 0
+
+
 def _label_sample(config: Config, args) -> int:
     import json
 
@@ -404,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
         return _check(config)
     if args.purge_source:
         return _purge_source(config, args)
+    if args.esco_sync:
+        return _esco_sync(config, args)
     if args.label_sample:
         return _label_sample(config, args)
     if args.dry_run:

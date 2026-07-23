@@ -532,6 +532,182 @@ class JobStore:
             return dict(row) if row else None
 
     # ------------------------------------------------------------------
+    # ESCO mapping layer
+    # ------------------------------------------------------------------
+    def upsert_esco_skills(self, rows: list[dict[str, Any]], *, version: str) -> int:
+        conn = self.connect()
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    """
+                    INSERT INTO esco_skills (esco_uri, preferred_label, skill_type,
+                                             description, esco_version)
+                    VALUES (%(esco_uri)s, %(preferred_label)s, %(skill_type)s,
+                            %(description)s, %(version)s)
+                    ON CONFLICT (esco_uri) DO UPDATE SET
+                        preferred_label = EXCLUDED.preferred_label,
+                        skill_type = EXCLUDED.skill_type,
+                        description = EXCLUDED.description,
+                        esco_version = EXCLUDED.esco_version,
+                        loaded_at = now()
+                    """,
+                    {**row, "version": version},
+                )
+        return len(rows)
+
+    def insert_esco_labels(self, rows: list[dict[str, Any]]) -> int:
+        """Labels are inserted WITHOUT embeddings; the sync's embedding pass
+        fills the NULL ones afterwards. That split is what makes an interrupted
+        sync resumable instead of restarted."""
+        conn = self.connect()
+        inserted = 0
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    """
+                    INSERT INTO esco_labels (label_key, label, esco_uri, is_preferred)
+                    VALUES (%(label_key)s, %(label)s, %(esco_uri)s, %(is_preferred)s)
+                    ON CONFLICT (label_key, esco_uri) DO NOTHING
+                    """,
+                    row,
+                )
+                inserted += cur.rowcount
+        return inserted
+
+    def labels_missing_embeddings(self, *, limit: int) -> list[dict[str, Any]]:
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT label_key, esco_uri, label FROM esco_labels "
+                "WHERE embedding IS NULL ORDER BY label_key LIMIT %s",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def set_label_embeddings(self, entries: list[tuple[str, str, list[float]]]) -> None:
+        conn = self.connect()
+        with conn.cursor() as cur:
+            for label_key, esco_uri, embedding in entries:
+                cur.execute(
+                    "UPDATE esco_labels SET embedding = %s "
+                    "WHERE label_key = %s AND esco_uri = %s",
+                    (embedding, label_key, esco_uri),
+                )
+
+    def esco_status(self) -> dict[str, Any]:
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT (SELECT count(*) FROM esco_skills) AS skills,
+                       (SELECT count(*) FROM esco_labels) AS labels,
+                       (SELECT count(*) FROM esco_labels WHERE embedding IS NOT NULL) AS embedded,
+                       (SELECT max(esco_version) FROM esco_skills) AS version,
+                       (SELECT count(*) FROM skill_esco_map) AS mapped_keys
+                """
+            )
+            return dict(cur.fetchone())
+
+    def get_esco_version(self) -> str | None:
+        return self.scalar("SELECT max(esco_version) FROM esco_skills")
+
+    def find_esco_by_labels(self, label_keys: list[str]) -> dict[str, dict[str, Any]]:
+        """Exact lexical lookup. When one key matches several labels, a
+        preferred label beats an alternative — DISTINCT ON with that ordering,
+        so the choice is deterministic rather than row-order luck."""
+        if not label_keys:
+            return {}
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (label_key)
+                       label_key, esco_uri, is_preferred
+                  FROM esco_labels
+                 WHERE label_key = ANY(%s)
+                 ORDER BY label_key, is_preferred DESC, esco_uri
+                """,
+                (label_keys,),
+            )
+            return {r["label_key"]: dict(r) for r in cur.fetchall()}
+
+    def nearest_esco_label(self, embedding: list[float], *, limit: int = 3) -> list[dict[str, Any]]:
+        """Nearest labels by cosine. Same two rules as the near-dup search:
+        ``1 - <=>`` is the similarity, and ef_search is raised so a filtered
+        HNSW scan cannot silently return fewer candidates than asked. Requires
+        the surrounding transaction the mapper runs in."""
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL hnsw.ef_search = 100")
+            cur.execute(
+                """
+                SELECT esco_uri, label,
+                       1 - (embedding <=> %(emb)s::vector) AS similarity
+                  FROM esco_labels
+                 WHERE embedding IS NOT NULL
+                 ORDER BY embedding <=> %(emb)s::vector
+                 LIMIT %(k)s
+                """,
+                {"emb": embedding, "k": limit},
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def upsert_skill_map(self, entries: list[dict[str, Any]]) -> None:
+        conn = self.connect()
+        with conn.cursor() as cur:
+            for entry in entries:
+                cur.execute(
+                    """
+                    INSERT INTO skill_esco_map (skill_key, esco_uri, method,
+                                                similarity, esco_version)
+                    VALUES (%(skill_key)s, %(esco_uri)s, %(method)s,
+                            %(similarity)s, %(esco_version)s)
+                    ON CONFLICT (skill_key) DO UPDATE SET
+                        esco_uri = EXCLUDED.esco_uri,
+                        method = EXCLUDED.method,
+                        similarity = EXCLUDED.similarity,
+                        esco_version = EXCLUDED.esco_version,
+                        mapped_at = now()
+                    """,
+                    entry,
+                )
+
+    def pending_skill_keys(self, *, version: str) -> list[str]:
+        """Skill keys that need mapping this cycle.
+
+        The eligibility predicate matches the aggregation's (minus the country
+        clause — mapping an out-of-scope skill is harmless, missing an in-scope
+        one is not), so everything the stats table will contain is covered.
+        A key already mapped stays mapped; a key recorded 'unmapped' is retried
+        only when the taxonomy version has changed — the one event that can turn
+        a miss into a hit.
+        """
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH keys AS (
+                    SELECT DISTINCT lower(btrim(s)) AS skill_key
+                      FROM job_postings, unnest(required_skills) AS s
+                     WHERE status = 'active'
+                       AND duplicate_of IS NULL
+                       AND sector IS NOT NULL
+                       AND listing_intent = 'vacancy'
+                       AND poster_type = 'company'
+                       AND btrim(s) <> ''
+                )
+                SELECT k.skill_key
+                  FROM keys k
+                  LEFT JOIN skill_esco_map m ON m.skill_key = k.skill_key
+                 WHERE m.skill_key IS NULL
+                    OR (m.method = 'unmapped' AND m.esco_version <> %(version)s)
+                 ORDER BY k.skill_key
+                """,
+                {"version": version},
+            )
+            return [r["skill_key"] for r in cur.fetchall()]
+
+    # ------------------------------------------------------------------
     # operator commands (phase 7)
     # ------------------------------------------------------------------
     def purge_source(self, source: str) -> int:

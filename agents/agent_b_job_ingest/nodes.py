@@ -167,9 +167,19 @@ def make_staleness(deps: GraphDeps) -> Callable[[IngestState], dict]:
 
 def make_aggregate(deps: GraphDeps) -> Callable[[IngestState], dict]:
     def aggregate(state: IngestState) -> dict:
+        from .esco_map import map_new_skills
+
+        # Mapping runs FIRST, in its own transaction, so the recompute's
+        # LEFT JOIN sees this cycle's new skills already resolved. After warm-up
+        # only genuinely new phrases pay an embedding call. A no-op when the
+        # taxonomy has never been synced.
+        with deps.store.transaction():
+            esco = map_new_skills(deps.store, deps.embedder, deps.config)
+
         with deps.store.transaction():
             summary = recompute_stats(deps.store, deps.config)
-        return {"aggregation_summary": summary.as_dict()}
+
+        return {"aggregation_summary": {**summary.as_dict(), "esco": esco.as_dict()}}
 
     return aggregate
 

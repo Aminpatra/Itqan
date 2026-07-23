@@ -6,6 +6,10 @@
 # Per-run artifacts
 output/
 
+# The downloaded ESCO dataset (EU-published, ~50MB). Loaded into Postgres by
+# `agent-b --esco-sync`; the repo carries only a small synthetic fixture.
+ESCO/
+
 # Legitimacy labels — real ingested postings a human labelled to measure filter
 # precision. Never commit: a realistic scam posting in the repo is a working
 # template. Covered by output/ above, repeated here so a relocated output dir

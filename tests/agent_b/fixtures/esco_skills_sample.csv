@@ -1,0 +1,10 @@
+conceptType,conceptUri,skillType,reuseLevel,preferredLabel,altLabels,hiddenLabels,status,modifiedDate,scopeNote,definition,inScheme,description
+KnowledgeSkillCompetence,http://example.test/esco/skill/0001,skill/competence,transversal,manage time,"prioritise tasks
+prioritize tasks
+time planning",,released,2024-01-01,,,scheme,Planning and ordering of work over time.
+KnowledgeSkillCompetence,http://example.test/esco/skill/0002,skill/competence,cross-sector,analyse data,"data analytics
+data analysis",,released,2024-01-01,,,scheme,Deriving findings from collected data.
+KnowledgeSkillCompetence,http://example.test/esco/skill/0003,skill/competence,sector-specific,perform welding,,,released,2024-01-01,,,scheme,Joining materials by welding processes.
+KnowledgeSkillCompetence,http://example.test/esco/skill/0004,knowledge,cross-sector,accounting,"bookkeeping",,released,2024-01-01,,,scheme,Recording and reporting of financial transactions.
+KnowledgeSkillCompetence,http://example.test/esco/skill/0005,skill/competence,transversal,assist customers,"customer service
+client service",,released,2024-01-01,,,scheme,Providing help and advice to customers.
