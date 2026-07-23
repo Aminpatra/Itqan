@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
+from shared.job_market import AGGREGABLE_POSTING_PREDICATE
+
 
 @dataclass
 class AggregationSummary:
@@ -67,17 +69,21 @@ class AggregationSummary:
 # cannot drift apart. ``eff_date`` falls back to first_seen_at when a posting has
 # no stated posted_date (a relative date the adapter left unresolved), because
 # the day we first observed it is the honest stand-in — never "now".
-_ELIGIBLE_CTE = """
+#
+# The four-clause aggregable predicate is imported from shared.job_market — the
+# published Agent C read surface applies the SAME predicate for retrieval, and
+# single-sourcing it there (the only import direction the architecture allows)
+# is what makes drift between "what we count" and "what we serve" impossible.
+# The two extra clauses below (sector known, country in scope) are COUNTING
+# concerns only and deliberately stay local.
+_ELIGIBLE_CTE = f"""
 eligible AS (
     SELECT posting_id, sector, title, source_url, required_skills,
            COALESCE(posted_date, first_seen_at::date) AS eff_date
       FROM job_postings
-     WHERE status = 'active'
-       AND duplicate_of IS NULL
+     WHERE {AGGREGABLE_POSTING_PREDICATE}
        AND sector IS NOT NULL
        AND country = ANY(%(countries)s)
-       AND listing_intent = 'vacancy'
-       AND poster_type = 'company'
 )
 """
 
@@ -208,12 +214,9 @@ SELECT count(DISTINCT sector) FROM eligible
 # Eligible in every way EXCEPT country — same filters as the CTE minus the
 # country clause and the sector requirement, restricted to null country in the
 # current window.
-_NULL_COUNTRY_SQL = """
+_NULL_COUNTRY_SQL = f"""
 SELECT count(*) FROM job_postings
- WHERE status = 'active'
-   AND duplicate_of IS NULL
-   AND listing_intent = 'vacancy'
-   AND poster_type = 'company'
+ WHERE {AGGREGABLE_POSTING_PREDICATE}
    AND country IS NULL
    AND COALESCE(posted_date, first_seen_at::date) > %(w_start)s
    AND COALESCE(posted_date, first_seen_at::date) <= %(w_end)s

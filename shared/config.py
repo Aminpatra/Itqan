@@ -140,6 +140,34 @@ class Config:
     # Where the user-downloaded ESCO bundle lives (gitignored; EU dataset).
     esco_csv_path: Path = field(default_factory=lambda: PROJECT_ROOT / "ESCO" / "skills_en.csv")
 
+    # ------------------------------------------------------------------
+    # Agent C — skill-gap analysis
+    # ------------------------------------------------------------------
+    # A retrieved posting counts as a usable match above this candidate-essence
+    # similarity. 0.43, lowered from the spec's 0.80 starting value on the first
+    # live measurement (2026-07-23): a real CS-graduate profile against the live
+    # corpus scored 0.41-0.48 for postings a human judges RELEVANT (technology
+    # roles, data specialist, Oracle DBA) — cross-type similarity compresses, as
+    # the original comment predicted, because a candidate essence aggregates
+    # many skills while a posting names few. Cross-domain check (synthetic nurse
+    # and salesperson profiles): rankings correct, relevant matches at
+    # 0.53-0.66, so 0.43 is conservative for most profiles — tool-name-heavy
+    # technical CVs sit lowest. One caveat: for those higher-scoring profiles
+    # the bar also admits weaker cross-domain hits (~0.52), which the per-job
+    # gap scores then contextualize honestly. The CLI prints the distribution
+    # every run.
+    agent_c_match_threshold: float = 0.43
+    # The stats fallback compares the candidate against sector skills demanded
+    # at least this often. Without the floor the comparison runs against every
+    # freq-1 phrase ever aggregated (463 rows in the first live sector, ~87% of
+    # them noise) and gap_score saturates at ~1.0, which says nothing.
+    agent_c_fallback_min_freq: int = 2
+    # Per-skill comparison bands: >= match is matched, [possible, match) is
+    # possible_match and is NEVER auto-resolved either way, < possible is
+    # missing.
+    agent_c_skill_match: float = 0.80
+    agent_c_skill_possible: float = 0.60
+
     # --- scraping ---
     user_agent: str = field(
         default_factory=lambda: os.getenv(

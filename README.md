@@ -6,11 +6,29 @@ Two independent LangGraph agents that share nothing but `shared/`:
   into a verified, provenance-tagged JSON profile.
 - **Agent B** ingests **public job postings** every 12 hours into two Postgres tables — a searchable
   posting store and an aggregated skill-demand table — filtering scams and never fabricating a count.
+- **Agent C** reads both and computes the candidate's **skill gap** against live postings, falling
+  back to sector demand statistics when retrieval is thin. Fully deterministic — zero LLM calls.
 
-A future Agent C reads both. Built with LangChain + LangGraph, PaddleOCR for scanned documents,
-OpenAI for extraction and embeddings, and Postgres + pgvector for Agent B's store.
+Built with LangChain + LangGraph, PaddleOCR for scanned documents, OpenAI for extraction and
+embeddings, and Postgres + pgvector for the job-market store, with the EU's ESCO taxonomy as the
+shared skill vocabulary.
 
-Agent A is documented first; **[Agent B has its own section below](#agent-b--scheduled-job-ingestion).**
+**How they connect** — the agents never import each other; the joins are a file contract and a
+database read surface, which is what lets each be run, tested, or rewritten alone:
+
+```
+                        one command:  python main.py pipeline --cv cv.pdf
+                        ┌──────────────────────────────────────────────┐
+CV/transcript ──▶ Agent A ── candidate_profile.json ──▶ Agent C ◀── job_postings +
+                     (or agent-c --watch picks it up)      │        skill_demand_stats
+                                                           ▼            ▲
+                                                     skill_gap.json     │ live Postgres reads,
+                                                                        │ every C run
+web sources ──▶ Agent B (12h cycle) ────────────────────────────────────┘
+```
+
+Agent A is documented first; **[Agent B](#agent-b--scheduled-job-ingestion)** and
+**[Agent C](#agent-c--skill-gap-analysis)** have their own sections below.
 
 ---
 
@@ -405,6 +423,65 @@ Remember `docker start itqan-pg` after a reboot — the container does not auto-
 
 ---
 
+## Agent C — skill gap analysis
+
+```bash
+python main.py agent-c --profile output/<run_id>/candidate_profile.json
+python main.py agent-c --profile ... --sector 2 --top-k 15 --user-id someone
+python main.py agent-c --watch          # react to Agent A automatically (see below)
+```
+
+**Watch mode** is the hands-free pipeline: leave `agent-c --watch` running, and every time Agent A
+finishes a profile, the gap analysis follows automatically — `skill_gap.json` is written into the
+same `output/<run_id>/` folder, so everything about one candidate lives in one place and the file's
+presence marks the run processed (nothing is ever analysed twice). The agents stay fully decoupled:
+the handshake is the filesystem, not an import. Profiles that already exist when the watcher starts
+are ignored unless `--backfill`; a profile that fails is set aside rather than retried every poll.
+
+Reads Agent A's profile and Agent B's tables (through the published read surface,
+`shared/job_market.py` — Agent C never touches Agent B's internals), and writes
+`output/<run_id>/skill_gap.json`.
+
+**Deterministic by design — zero LLM calls.** Matching and scoring are arithmetic over data two
+other systems already verified: cosine similarity in the same embedding space Agent B uses, and
+ESCO concept identity from the same tables. An LLM here would add nothing but non-determinism.
+
+```
+build_query_embedding   profile -> posting-shaped essence (headline / location / skills) -> vector
+retrieve_postings       nearest eligible postings; < 5 above the similarity threshold => fallback
+map_candidate_skills    the candidate's skills through the ESCO tables — READ-ONLY, same tiers
+                        and threshold as Agent B, so both sides speak one vocabulary
+gap_analysis            per job: matched / missing / possible_match per required skill
+persist                 skill_gap.json
+```
+
+The honesty rules the arithmetic follows:
+
+- **`possible_match` ([0.6, 0.8) similarity) is never auto-resolved.** It counts in the
+  `gap_score` denominator (it is a real requirement) but never in the numerator (we do not know
+  it is missing). `gap_score = Σweight(missing) / Σweight(matched+missing+possible)`.
+- **Weights are demand counts** — `frequency_count` from the latest stats window (by `esco_code`,
+  else by raw key), floor 1 so an un-aggregated skill still exists in the score. This system has no
+  essential/optional tags and does not invent them.
+- **The fallback sector is never guessed**: modal sector of the retrieved postings, or `--sector`,
+  or the sector-level analysis is skipped with a warning in the output.
+- **ESCO identity beats phrase fuzz**: a job skill sharing the candidate's concept is matched even
+  when the raw phrasings are embedding-distant.
+- The output flags `used_fallback` so a consumer knows whether it is reading per-job specificity or
+  sector-level aggregates, embeds the gap-score formula, and carries the candidate's per-skill ESCO
+  mappings (including near-miss scores for unmapped skills) as tuning evidence.
+
+The retrieval threshold (`agent_c_match_threshold`) started at the spec's 0.80 and was moved to
+**0.43 on the first live measurement**: a real CS-graduate profile scored 0.41–0.48 against
+postings a human judges relevant (technology roles, data specialist, Oracle DBA) — cross-type
+similarity compresses, because a candidate essence aggregates many skills while a posting names
+few. That was one profile; the CLI prints the distribution every run, and the threshold moves on
+that evidence. The stats fallback likewise ignores skills aggregated only once
+(`agent_c_fallback_min_freq`) — without the floor it compared against 463 sector phrases, ~87%
+freq-1 noise, and the gap saturated at a meaningless ~1.0.
+
+---
+
 ## Layout
 
 ```
@@ -443,7 +520,7 @@ The agents in play:
 |---|---|---|
 | **A** — `agent_a_cv_extraction` | CV + transcript files | `candidate_profile.json` |
 | **B** — `agent_b_job_ingest` | Public job sources (feed, Telegram, HTML) | `job_postings`, `skill_demand_stats` (Postgres) |
-| **C** — matching *(not built)* | Agent A's profile **and** Agent B's tables | — |
+| **C** — `agent_c_gap_analysis` | Agent A's profile **and** Agent B's tables (via `shared/job_market.py`) | `skill_gap.json` |
 
 Agent B does **not** read `CandidateProfile`; that is Agent C's job. Agent B and Agent A share nothing but
 `shared/`, and neither knows the other exists.

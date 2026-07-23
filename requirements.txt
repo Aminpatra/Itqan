@@ -20,3 +20,8 @@ pgvector>=0.3
 # Parses both the Blogger post bodies (HTML inside Atom <content>) and the
 # t.me/s channel pages. The Atom envelope itself uses stdlib ElementTree.
 selectolax>=0.3
+
+# Console display ONLY (shared/display.py): terminals like VS Code's (xterm.js)
+# cannot shape Arabic, so CLI prints pre-shape it. Never applied to stored data.
+arabic-reshaper>=3.0
+python-bidi>=0.4

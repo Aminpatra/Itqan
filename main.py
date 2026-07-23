@@ -35,6 +35,14 @@ AGENTS = {
         "agents.agent_b_job_ingest.cli",
         "Ingest public job postings into the job-demand tables (12h cycle)",
     ),
+    "agent-c": (
+        "agents.agent_c_gap_analysis.cli",
+        "Compute a candidate's skill gap against live postings and demand stats",
+    ),
+    "pipeline": (
+        "agents.pipeline",
+        "CV in, skill gap out: Agent A then Agent C in one run (C reads Agent B's tables)",
+    ),
 }
 
 

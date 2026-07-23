@@ -243,13 +243,16 @@ def _dry_run(config: Config, args) -> int:
                 # different day on every fetch, so it is resolved once at
                 # first-seen time rather than per cycle.
                 date = f"~{posting.posted_date_text}" if posting.posted_date_text else "?"
-            print(f"      {date}  {posting.title[:64]}")
+            from shared.display import arabize
+
+            print(f"      {date}  {arabize(posting.title[:64])}")
             print(f"        url    {posting.source_url[:96]}")
             if (posting.listing_intent, posting.poster_type) != ("vacancy", "company"):
                 print(f"        NOT AGGREGABLE  intent={posting.listing_intent} "
                       f"poster={posting.poster_type}")
             if posting.labels:
-                print(f"        labels {', '.join(posting.labels[:6])}")
+                # Display-only reshaping; the stored labels stay logical-order.
+                print(f"        labels {arabize(', '.join(posting.labels[:6]))}")
             if posting.outbound_links:
                 print(f"        links  {len(posting.outbound_links)}: {posting.outbound_links[0]}")
             if assessment.signals:

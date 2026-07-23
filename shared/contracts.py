@@ -84,7 +84,7 @@ class Confidence(BaseModel):
 
 
 class CandidateProfile(BaseModel):
-    """The envelope Agent A writes and Agent B consumes."""
+    """The envelope Agent A writes and Agent C consumes."""
 
     schema_version: str = SCHEMA_VERSION
     run_id: str
@@ -108,10 +108,78 @@ class CandidateProfile(BaseModel):
 
 
 def load_profile(path: str) -> CandidateProfile:
-    """Read an envelope from disk. This is Agent B's entry point."""
+    """Read an envelope from disk. This is Agent C's entry point."""
     import json
     from pathlib import Path
 
     return CandidateProfile.model_validate(
         json.loads(Path(path).read_text(encoding="utf-8"))
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent B -> Agent C: the job-market read contracts.
+#
+# Field lists mirror the job_postings / skill_demand_stats migrations. Fields
+# DELIBERATELY absent from JobPostingExport, so their omission is a decision and
+# not an accident:
+#   embedding            — 1536 floats Agent C never needs back; it queries BY
+#                          vector, it does not read vectors
+#   status               — every exported row is 'active' by filter; exporting
+#                          the column would invite consumers to re-filter wrongly
+#   content_hash, duplicate_of, missed_cycles, stale_since, review_reason,
+#   extraction_model     — Agent B's internal bookkeeping, not market data
+# ---------------------------------------------------------------------------
+
+class JobPostingExport(BaseModel):
+    """One retrievable posting, as served by ``shared.job_market``."""
+
+    posting_id: str
+    source: str
+    source_group: str
+    source_type: str
+    source_url: str
+
+    title: str
+    raw_description: str
+
+    sector: Optional[str] = None            # ISCO-08 major group, '0'-'9'
+    required_skills: list[str] = Field(default_factory=list)
+    seniority_level: Optional[str] = None
+    location: Optional[str] = None
+    country: Optional[str] = None
+    posted_date: Optional[str] = None       # ISO date; None when never stated
+
+    legitimacy_score: Optional[float] = None
+    listing_intent: str = "vacancy"         # by filter; carried for transparency
+    poster_type: str = "company"
+
+    first_seen_at: str
+    last_seen_at: str
+
+    # Computed per query: cosine similarity of this posting's essence embedding
+    # to the caller's query vector. 1.0 identical, 0.0 unrelated.
+    similarity: float
+
+
+class SkillDemandStatRow(BaseModel):
+    """One row of the aggregated demand table, latest window only.
+
+    ``esco_code`` is the canonicalization handle: group by it to merge raw
+    phrasings of one concept. NULL means the mapper found no concept — never a
+    guess, so treat unmapped rows as their raw ``skill_key``.
+    """
+
+    sector: str
+    skill: str
+    skill_key: str
+    esco_code: Optional[str] = None
+    window_start: str
+    window_end: str
+    frequency_count: int
+    prior_frequency_count: int = 0
+    trend: str = "stable"
+    co_occurring_skills: list[dict[str, Any]] = Field(default_factory=list)
+    sample_postings: list[dict[str, Any]] = Field(default_factory=list)
+    low_confidence: bool = False
+    computed_at: str
