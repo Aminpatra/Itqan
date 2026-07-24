@@ -1,0 +1,14 @@
+{
+  "elements": [
+    {
+      "id": "eee",
+      "slug": "data-analysis-r",
+      "name": "Data Analysis with R",
+      "description": "Analyse data and build visualisations using the R programming language.",
+      "partnerIds": ["1501"],
+      "primaryLanguages": ["en"]
+    }
+  ],
+  "paging": {"total": 8},
+  "linked": {"partners.v1": [{"id": "1501", "name": "IBM", "shortName": "ibm"}]}
+}

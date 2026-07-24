@@ -127,6 +127,23 @@ class Config:
     legitimacy_adjudicate_low: float = 0.30
     legitimacy_adjudicate_high: float = 0.60
 
+    # ------------------------------------------------------------------
+    # Agent D — course ingestion (the supply side)
+    # ------------------------------------------------------------------
+    # 3 days, not 12h: courses change far slower than job postings, so a shorter
+    # cycle would spend LLM/embedding budget re-confirming an unchanged catalog.
+    # Staleness still counts CYCLES, so "3 missed cycles" here is ~9 days.
+    course_cycle_hours: int = 72
+    course_stale_after_cycles: int = 3
+    course_prune_after_days: int = 60
+    course_window_days: int = 90         # supply moves slowly; a wider window than jobs
+    # A skill taught by fewer than this many courses is real but thin supply.
+    course_low_confidence_min_courses: int = 3
+    course_neardup_recent_days: int = 30
+    # Coursera's public catalog page size; also the freeCodeCamp cert cap.
+    coursera_max_pages: int = 8
+    coursera_page_size: int = 100
+
     # --- ESCO mapping ---
     # Minimum cosine similarity for an embedding-based skill->ESCO mapping.
     # 0.80, lowered from the initial 0.85 guess on first-corpus evidence

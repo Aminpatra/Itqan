@@ -214,6 +214,25 @@ class FakeStructuredLLM:
                 poster_type="company" if company else "unknown",
             )
 
+        if schema.__name__ == "CourseExtraction":
+            from agents.agent_d_course_ingest.schemas import CourseExtraction
+
+            # Scan ONLY the course text, not the whole prompt — the system
+            # message lists example skills ("python", "machine learning") that
+            # would otherwise leak into every extraction and defeat the
+            # "no skills -> rejected" path. The human template puts the course
+            # after "DESCRIPTION:".
+            full = str(payload)
+            body = full.split("DESCRIPTION:", 1)[-1].casefold() if "DESCRIPTION:" in full else full.casefold()
+            skills = [s for s in ("python", "sql", "machine learning", "web design")
+                      if s in body]
+            level = "beginner" if "beginner" in body or "basics" in body else None
+            return CourseExtraction(
+                taught_skills=[s.title() if " " not in s else s for s in skills],
+                level=level,
+                subject="data science" if "data" in body else None,
+            )
+
         if schema.__name__ == "LegitimacyVerdict":
             from agents.agent_b_job_ingest.schemas import LegitimacyVerdict
 

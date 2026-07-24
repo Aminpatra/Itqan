@@ -1,0 +1,43 @@
+{
+  "elements": [
+    {
+      "id": "aaa",
+      "slug": "python-basics",
+      "name": "Python Basics",
+      "description": "Learn Python programming from scratch: variables, loops, functions and data structures.",
+      "partnerIds": ["443"],
+      "primaryLanguages": ["en"]
+    },
+    {
+      "id": "bbb",
+      "slug": "spss-logistic-regression",
+      "name": "SPSS: Logistic Regression",
+      "description": "Build practical skills in logistic regression and supervised learning using IBM SPSS.",
+      "partnerIds": ["1501"],
+      "primaryLanguages": ["en"]
+    },
+    {
+      "id": "ccc",
+      "slug": "cours-de-francais",
+      "name": "Cours de Francais",
+      "description": "Un cours pour apprendre le francais.",
+      "partnerIds": ["443"],
+      "primaryLanguages": ["fr"]
+    },
+    {
+      "id": "ddd",
+      "slug": "",
+      "name": "No Slug Course",
+      "description": "This element has no slug and must be skipped.",
+      "partnerIds": ["443"],
+      "primaryLanguages": ["en"]
+    }
+  ],
+  "paging": {"next": "4", "total": 8},
+  "linked": {
+    "partners.v1": [
+      {"id": "443", "name": "Google Cloud", "shortName": "googlecloud"},
+      {"id": "1501", "name": "IBM", "shortName": "ibm"}
+    ]
+  }
+}

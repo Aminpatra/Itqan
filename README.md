@@ -8,6 +8,9 @@ Two independent LangGraph agents that share nothing but `shared/`:
   posting store and an aggregated skill-demand table — filtering scams and never fabricating a count.
 - **Agent C** reads both and computes the candidate's **skill gap** against live postings, falling
   back to sector demand statistics when retrieval is thin. Fully deterministic — zero LLM calls.
+- **Agent D** is Agent B for **courses**: it ingests online courses (Coursera + freeCodeCamp),
+  extracts the skills each one *teaches*, and aggregates a `skill_supply_stats` table. Joined with
+  Agent B's demand on `esco_code`, it answers *which in-demand skills have few courses*.
 
 Built with LangChain + LangGraph, PaddleOCR for scanned documents, OpenAI for extraction and
 embeddings, and Postgres + pgvector for the job-market store, with the EU's ESCO taxonomy as the
@@ -482,6 +485,54 @@ freq-1 noise, and the gap saturated at a meaningless ~1.0.
 
 ---
 
+## Agent D — course ingestion (the supply side)
+
+Agent B ingests jobs → skill **demand**; Agent D ingests courses → skill **supply**. Same
+architecture (the scraping layer is shared in `shared/scraping/`), same ESCO vocabulary, same store
+patterns — on a **3-day cycle** (courses change far slower than jobs).
+
+```bash
+python main.py agent-d --migrate
+python main.py agent-d --once --dry-run --sources coursera --limit 5   # live, no writes
+python main.py agent-d --once --limit 20                               # a real cycle
+python main.py agent-d --check
+```
+
+Runtime dependency: the shared ESCO taxonomy, synced once by `agent-b --esco-sync`.
+
+**Sources.** Two consent models, deliberately different:
+- **Coursera** (`source_type='api'`) — the public Catalog API (23K courses). robots.txt disallows
+  `/api/` for **crawlers**; a documented public API consumed within its rate limits is governed by
+  its **terms**, gated by a human `terms_reviewed=True` (same discipline as the Telegram gate). API
+  sources do not robots-check; that override is recorded, never silent.
+- **freeCodeCamp** (`source_type='html_scrape'`) — a web scrape, so it **does** honor robots
+  (fully open). The 11 free certifications; curriculum is **CC-BY-SA-4.0**, so every row carries
+  `license` and `attribution`. We catalog skill facts + links, never redistribute content.
+
+**The pipeline** mirrors Agent B stage-for-stage, with two differences that fall out of "courses
+aren't scam-prone postings": there is **no legitimacy filter** (a **quality gate** rejects a course
+that yields no extractable skill instead), and **no link dedup** (courses have no cross-source
+links; near-dup by essence embedding still runs). Skills taught are extracted with the same
+recruiter-canonical-name discipline as job requirements, so the two sides aggregate on one
+vocabulary, and mapped into Agent D's own `course_esco_map` (never Agent B's `skill_esco_map`).
+
+**The payoff** — demand meets supply on `esco_code`:
+
+```sql
+SELECT es.preferred_label AS skill, d.frequency_count AS demand_jobs,
+       COALESCE(s.course_count, 0) AS supply_courses
+FROM skill_demand_stats d
+LEFT JOIN skill_supply_stats s USING (esco_code)
+JOIN esco_skills es ON es.esco_uri = d.esco_code
+WHERE d.window_end = (SELECT max(window_end) FROM skill_demand_stats)
+ORDER BY d.frequency_count DESC;
+```
+
+A high `demand_jobs` with a low `supply_courses` is a real market gap — an in-demand skill with few
+courses teaching it.
+
+---
+
 ## Layout
 
 ```
@@ -521,6 +572,7 @@ The agents in play:
 | **A** — `agent_a_cv_extraction` | CV + transcript files | `candidate_profile.json` |
 | **B** — `agent_b_job_ingest` | Public job sources (feed, Telegram, HTML) | `job_postings`, `skill_demand_stats` (Postgres) |
 | **C** — `agent_c_gap_analysis` | Agent A's profile **and** Agent B's tables (via `shared/job_market.py`) | `skill_gap.json` |
+| **D** — `agent_d_course_ingest` | Coursera API + freeCodeCamp | `courses`, `skill_supply_stats` (Postgres) |
 
 Agent B does **not** read `CandidateProfile`; that is Agent C's job. Agent B and Agent A share nothing but
 `shared/`, and neither knows the other exists.

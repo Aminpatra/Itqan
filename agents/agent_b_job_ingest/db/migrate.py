@@ -14,6 +14,7 @@ are not.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,8 +22,22 @@ import psycopg
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
-_BOOTSTRAP = """
-CREATE TABLE IF NOT EXISTS schema_migrations (
+# The default tracking table. A second agent applying its own migrations to the
+# SAME database (Agent D shares the itqan database) must use a DIFFERENT table,
+# or the two would collide on overlapping version numbers (both start at 0001).
+# Callers pass ``tracking_table=`` for that; the default keeps Agent B unchanged.
+DEFAULT_TRACKING_TABLE = "schema_migrations"
+
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _bootstrap_sql(tracking_table: str) -> str:
+    if not _IDENT.match(tracking_table):
+        # The table name is interpolated, not bound (identifiers cannot be
+        # parameters), so it must be a plain identifier — never user input.
+        raise MigrationError(f"invalid tracking table name: {tracking_table!r}")
+    return f"""
+CREATE TABLE IF NOT EXISTS {tracking_table} (
     version     text PRIMARY KEY,
     checksum    text        NOT NULL,
     applied_at  timestamptz NOT NULL DEFAULT now()
@@ -75,28 +90,44 @@ def discover(directory: Path | None = None) -> list[Migration]:
     return migrations
 
 
-def applied_versions(conn: psycopg.Connection) -> dict[str, str]:
+def applied_versions(
+    conn: psycopg.Connection, *, tracking_table: str = DEFAULT_TRACKING_TABLE
+) -> dict[str, str]:
     """version -> checksum for everything already applied."""
     with conn.cursor() as cur:
-        cur.execute("SELECT version, checksum FROM schema_migrations")
+        cur.execute(f"SELECT version, checksum FROM {_checked(tracking_table)}")
         return {row[0]: row[1] for row in cur.fetchall()}
 
 
-def apply_migrations(dsn: str, *, directory: Path | None = None) -> list[str]:
+def _checked(tracking_table: str) -> str:
+    if not _IDENT.match(tracking_table):
+        raise MigrationError(f"invalid tracking table name: {tracking_table!r}")
+    return tracking_table
+
+
+def apply_migrations(
+    dsn: str,
+    *,
+    directory: Path | None = None,
+    tracking_table: str = DEFAULT_TRACKING_TABLE,
+) -> list[str]:
     """Apply every pending migration. Returns the versions applied this run.
 
     Re-running against an up-to-date database is a no-op and returns ``[]`` —
     that property is the whole point, and it is what the phase gate checks.
+
+    ``tracking_table`` lets a second agent record its migrations separately in
+    the shared database (Agent D uses ``schema_migrations_agent_d``).
     """
     migrations = discover(directory)
     newly_applied: list[str] = []
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute(_BOOTSTRAP)
+            cur.execute(_bootstrap_sql(tracking_table))
         conn.commit()
 
-        already = applied_versions(conn)
+        already = applied_versions(conn, tracking_table=tracking_table)
 
         for migration in migrations:
             recorded = already.get(migration.version)
@@ -121,7 +152,8 @@ def apply_migrations(dsn: str, *, directory: Path | None = None) -> list[str]:
                     with conn.cursor() as cur:
                         cur.execute(migration.sql)
                         cur.execute(
-                            "INSERT INTO schema_migrations (version, checksum) VALUES (%s, %s)",
+                            f"INSERT INTO {_checked(tracking_table)} "
+                            "(version, checksum) VALUES (%s, %s)",
                             (migration.version, migration.checksum),
                         )
             except psycopg.Error as exc:
@@ -134,12 +166,17 @@ def apply_migrations(dsn: str, *, directory: Path | None = None) -> list[str]:
     return newly_applied
 
 
-def pending(dsn: str, *, directory: Path | None = None) -> list[str]:
+def pending(
+    dsn: str,
+    *,
+    directory: Path | None = None,
+    tracking_table: str = DEFAULT_TRACKING_TABLE,
+) -> list[str]:
     """Versions that would be applied, without applying them."""
     migrations = discover(directory)
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute(_BOOTSTRAP)
+            cur.execute(_bootstrap_sql(tracking_table))
         conn.commit()
-        already = applied_versions(conn)
+        already = applied_versions(conn, tracking_table=tracking_table)
     return [f"{m.version}_{m.name}" for m in migrations if m.version not in already]

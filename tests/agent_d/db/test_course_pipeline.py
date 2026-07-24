@@ -1,0 +1,198 @@
+﻿"""Agent D against real Postgres: store SQL, ESCO mapping tiers, supply
+aggregation, and the demand-vs-supply join that is the whole point.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+from agents.agent_b_job_ingest.esco_map import sync_taxonomy
+from agents.agent_d_course_ingest.aggregate import recompute_supply
+from agents.agent_d_course_ingest.esco_map import map_new_course_skills
+from agents.agent_d_course_ingest.pipeline import CoursePipeline
+from agents.agent_d_course_ingest.prompts.extraction import EXTRACTION_PROMPT
+from agents.agent_d_course_ingest.records import PersistedCourse
+from agents.agent_d_course_ingest.schemas import CourseExtraction
+from agents.agent_d_course_ingest.sources.base import RawCourse
+from shared.config import Config
+from shared.llm import structured
+from tests.fake_embedder import FakeEmbedder
+from tests.fake_llm import FakeStructuredLLM
+
+ESCO_FIXTURE = Path(__file__).parents[2] / "agent_b" / "fixtures" / "esco_skills_sample.csv"
+AS_OF = date(2026, 7, 24)
+
+
+def _cfg(store):
+    # map_skills_to_esco opens its OWN connection via config.database_url, so in
+    # tests it must be pointed at the test DB, not the env's dev database.
+    return Config(database_url=store.dsn)
+
+
+def _sync_esco(store):
+    # The taxonomy sync is Agent B's (it owns esco_skills/esco_labels); Agent D
+    # only READS them via the shared resolver. Sync through a JobStore on the
+    # same database, exactly as production does via `agent-b --esco-sync`.
+    from agents.agent_b_job_ingest.db import JobStore
+
+    with JobStore(store.dsn) as jb:
+        sync_taxonomy(jb, FakeEmbedder(), path=ESCO_FIXTURE, version="test-1")
+
+
+def _course(url, **kw):
+    return RawCourse(
+        source=kw.pop("source", "coursera"), source_group=kw.pop("group", "coursera"),
+        source_type=kw.pop("stype", "api"), source_url=url,
+        name=kw.pop("name", "Intro to Accounting"),
+        raw_description=kw.pop("body", "A course covering accounting and data analysis."),
+        provider=kw.pop("provider", "IBM"), primary_language="en",
+    )
+
+
+def _pipeline(store, llm=None, embedder=None):
+    llm = llm or FakeStructuredLLM(
+        CourseExtraction=CourseExtraction(taught_skills=["accounting", "data analysis"])
+    )
+    return CoursePipeline(
+        store=store, extractor=EXTRACTION_PROMPT | structured(llm, CourseExtraction),
+        embedder=embedder or FakeEmbedder(), config=Config(), model_name="fake",
+    )
+
+
+def _row(cid, **kw):
+    base = dict(course_id=cid, source="coursera", source_group="coursera", source_type="api",
+                source_url=f"https://c.test/{cid}", name=f"Course {cid}",
+                raw_description="d", content_hash=f"h_{cid}")
+    base.update(kw)
+    return PersistedCourse(**base)
+
+
+# ---------------------------------------------------------------------------
+# store SQL
+# ---------------------------------------------------------------------------
+def test_upsert_then_a_second_run_reports_unchanged(store):
+    llm, emb = FakeStructuredLLM(CourseExtraction=CourseExtraction(taught_skills=["accounting"])), FakeEmbedder()
+    batch = [_course("https://c.test/a"), _course("https://c.test/b", name="Data 101")]
+
+    first = _pipeline(store, llm, emb).run(batch)
+    assert first.written == 2
+
+    llm2, emb2 = FakeStructuredLLM(), FakeEmbedder()
+    second = _pipeline(store, llm2, emb2).run(batch)
+    assert second.unchanged == 2 and second.extractions == 0 and second.embeddings == 0
+    assert llm2.calls == [] and emb2.embed_calls == 0
+
+
+def test_neardup_similarity_direction(store):
+    """1 - distance; identical vector ~1.0, orthogonal ~0.0 â€” the classic bug."""
+    v0 = [0.0] * 1536; v0[0] = 1.0
+    v1 = [0.0] * 1536; v1[1] = 1.0
+    store.upsert_batch([_row("x", embedding=v0)])
+    store.connect().commit()
+
+    same = store.find_neardup_candidates(v0, recent_days=30, limit=5, exclude_id="q")
+    assert same and abs(same[0]["similarity"] - 1.0) < 1e-6
+    orth = store.find_neardup_candidates(v1, recent_days=30, limit=5, exclude_id="q")
+    assert orth and abs(orth[0]["similarity"]) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# ESCO mapping tiers (course_esco_map, never skill_esco_map)
+# ---------------------------------------------------------------------------
+def test_course_skills_map_through_the_shared_tiers_into_course_esco_map(store):
+    _sync_esco(store)
+    _pipeline(store).run([_course("https://c.test/a")])  # skills: accounting, data analysis
+
+    summary = map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    assert summary.exact >= 1        # accounting -> preferred label
+    assert summary.alt_label >= 1    # data analysis -> alt of "analyse data"
+
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT skill_key, method, esco_uri FROM course_esco_map ORDER BY skill_key")
+        rows = {r["skill_key"]: r for r in cur.fetchall()}
+        cur.execute("SELECT count(*) AS n FROM skill_esco_map")
+        assert cur.fetchone()["n"] == 0, "Agent D wrote into Agent B's skill_esco_map"
+
+    assert rows["accounting"]["method"] == "exact"
+    assert rows["data analysis"]["method"] == "alt_label"
+
+
+# ---------------------------------------------------------------------------
+# supply aggregation + esco_code fill
+# ---------------------------------------------------------------------------
+def test_supply_counts_courses_and_fills_esco_code(store):
+    _sync_esco(store)
+    _pipeline(store).run([
+        _course("https://c.test/a", name="Accounting A", provider="IBM"),
+        _course("https://c.test/b", name="Accounting B", provider="Google"),
+    ])
+    map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT skill, course_count, provider_count, esco_code, low_confidence "
+                    "FROM skill_supply_stats WHERE skill_key = 'accounting'")
+        row = cur.fetchone()
+    assert row["course_count"] == 2
+    assert row["provider_count"] == 2               # IBM + Google
+    assert row["esco_code"].endswith("/0004")       # accounting concept
+    assert row["low_confidence"] is True            # 2 < course_low_confidence_min_courses (3)
+
+
+def test_rejected_and_duplicate_courses_are_not_counted(store):
+    _sync_esco(store)
+    store.upsert_batch([
+        _row("good", taught_skills=["accounting"]),
+        _row("bad", taught_skills=["accounting"], status="rejected",
+             source_url="https://c.test/bad"),
+        _row("dup", taught_skills=["accounting"], duplicate_of="good",
+             source_url="https://c.test/dup"),
+    ])
+    store.connect().commit()
+    map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT course_count FROM skill_supply_stats WHERE skill_key='accounting'")
+        assert cur.fetchone()["course_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# the payoff: demand meets supply on esco_code
+# ---------------------------------------------------------------------------
+def test_demand_and_supply_join_on_esco_code(store):
+    _sync_esco(store)
+    # supply: two courses teach accounting
+    _pipeline(store, FakeStructuredLLM(CourseExtraction=CourseExtraction(taught_skills=["accounting"]))).run([
+        _course("https://c.test/a", name="Acc A"), _course("https://c.test/b", name="Acc B"),
+    ])
+    map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    # demand: a job stat row for the SAME esco concept (seed directly)
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO skill_demand_stats (sector, skill, skill_key, esco_code, window_start, "
+            "window_end, frequency_count, trend) VALUES "
+            "('2','Accounting','accounting','http://example.test/esco/skill/0004',"
+            "'2026-06-22','2026-07-22',9,'stable')"
+        )
+        conn.commit()
+        cur.execute(
+            """
+            SELECT d.frequency_count AS demand, s.course_count AS supply
+              FROM skill_demand_stats d
+              JOIN skill_supply_stats s USING (esco_code)
+             WHERE d.esco_code = 'http://example.test/esco/skill/0004'
+            """
+        )
+        row = cur.fetchone()
+    assert row["demand"] == 9 and row["supply"] == 2
