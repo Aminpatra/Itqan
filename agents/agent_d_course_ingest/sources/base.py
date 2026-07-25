@@ -41,6 +41,20 @@ class RawCourse:
     attribution: str | None = None
     license: str | None = None
 
+    # --- volatile quality/price signals (Agent E tie-breaking) --------------
+    # Deterministic, from the provider's response/page — NEVER inferred. Stored
+    # in the provider's own native scale (a 4.5 on Coursera and a 4.5 elsewhere
+    # are NOT normalized here — that is a consumer's query-time concern). A
+    # missing signal is None, never a 0. These refresh every cycle regardless of
+    # content_hash, because price and ratings drift while title/description do not.
+    rating: float | None = None
+    review_count: int | None = None
+    enrollment_count: int | None = None
+    last_updated: str | None = None      # ISO8601, the provider's own field if present
+    # {"amount": float|None, "currency": str|None, "is_free": bool}, or None when
+    # the provider reports no price at all. Free -> amount 0.0, is_free True.
+    price: dict | None = None
+
     def __post_init__(self) -> None:
         if self.source_type not in SOURCE_TYPES:
             raise ValueError(f"unknown source_type {self.source_type!r}; expected {SOURCE_TYPES}")

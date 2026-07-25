@@ -43,9 +43,14 @@ AGENTS = {
         "agents.agent_d_course_ingest.cli",
         "Ingest online courses into the course-supply tables (3-day cycle)",
     ),
+    "agent-e": (
+        "agents.agent_e_course_recommend.cli",
+        "Recommend one course per missing skill from a candidate's skill gap",
+    ),
     "pipeline": (
         "agents.pipeline",
-        "CV in, skill gap out: Agent A then Agent C in one run (C reads Agent B's tables)",
+        "CV in, course recommendations out: Agent A -> C -> E in one run "
+        "(C reads Agent B's tables, E reads Agent D's courses)",
     ),
 }
 

@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
-_AGGREGATE_SQL = """
+# Single source of truth for "a recommendable course", shared with the read
+# surface Agent E queries — imported so retrieval and aggregation never drift.
+from shared.course_market import AGGREGABLE_COURSE_PREDICATE
+
+_AGGREGATE_SQL = f"""
 INSERT INTO skill_supply_stats (
     skill, skill_key, esco_code, window_start, window_end,
     course_count, provider_count, levels, sample_courses, low_confidence, computed_at
@@ -29,8 +33,7 @@ WITH eligible AS (
            lower(btrim(required_skills.skill)) AS skill_key
       FROM courses,
            LATERAL unnest(taught_skills) AS required_skills(skill)
-     WHERE status = 'active'
-       AND duplicate_of IS NULL
+     WHERE {AGGREGABLE_COURSE_PREDICATE}
        AND btrim(required_skills.skill) <> ''
        AND first_seen_at::date > %(w_start)s
        AND first_seen_at::date <= %(w_end)s
@@ -83,9 +86,9 @@ ON CONFLICT (skill_key, window_end) DO UPDATE SET
     computed_at = now()
 """
 
-_SKILL_COUNT_SQL = """
+_SKILL_COUNT_SQL = f"""
 SELECT count(DISTINCT lower(btrim(s))) FROM courses, unnest(taught_skills) AS s
- WHERE status = 'active' AND duplicate_of IS NULL AND btrim(s) <> ''
+ WHERE {AGGREGABLE_COURSE_PREDICATE} AND btrim(s) <> ''
    AND first_seen_at::date > %(w_start)s AND first_seen_at::date <= %(w_end)s
 """
 

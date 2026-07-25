@@ -11,6 +11,9 @@ Two independent LangGraph agents that share nothing but `shared/`:
 - **Agent D** is Agent B for **courses**: it ingests online courses (Coursera + freeCodeCamp),
   extracts the skills each one *teaches*, and aggregates a `skill_supply_stats` table. Joined with
   Agent B's demand on `esco_code`, it answers *which in-demand skills have few courses*.
+- **Agent E** closes the loop: it recommends **one course per missing skill** from Agent C's gap and
+  Agent D's supply, via deterministic coverage-first selection, then writes a short grounded
+  rationale per pick (its only LLM call, fenced to the finalized data).
 
 Built with LangChain + LangGraph, PaddleOCR for scanned documents, OpenAI for extraction and
 embeddings, and Postgres + pgvector for the job-market store, with the EU's ESCO taxonomy as the
@@ -20,18 +23,25 @@ shared skill vocabulary.
 database read surface, which is what lets each be run, tested, or rewritten alone:
 
 ```
-                        one command:  python main.py pipeline --cv cv.pdf
+        one command, A -> C -> E:  python main.py pipeline --cv cv.pdf
+                                   (--no-recommend stops after the gap)
                         ┌──────────────────────────────────────────────┐
 CV/transcript ──▶ Agent A ── candidate_profile.json ──▶ Agent C ◀── job_postings +
                      (or agent-c --watch picks it up)      │        skill_demand_stats
                                                            ▼            ▲
-                                                     skill_gap.json     │ live Postgres reads,
-                                                                        │ every C run
-web sources ──▶ Agent B (12h cycle) ────────────────────────────────────┘
+                                                     skill_gap.json     │ live Postgres reads
+                                                           │            │
+                                                           ▼            │
+                              Agent E ── course_recommendations.json    │
+                                 ▲                                      │
+web sources ──▶ Agent B (12h cycle) ────────────────────────────────────┤
+web sources ──▶ Agent D (3-day cycle) ── courses / skill_supply_stats ──┘
+                        (Agent E reads these via shared/course_market.py)
 ```
 
-Agent A is documented first; **[Agent B](#agent-b--scheduled-job-ingestion)** and
-**[Agent C](#agent-c--skill-gap-analysis)** have their own sections below.
+Agent A is documented first; **[Agent B](#agent-b--scheduled-job-ingestion)**,
+**[Agent C](#agent-c--skill-gap-analysis)**, **[Agent D](#agent-d--course-ingestion-the-supply-side)**,
+and **[Agent E](#agent-e--course-recommendation-closing-the-loop)** have their own sections below.
 
 ---
 
@@ -530,6 +540,44 @@ ORDER BY d.frequency_count DESC;
 
 A high `demand_jobs` with a low `supply_courses` is a real market gap — an in-demand skill with few
 courses teaching it.
+
+---
+
+## Agent E — course recommendation (closing the loop)
+
+Agent E turns a candidate's **skill gap** (Agent C) into concrete course suggestions from the
+**supply** (Agent D): **exactly one course per missing skill**. Selection is **deterministic — no
+LLM**; the single LLM call is a short, grounded **rationale** per recommendation, fenced to the
+already-finalized record so it can explain the choice but never change it.
+
+```bash
+python main.py agent-e --gap output/<run>/skill_gap.json                 # select + one rationale each
+python main.py agent-e --gap output/<run>/skill_gap.json --no-rationale  # selection only, no API key
+```
+
+Runtime inputs: a `skill_gap.json` with `aggregate.missing_skill_details` (Agent C enrichment) and
+Agent D's course tables. Agent E reads Agent D only through `shared/course_market.py` — never its
+internals.
+
+**The graph** is `load_missing_skills → retrieve_candidate_courses → greedy_cover_assign →
+attach_flags → generate_rationale → persist`:
+- **Missing skills** come from Agent C's deduped aggregate (per-job `possible_match_skills` are
+  excluded by construction — only confirmed gaps produce a recommendation). Each carries its
+  `esco_code` and inherited `priority_score`.
+- **Retrieval** is by ESCO code, with an **exact `skill_key` fallback** for skills that never mapped
+  to a concept (an exact match only — an unmapped skill is exactly where a fuzzy guess does harm).
+- **Selection** is a weighted **greedy set-cover**: pick the course maximizing
+  `(#uncovered skills it covers) × (their summed priority)`, ties broken by a **config list**
+  (`agent_e_tiebreak`, default rating → review_count → last_updated → price) with **nulls always last
+  and never coerced to 0**, and a final `course_id` tiebreak for total determinism. A course covering
+  several missing skills is recommended **once**, the rest listed in `covers_other_skills`. A skill
+  with no candidate becomes `no_course_found` (and the LLM is skipped for it).
+- **The rationale** is the ONLY LLM step. It receives a plain fact sheet (title, provider, rating,
+  reviews, price, a `priority_bucket` word) — never the raw `priority_score`, ESCO codes, or
+  `gap_score` — so it cannot leak internal terms or invent beyond the given facts. Nulls are omitted,
+  never guessed; `used_fallback` softens the language.
+
+Output: `output/<run>/course_recommendations.json` (`schema_version` `itqan.course_reco/1.0`).
 
 ---
 

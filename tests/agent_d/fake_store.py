@@ -41,6 +41,27 @@ class FakeCourseStore:
                 self.rows[i].status = "active"
         return len(ids)
 
+    def refresh_volatile(self, rows: list[dict]) -> int:
+        """Mirror the store: update volatile columns on existing rows, no
+        re-embed. Only counts rows that actually exist (like the real UPDATE)."""
+        n = 0
+        for r in rows:
+            row = self.rows.get(r["course_id"])
+            if row is None:
+                continue
+            row.rating = r["rating"]
+            row.review_count = r["review_count"]
+            row.enrollment_count = r["enrollment_count"]
+            row.last_updated = r["last_updated"]
+            row.price_amount = r["price_amount"]
+            row.price_currency = r["price_currency"]
+            row.price_is_free = r["price_is_free"]
+            if row.status == "stale":
+                row.status = "active"
+            self.touched.append(r["course_id"])
+            n += 1
+        return n
+
     def upsert_batch(self, rows: list[Any]) -> None:
         self.upsert_calls += 1
         ordered = sorted(rows, key=lambda r: r.duplicate_of is not None)

@@ -39,6 +39,9 @@ class IngestSummary:
     extractions: int = 0
     embeddings: int = 0
     written: int = 0
+    # Unchanged courses whose volatile quality/price signals were refreshed this
+    # cycle without re-extracting or re-embedding.
+    volatile_refreshed: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return dict(self.__dict__)
@@ -72,19 +75,22 @@ class CoursePipeline:
         deduped = _dedupe(courses)
         stored = self.store.lookup_hashes([id_for(c) for c in deduped])
 
-        unchanged_ids: list[str] = []
+        unchanged_volatile: list[dict] = []
         work: list[_Work] = []
         for raw in deduped:
             cid = id_for(raw)
             chash = content_hash(raw)
             if stored.get(cid) == chash:
-                unchanged_ids.append(cid)
+                # Content unchanged, but price/rating may have moved: refresh the
+                # volatile signals every cycle WITHOUT re-extracting or embedding.
+                unchanged_volatile.append(_volatile_row(cid, raw))
                 continue
             summary.new += cid not in stored
             summary.changed += cid in stored
             work.append(self._new_work(raw, cid, chash))
 
-        summary.unchanged = self.store.touch_seen(unchanged_ids)
+        summary.unchanged = self.store.refresh_volatile(unchanged_volatile)
+        summary.volatile_refreshed = summary.unchanged
 
         # extract, then the quality gate (needs the skills to judge them)
         for item in work:
@@ -116,6 +122,12 @@ class CoursePipeline:
             provider=raw.provider, level=raw.level, primary_language=raw.primary_language,
             attribution=raw.attribution, license=raw.license,
             extraction_model=self.model_name,
+            # Volatile signals travel with the full upsert for changed/new courses
+            # (unchanged ones go through refresh_volatile instead). Deterministic,
+            # no LLM — they came straight from the provider response/page.
+            rating=raw.rating, review_count=raw.review_count,
+            enrollment_count=raw.enrollment_count, last_updated=raw.last_updated,
+            **PersistedCourse.price_columns(raw.price),
         )
         return _Work(raw=raw, course_id=cid, content_hash=chash, row=row)
 
@@ -208,6 +220,18 @@ class CoursePipeline:
 
 
 # ---------------------------------------------------------------------------
+def _volatile_row(cid: str, raw: RawCourse) -> dict:
+    """The volatile-column payload for an unchanged course's cheap refresh."""
+    return {
+        "course_id": cid,
+        "rating": raw.rating,
+        "review_count": raw.review_count,
+        "enrollment_count": raw.enrollment_count,
+        "last_updated": raw.last_updated,
+        **PersistedCourse.price_columns(raw.price),
+    }
+
+
 def _dedupe(courses: list[RawCourse]) -> list[RawCourse]:
     seen: set[str] = set()
     out: list[RawCourse] = []

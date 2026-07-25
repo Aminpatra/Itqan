@@ -232,6 +232,39 @@ def test_demand_frequency_weights_the_gap_score(profile_path, tmp_path):
     assert state["aggregate"]["most_common_missing_skills"][0] == "heavy-missing"
 
 
+def test_missing_skill_details_carries_esco_and_priority_for_agent_e(profile_path, tmp_path):
+    """The additive per-skill detail Agent E inherits: same skills and order as
+    most_common_missing_skills, each with its esco_code (or None when the skill
+    never mapped — never guessed) and its summed-demand priority_score."""
+    embedder = PinnedEmbedder({
+        "alpha": CANDIDATE_AXIS,
+        "heavy-missing": _pin(0.10),   # esco-coded, freq 9 over 5 jobs -> priority 45
+        "light-missing": _pin(0.10),   # unmapped, freq 2 over 5 jobs -> priority 10, esco None
+        "hit": _pin(0.90),
+    })
+    postings = [_posting(f"p{i}", 0.85, skills=["heavy-missing", "light-missing", "hit"])
+                for i in range(5)]
+    stats = [_stat("heavy-missing", esco="uri:HM", freq=9),
+             _stat("light-missing", freq=2)]
+    state = run_graph(profile_path, tmp_path, postings=postings, stats=stats,
+                      embedder=embedder)
+
+    details = state["aggregate"]["missing_skill_details"]
+    # order + membership mirror most_common_missing_skills
+    assert [d["skill"] for d in details] == state["aggregate"]["most_common_missing_skills"]
+    by_skill = {d["skill"]: d for d in details}
+    # priority_score is the demand weight summed across every job the skill is
+    # missing in (freq 9 x 5 postings = 45; freq 2 x 5 = 10).
+    assert by_skill["heavy-missing"] == {
+        "skill": "heavy-missing", "esco_code": "uri:HM", "priority_score": 45,
+    }
+    assert by_skill["light-missing"] == {
+        "skill": "light-missing", "esco_code": None, "priority_score": 10,
+    }
+    # 'hit' matched -> never a missing detail
+    assert "hit" not in by_skill
+
+
 # ---------------------------------------------------------------------------
 # output contract
 # ---------------------------------------------------------------------------

@@ -33,11 +33,13 @@ def make_pipeline(store=None, llm=None, embedder=None):
 
 
 def course(url, *, source="coursera", group="coursera", stype="api",
-           name="Python Basics", body=None, provider="Google Cloud"):
+           name="Python Basics", body=None, provider="Google Cloud",
+           rating=None, review_count=None, price=None):
     return RawCourse(
         source=source, source_group=group, source_type=stype, source_url=url,
         name=name, raw_description=body or "Learn Python and SQL from the basics.",
         provider=provider, primary_language="en", license=None,
+        rating=rating, review_count=review_count, price=price,
     )
 
 
@@ -57,6 +59,40 @@ def test_second_run_does_zero_llm_and_embedding_work():
     assert second.unchanged == 2
     assert second.extractions == 0 and second.embeddings == 0
     assert llm2.calls == [] and emb2.embed_calls == 0
+
+
+def test_volatile_signals_refresh_every_cycle_independent_of_content_hash():
+    """Price/rating drift while title+description (the content_hash) do not. A
+    second cycle with the SAME content but a CHANGED rating/price must update the
+    stored volatile fields WITHOUT re-extracting or re-embedding."""
+    store = FakeCourseStore()
+    pipe, _, _ = make_pipeline(store=store)
+    pipe.run([course("https://c.test/a", rating=4.1,
+                     price={"amount": 49.0, "currency": "USD", "is_free": False})])
+    row = next(iter(store.rows.values()))
+    assert row.rating == 4.1 and row.price_amount == 49.0
+
+    # Same content_hash (name+body unchanged), new rating + price.
+    pipe2, llm2, emb2 = make_pipeline(store=store)
+    summary = pipe2.run([course("https://c.test/a", rating=4.7,
+                                price={"amount": 12.0, "currency": "USD", "is_free": False})])
+
+    assert summary.unchanged == 1 and summary.volatile_refreshed == 1
+    assert summary.extractions == 0 and summary.embeddings == 0   # content-gated path skipped
+    assert llm2.calls == [] and emb2.embed_calls == 0
+    assert row.rating == 4.7, "rating did not refresh on an unchanged course"
+    assert row.price_amount == 12.0, "price did not refresh on an unchanged course"
+
+
+def test_free_course_stores_amount_zero_not_null():
+    store = FakeCourseStore()
+    pipe, _, _ = make_pipeline(store=store)
+    pipe.run([course("https://c.test/free",
+                     price={"amount": 0.0, "currency": None, "is_free": True})])
+    row = next(iter(store.rows.values()))
+    assert row.price_is_free is True
+    assert row.price_amount == 0.0 and row.price_amount is not None
+    assert row.price_currency is None
 
 
 def test_a_changed_course_is_re_extracted():

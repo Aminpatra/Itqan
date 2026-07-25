@@ -304,15 +304,26 @@ def make_gap_analysis(deps: Deps) -> Callable[[GapState], dict]:
                 missing_weight[key] = missing_weight.get(key, 0) + weight(
                     key, key_to_esco.get(key)
                 )
-        top_missing = [
-            k for k, _w in sorted(missing_weight.items(), key=lambda kv: (-kv[1], kv[0]))
-        ][:10]
+        ranked_missing = sorted(
+            missing_weight.items(), key=lambda kv: (-kv[1], kv[0])
+        )[:10]
+        top_missing = [k for k, _w in ranked_missing]
+        # Additive: the per-skill detail Agent E inherits — its esco_code (for
+        # course retrieval) and priority_score (the summed demand weight, used as
+        # the coverage-selection weight). Same skills, same order as
+        # most_common_missing_skills; esco_code is None when the skill never
+        # mapped to the vocabulary (never guessed).
+        missing_skill_details = [
+            {"skill": k, "esco_code": key_to_esco.get(k), "priority_score": w}
+            for k, w in ranked_missing
+        ]
 
         scores = [j["gap_score"] for j in matched_jobs]
         if fallback_gap:
             scores.append(fallback_gap["gap_score"])
         aggregate = {
             "most_common_missing_skills": top_missing,
+            "missing_skill_details": missing_skill_details,
             "average_gap_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
         }
 

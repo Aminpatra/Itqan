@@ -123,6 +123,11 @@ class FreeCodeCampAdapter(BaseAdapter):
             primary_language="en",
             attribution=ATTRIBUTION,
             license=LICENSE,
+            # freeCodeCamp certifications are free. amount 0.0 (NOT null), no
+            # currency (none applies to a $0 course). It exposes no rating /
+            # enrollment / last-updated, so those stay None — a missing signal is
+            # missing, never a fabricated 0.
+            price={"amount": 0.0, "currency": None, "is_free": True},
         )
 
 

@@ -21,7 +21,9 @@ from tests.fake_embedder import FakeEmbedder
 from tests.fake_llm import FakeStructuredLLM
 
 ESCO_FIXTURE = Path(__file__).parents[2] / "agent_b" / "fixtures" / "esco_skills_sample.csv"
-AS_OF = date(2026, 7, 24)
+# today, not a hardcoded date: courses are first_seen at the server's now(), and
+# the supply window ends at as_of — a fixed past date would exclude today's rows.
+AS_OF = date.today()
 
 
 def _cfg(store):
@@ -82,6 +84,31 @@ def test_upsert_then_a_second_run_reports_unchanged(store):
     second = _pipeline(store, llm2, emb2).run(batch)
     assert second.unchanged == 2 and second.extractions == 0 and second.embeddings == 0
     assert llm2.calls == [] and emb2.embed_calls == 0
+
+
+def test_refresh_volatile_updates_price_and_rating_without_touching_embedding(store):
+    """The lightweight every-cycle path: volatile columns + price_observed_at
+    change; the embedding (the expensive content-gated artifact) does not."""
+    vec = [0.25] * 1536
+    store.upsert_batch([_row("c", embedding=vec, rating=4.0)])
+    store.connect().commit()
+
+    store.refresh_volatile([{
+        "course_id": "c", "rating": 4.8, "review_count": 500, "enrollment_count": 9000,
+        "last_updated": None, "price_amount": 0.0, "price_currency": None, "price_is_free": True,
+    }])
+    store.connect().commit()
+
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT rating, review_count, enrollment_count, price_is_free, price_amount, "
+                    "price_observed_at, embedding FROM courses WHERE course_id='c'")
+        row = cur.fetchone()
+    assert float(row["rating"]) == 4.8
+    assert row["review_count"] == 500 and row["enrollment_count"] == 9000
+    assert row["price_is_free"] is True and float(row["price_amount"]) == 0.0
+    assert row["price_observed_at"] is not None
+    assert row["embedding"] is not None, "refresh_volatile disturbed the embedding"
 
 
 def test_neardup_similarity_direction(store):

@@ -192,6 +192,47 @@ class CourseStore:
             )
             return cur.rowcount
 
+    def refresh_volatile(self, rows: list[dict[str, Any]]) -> int:
+        """The lightweight every-cycle path for UNCHANGED courses.
+
+        Updates the volatile quality/price columns (which drift while the
+        content_hash does not) and does the same touch as ``touch_seen`` — but
+        NO re-extraction and NO re-embedding. This is what keeps a course's price
+        fresh between the expensive content-gated cycles. ``price_observed_at`` is
+        stamped now(), because the honest record of a fluctuating price is "this
+        is what it was when we last looked".
+
+        Each row: {course_id, rating, review_count, enrollment_count,
+        last_updated, price_amount, price_currency, price_is_free}.
+        """
+        if not rows:
+            return 0
+        conn = self.connect()
+        n = 0
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    """
+                    UPDATE courses SET
+                        rating = %(rating)s,
+                        review_count = %(review_count)s,
+                        enrollment_count = %(enrollment_count)s,
+                        last_updated = %(last_updated)s,
+                        price_amount = %(price_amount)s,
+                        price_currency = %(price_currency)s,
+                        price_is_free = %(price_is_free)s,
+                        price_observed_at = now(),
+                        last_seen_at = now(),
+                        missed_cycles = 0,
+                        status = CASE WHEN status = 'stale' THEN 'active' ELSE status END,
+                        stale_since = CASE WHEN status = 'stale' THEN NULL ELSE stale_since END
+                     WHERE course_id = %(course_id)s
+                    """,
+                    row,
+                )
+                n += cur.rowcount
+        return n
+
     def upsert_batch(self, rows: list[Any]) -> None:
         if not rows:
             return
@@ -388,13 +429,18 @@ INSERT INTO courses (
     name, raw_description, content_hash, status,
     taught_skills, provider, level, primary_language, subject, country,
     review_reason, duplicate_of, attribution, license, extraction_model, embedding,
+    rating, review_count, enrollment_count, last_updated,
+    price_amount, price_currency, price_is_free, price_observed_at,
     first_seen_at, last_seen_at, missed_cycles, stale_since
 ) VALUES (
     %(course_id)s, %(source)s, %(source_group)s, %(source_type)s, %(source_url)s,
     %(name)s, %(raw_description)s, %(content_hash)s, %(status)s,
     %(taught_skills)s, %(provider)s, %(level)s, %(primary_language)s, %(subject)s, %(country)s,
     %(review_reason)s, %(duplicate_of)s, %(attribution)s, %(license)s, %(extraction_model)s,
-    %(embedding)s, now(), now(), 0, NULL
+    %(embedding)s,
+    %(rating)s, %(review_count)s, %(enrollment_count)s, %(last_updated)s,
+    %(price_amount)s, %(price_currency)s, %(price_is_free)s, now(),
+    now(), now(), 0, NULL
 )
 ON CONFLICT (course_id) DO UPDATE SET
     source = EXCLUDED.source, source_group = EXCLUDED.source_group,
@@ -407,6 +453,10 @@ ON CONFLICT (course_id) DO UPDATE SET
     review_reason = EXCLUDED.review_reason, duplicate_of = EXCLUDED.duplicate_of,
     attribution = EXCLUDED.attribution, license = EXCLUDED.license,
     extraction_model = EXCLUDED.extraction_model, embedding = EXCLUDED.embedding,
+    rating = EXCLUDED.rating, review_count = EXCLUDED.review_count,
+    enrollment_count = EXCLUDED.enrollment_count, last_updated = EXCLUDED.last_updated,
+    price_amount = EXCLUDED.price_amount, price_currency = EXCLUDED.price_currency,
+    price_is_free = EXCLUDED.price_is_free, price_observed_at = now(),
     last_seen_at = now(), missed_cycles = 0, stale_since = NULL
 """
 
@@ -421,4 +471,8 @@ def _row_params(row: Any) -> dict[str, Any]:
         "country": row.country, "review_reason": row.review_reason,
         "duplicate_of": row.duplicate_of, "attribution": row.attribution, "license": row.license,
         "extraction_model": row.extraction_model, "embedding": row.embedding,
+        "rating": row.rating, "review_count": row.review_count,
+        "enrollment_count": row.enrollment_count, "last_updated": row.last_updated,
+        "price_amount": row.price_amount, "price_currency": row.price_currency,
+        "price_is_free": row.price_is_free,
     }

@@ -143,6 +143,12 @@ class Config:
     # Coursera's public catalog page size; also the freeCodeCamp cert cap.
     coursera_max_pages: int = 8
     coursera_page_size: int = 100
+    # Enrich each kept Coursera course by fetching its public course page
+    # (robots-allowed) for rating/review_count/enrollment — the API exposes none
+    # of these. One extra ~0.5-1MB fetch per course every cycle; set False to
+    # skip and leave those fields NULL for Coursera.
+    coursera_enrich: bool = True
+    coursera_enrich_interval_s: float = 1.0
 
     # --- ESCO mapping ---
     # Minimum cosine similarity for an embedding-based skill->ESCO mapping.
@@ -184,6 +190,16 @@ class Config:
     # missing.
     agent_c_skill_match: float = 0.80
     agent_c_skill_possible: float = 0.60
+
+    # --- Agent E (course recommender) ---
+    # When several courses tie on coverage value, break the tie by these fields
+    # in order. A config LIST, not a hardcoded chain, so product can reorder it
+    # without a code change (the task explicitly required this). Nulls always
+    # sort LAST in every field (a missing rating never beats a real one, and is
+    # never coerced to 0); a final tie breaks on the lowest course_id, so the
+    # selection is always total and reproducible. Valid fields: rating,
+    # review_count, last_updated, price.
+    agent_e_tiebreak: tuple[str, ...] = ("rating", "review_count", "last_updated", "price")
 
     # --- scraping ---
     user_agent: str = field(

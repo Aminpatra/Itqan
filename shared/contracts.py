@@ -183,3 +183,66 @@ class SkillDemandStatRow(BaseModel):
     sample_postings: list[dict[str, Any]] = Field(default_factory=list)
     low_confidence: bool = False
     computed_at: str
+
+
+# ---------------------------------------------------------------------------
+# Agent D -> Agent E: the course price sub-shape.
+#
+# The one structured (non-scalar) course quality signal, published here so a
+# future course consumer (Agent E) has a typed home for it. The rest of the
+# quality signals (rating, review_count, enrollment_count, last_updated) are
+# plain scalars and live directly on the course record / table.
+# ---------------------------------------------------------------------------
+
+class CoursePrice(BaseModel):
+    """A course's price as reported by its provider at ingestion time.
+
+    Stored as reported — NEVER normalized across providers, and never inferred.
+    A provider that exposes no price at all yields ``price = None`` on the record
+    (not this object with guessed values); this object is only built when the
+    provider actually reports price. A free course is
+    ``{amount: 0.0, currency: None, is_free: True}`` — amount is 0.0, never null.
+
+    ``currency`` is Optional (deviating from a bare ``str``): a $0 course has no
+    meaningful currency, and inventing one ("USD") would be exactly the kind of
+    fabrication the rest of this system refuses. Cross-provider comparability is
+    a query-time concern for the consumer, not an ingestion-time normalization.
+    """
+
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    is_free: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Agent D -> Agent E: one retrievable course, as served by shared.course_market.
+#
+# The supply-side analog of JobPostingExport. Carries exactly the facts Agent E
+# needs to pick a course and write a grounded rationale — the taught skills, the
+# link, and the volatile quality/price signals — and nothing about Agent D's
+# internal bookkeeping (content_hash, duplicate_of, embedding, staleness). Every
+# quality field is Optional because "the provider did not report it" is a real,
+# common answer that must stay null, never a guessed 0.
+# ---------------------------------------------------------------------------
+
+class CourseCandidate(BaseModel):
+    """One course that teaches at least one requested skill.
+
+    ``rating`` is stored on the provider's own native scale (NOT normalized) and
+    is None when the provider publishes none. ``price`` is a full CoursePrice or
+    None (never a fabricated placeholder). Which of the caller's skills this
+    course covers is set-relative, so it is computed by Agent E per run, not
+    carried on this record.
+    """
+
+    course_id: str
+    title: str                                  # the course's `name` column
+    provider: Optional[str] = None
+    url: str                                     # the course's `source_url` column
+    taught_skills: list[str] = Field(default_factory=list)
+
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
+    enrollment_count: Optional[int] = None
+    last_updated: Optional[str] = None           # ISO8601, or None
+    price: Optional[CoursePrice] = None
