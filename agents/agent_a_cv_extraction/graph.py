@@ -13,6 +13,7 @@
            |--[no gaps / rounds spent]--> research_curriculum
       -> research_curriculum   what the courses/certs typically teach
       -> judge_skills          claims cross-checked against that evidence
+      -> derive_coursework_skills  promote unclaimed skills the coursework teaches
       -> summarize             few-shot
       -> persist
       -> END
@@ -35,6 +36,7 @@ from shared.config import Config
 from .nodes import (
     human_review,
     make_assess_gaps_node,
+    make_derive_coursework_skills_node,
     make_extract_text_node,
     make_ingest_node,
     make_judge_skills_node,
@@ -72,6 +74,7 @@ def build_graph(llm: Any, config: Config | None = None, *, checkpointer: Any = N
     builder.add_node("validate_human_input", make_validate_human_node(llm, config))
     builder.add_node("research_curriculum", make_research_curriculum_node(llm, config))
     builder.add_node("judge_skills", make_judge_skills_node(llm, config))
+    builder.add_node("derive_coursework_skills", make_derive_coursework_skills_node(llm, config))
     builder.add_node("summarize", make_summarize_node(llm, config))
     builder.add_node("persist", make_persist_node(config))
 
@@ -107,7 +110,10 @@ def build_graph(llm: Any, config: Config | None = None, *, checkpointer: Any = N
     builder.add_edge("validate_human_input", "assess_gaps")
 
     builder.add_edge("research_curriculum", "judge_skills")
-    builder.add_edge("judge_skills", "summarize")
+    # Derivation runs after judging so it can dedup against the accepted/rejected
+    # claims, and reuses the same judge to filter its own candidates.
+    builder.add_edge("judge_skills", "derive_coursework_skills")
+    builder.add_edge("derive_coursework_skills", "summarize")
     builder.add_edge("summarize", "persist")
     builder.add_edge("persist", END)
 

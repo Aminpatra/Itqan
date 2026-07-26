@@ -80,6 +80,15 @@ WHAT TO LIST when recognized:
   that field use, since these are compared against a practitioner's own wording.
 - `typical_concepts`: the theory and principles covered, as distinct from the
   practical skills above.
+- `key_skills_taught`: the credential's CORE concrete skills, listed IN FULL and
+  independent of the claimed list — the specific, recruiter-searchable tools, methods,
+  languages, standards or techniques a graduate can genuinely do afterwards. List these
+  even when the candidate never claimed them: this field exists to surface skills the
+  candidate gained but may not have written down. "Database Systems" belongs SQL,
+  relational modelling, query optimisation here; "Computer Networks" belongs TCP/IP,
+  routing, packet analysis. Same rules as typical_skills: name the specific components,
+  never the umbrella ("databases", "networking"), and stay within what the course at its
+  stated level reliably teaches — do not pad with the whole field.
 
 NAME THE COMPONENTS, NOT THE UMBRELLA. `typical_skills` is matched against the skills a
 candidate listed, and candidates list specific tools. An umbrella term matches nothing

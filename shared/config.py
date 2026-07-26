@@ -58,6 +58,16 @@ class Config:
     # Bounded HITL loop — after this many rounds, unfilled gaps finalize as null.
     max_review_rounds: int = 2
 
+    # Promote skills the candidate credibly gained from completed coursework
+    # (transcript + CV courses/certificates) but never wrote on their CV, so a
+    # job-matcher can see them. They are added to skills.accepted flagged
+    # origin="coursework_derived" and capped at "medium" quality — always below a
+    # CV skill backed by a project or certificate. Set False to skip entirely.
+    derive_coursework_skills: bool = True
+    # Ceiling on how many derived skills to add: a full degree transcript can
+    # teach dozens, and past a point they dilute the profile rather than enrich it.
+    max_coursework_derived_skills: int = 15
+
     ocr_lang: str = "en"
     pdf_raster_dpi: int = 200
 

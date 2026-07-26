@@ -1,6 +1,7 @@
 """Graph nodes. Each factory takes its dependencies and returns the node callable."""
 
 from .curriculum import make_research_curriculum_node
+from .derive_skills import make_derive_coursework_skills_node
 from .gaps import make_assess_gaps_node, make_route_gaps
 from .human_review import human_review
 from .ingest import make_extract_text_node, make_ingest_node
@@ -25,6 +26,7 @@ __all__ = [
     "make_assess_gaps_node",
     "make_route_gaps",
     "make_research_curriculum_node",
+    "make_derive_coursework_skills_node",
     "human_review",
     "make_validate_human_node",
     "make_judge_skills_node",

@@ -132,6 +132,12 @@ class CredentialCurriculum(BaseModel):
     recognized: bool
     typical_skills: list[str] = Field(default_factory=list)
     typical_concepts: list[str] = Field(default_factory=list)
+    # The concrete, named skills this credential centrally teaches, listed in FULL
+    # and independent of what the candidate claimed — the raw material for
+    # promoting skills the candidate gained but never wrote on their CV. Unlike
+    # typical_skills (which is steered toward the claimed set for corroboration),
+    # this is the credential's own core syllabus. See nodes/derive_skills.py.
+    key_skills_taught: list[str] = Field(default_factory=list)
     # The decisive field. Which of the skills the candidate ACTUALLY CLAIMED does
     # this credential normally teach? Asking directly beats emitting a generic
     # syllabus and hoping its vocabulary happens to match the candidate's wording

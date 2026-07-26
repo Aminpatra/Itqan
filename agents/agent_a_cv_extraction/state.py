@@ -94,8 +94,9 @@ class AgentState(TypedDict, total=False):
 
     # ---- judging and output ---------------------------------------------
     # What the candidate's courses/certificates typically teach. Background
-    # knowledge about syllabi, used to corroborate claimed skills — never a
-    # source of new skills. See nodes/curriculum.py.
+    # knowledge about syllabi: used to corroborate claimed skills (judge_skills)
+    # and, when enabled, to derive unclaimed skills the coursework teaches
+    # (derive_coursework_skills). See nodes/curriculum.py and nodes/derive_skills.py.
     curriculum: list[dict[str, Any]]
     accepted_skills: list[dict[str, Any]]
     rejected_skills: list[dict[str, Any]]

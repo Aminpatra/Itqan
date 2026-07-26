@@ -139,6 +139,7 @@ def make_persist_node(config: Config):
                         credential_kind=entry.get("credential_kind", "course"),
                         typical_skills=entry.get("typical_skills") or [],
                         typical_concepts=entry.get("typical_concepts") or [],
+                        key_skills_taught=entry.get("key_skills_taught") or [],
                         covers_claimed_skills=entry.get("covers_claimed_skills") or [],
                         grade_achieved=entry.get("grade_achieved"),
                     )

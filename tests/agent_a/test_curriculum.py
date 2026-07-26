@@ -148,14 +148,25 @@ def test_skipped_when_there_are_no_credentials():
     assert result["curriculum"] == []
 
 
-def test_skipped_when_there_are_no_skills_to_corroborate():
-    """Curriculum only ever corroborates claimed skills, so with no claims there
-    is nothing to research and no call worth paying for."""
+def test_skipped_when_no_claims_and_derivation_off():
+    """With no claims to corroborate AND coursework derivation disabled, there is
+    nothing to research and no call worth paying for."""
     fake = FakeStructuredLLM()
-    node = make_research_curriculum_node(fake, Config())
+    node = make_research_curriculum_node(fake, Config(derive_coursework_skills=False))
     result = node({"cv_extraction": {"skills": [], "courses": [{"title": "Machine Learning"}]}})
     assert result["curriculum"] == []
     assert "CurriculumResearch" not in fake.calls
+
+
+def test_runs_without_claims_when_derivation_is_on():
+    """Coursework derivation feeds on typical_skills, so with derivation enabled
+    (the default) the research runs even for a claim-less CV — the transcript's
+    syllabi are exactly what gets promoted downstream."""
+    fake = FakeStructuredLLM()
+    node = make_research_curriculum_node(fake, Config())   # derive on by default
+    result = node({"cv_extraction": {"skills": [], "courses": [{"title": "Machine Learning"}]}})
+    assert result["curriculum"], "research should run to feed coursework derivation"
+    assert "CurriculumResearch" in fake.calls
 
 
 def test_evidence_context_fences_curriculum_as_non_document():

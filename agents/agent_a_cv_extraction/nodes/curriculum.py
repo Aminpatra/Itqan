@@ -118,8 +118,11 @@ def make_research_curriculum_node(llm: Any, config: Config):
             for s in (state.get("cv_extraction") or {}).get("skills") or []
             if isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"].strip()
         ]
-        # Nothing to corroborate means nothing to research.
-        if not claimed:
+        # Nothing to corroborate AND nothing to derive means nothing to research.
+        # When coursework derivation is on we research even a claim-less CV, because
+        # the transcript's typical_skills are exactly what derive_coursework_skills
+        # promotes; covers_claimed_skills just comes back empty.
+        if not claimed and not config.derive_coursework_skills:
             return {"curriculum": [], "trace": ["research_curriculum(no skills)"]}
 
         try:
@@ -153,7 +156,8 @@ def make_research_curriculum_node(llm: Any, config: Config):
             # carries no curriculum and must not reach the judge as if it did.
             if title_key not in known_titles or not entry.get("recognized"):
                 continue
-            if not (entry.get("typical_skills") or entry.get("typical_concepts")):
+            if not (entry.get("typical_skills") or entry.get("typical_concepts")
+                    or entry.get("key_skills_taught")):
                 continue
 
             # The guardrail that keeps this stage unable to invent a skill:

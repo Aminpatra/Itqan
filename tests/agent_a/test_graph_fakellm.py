@@ -199,6 +199,52 @@ def test_transcript_courses_merge_into_the_profile(tmp_path):
     assert roles == {"cv", "transcript"}
 
 
+def test_coursework_skill_is_derived_end_to_end(tmp_path):
+    """A skill the transcript's coursework teaches but the CV never claimed is
+    promoted into skills.accepted, flagged and capped at medium."""
+    from agents.agent_a_cv_extraction.schemas import (
+        CredentialCurriculum,
+        CurriculumResearch,
+        SkillJudgement,
+        SkillVerdict,
+    )
+
+    # The transcript fixture has a "Machine Learning" course; teach it Apache Spark
+    # (which the CV does not claim) and have the reused judge keep it.
+    fake = FakeStructuredLLM(
+        CurriculumResearch=CurriculumResearch(credentials=[
+            CredentialCurriculum(
+                credential_name="Machine Learning", credential_kind="course",
+                recognized=True, typical_skills=["Apache Spark"], typical_concepts=[],
+                covers_claimed_skills=[],
+            )
+        ]),
+        SkillJudgement=SkillJudgement(verdicts=[
+            SkillVerdict(name="Apache Spark", keep=True, quality="medium", category="tool",
+                         evidence_type="course", rationale="taught in the ML course"),
+        ]),
+    )
+    app = build_graph(fake, Config())
+    cfg = {"configurable": {"thread_id": f"derive-{tmp_path.name}"}}
+    state = app.invoke(
+        {
+            "cv_paths": [str(FIXTURE)],
+            "transcript_paths": [str(TRANSCRIPT)],
+            "run_id": "derive", "output_dir": str(tmp_path),
+            "interactive": False, "review_rounds": 0,
+        },
+        config=cfg,
+    )
+    profile = json.loads(Path(state["final_output_path"]).read_text(encoding="utf-8"))
+    derived = [s for s in profile["skills"]["accepted"] if s.get("origin") == "coursework_derived"]
+    assert any(s["name"] == "Apache Spark" for s in derived), (
+        "the coursework-taught skill never reached the profile"
+    )
+    assert all(s["quality"] == "medium" for s in derived), "derived skill exceeded medium"
+    spark = next(s for s in derived if s["name"] == "Apache Spark")
+    assert spark["corroborating_credential"] == "Machine Learning"
+
+
 def test_provenance_records_grounding_method(tmp_path):
     state = run(tmp_path, interactive=False)
     profile = json.loads(Path(state["final_output_path"]).read_text(encoding="utf-8"))
