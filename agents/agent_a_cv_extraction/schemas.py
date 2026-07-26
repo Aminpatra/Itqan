@@ -160,7 +160,7 @@ class SkillVerdict(BaseModel):
     quality: Literal["high", "medium", "low"]
     category: Literal["technical", "domain", "tool", "language", "soft", "generic"]
     evidence_type: Literal[
-        "project", "experience", "course", "certification", "claim_only"
+        "project", "experience", "course", "certification", "adjacent", "claim_only"
     ]
     evidence_quote: Optional[str] = None
     # Set when the corroboration came from a credential's typical curriculum

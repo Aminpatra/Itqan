@@ -99,6 +99,10 @@ _MAX_QUALITY = {
     "experience": "high",
     "certification": "high",
     "course": "medium",
+    # A specific tool inferred to be standard for a domain the candidate has
+    # DIRECT evidence in: credible, so above a bare claim, but never "high" —
+    # they did not demonstrate it, they are presumed to use it. Caps at medium.
+    "adjacent": "medium",
     "claim_only": "low",
 }
 _RANK = {"low": 0, "medium": 1, "high": 2}
