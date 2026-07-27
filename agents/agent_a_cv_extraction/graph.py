@@ -49,6 +49,7 @@ from .nodes import (
     make_validate_human_node,
     make_verify_node,
     route_after_cv,
+    route_after_ingest,
 )
 from .state import AgentState
 
@@ -80,7 +81,17 @@ def build_graph(llm: Any, config: Config | None = None, *, checkpointer: Any = N
 
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "extract_text")
-    builder.add_edge("extract_text", "llm_extract_cv")
+
+    # A CV with no readable text cannot be extracted from, and every node after
+    # this one would be spending an LLM call on an empty string — then writing a
+    # profile full of nulls and reporting success. Short-circuit to persist so the
+    # run still produces an envelope (carrying the error, which is the useful
+    # output here) without paying for five model calls to learn nothing.
+    builder.add_conditional_edges(
+        "extract_text",
+        route_after_ingest,
+        {"llm_extract_cv": "llm_extract_cv", "persist": "persist"},
+    )
 
     builder.add_conditional_edges(
         "llm_extract_cv",

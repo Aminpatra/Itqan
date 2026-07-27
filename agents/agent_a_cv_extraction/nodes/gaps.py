@@ -187,22 +187,47 @@ def make_assess_gaps_node(config: Config):
                 "list a few key courses, comma-separated (or press Enter to skip)",
             )
 
+        # Only MAX_GAPS_PER_ROUND are put to the user, but the FULL list is kept
+        # so it can be published. Truncating before storing meant gaps 9+ existed
+        # nowhere — not asked, not recorded — while the warning below told the user
+        # they were "recorded in the output". This is the last round's view, which
+        # is the right one to publish: it is what is still missing at the end.
+        all_gaps = list(gaps)
         overflow = len(gaps) - MAX_GAPS_PER_ROUND
         if overflow > 0:
             gaps = gaps[:MAX_GAPS_PER_ROUND]
 
         updates: dict[str, Any] = {
             "gaps": gaps,
-            "trace": [f"assess_gaps({len(gaps)})"],
+            "unresolved_gaps": all_gaps,
+            "trace": [f"assess_gaps({len(gaps)}/{len(all_gaps)})"],
         }
         if overflow > 0:
             updates["warnings"] = [
                 f"{overflow} further gap(s) were not raised this round to keep the "
-                f"prompt manageable; they remain recorded in the output."
+                f"prompt manageable; all {len(all_gaps)} are recorded in "
+                f"provenance.unresolved_gaps."
             ]
         return updates
 
     return assess_gaps
+
+
+def route_after_ingest(state: AgentState) -> str:
+    """Stop before the LLM stages when there is nothing to extract from.
+
+    ``ingest`` records a fatal error when no text could be read out of the CV, but
+    nothing acted on it: the run continued through extraction, verification,
+    curriculum research, judging and summarization — five model calls over an
+    empty string — and published a profile of nulls with no indication anything
+    had gone wrong. Routing straight to persist keeps the envelope (and its
+    ``errors``) while refusing to pay for, or dress up, a failure.
+    """
+    if state.get("errors"):
+        return "persist"
+    if not (state.get("cv_doc") or {}).get("text", "").strip():
+        return "persist"
+    return "llm_extract_cv"
 
 
 def make_route_gaps(config: Config):

@@ -14,7 +14,7 @@ from typing import Any
 from shared.config import Config
 from shared.llm import as_dict, structured
 
-from shared.grounding import compact_nulls
+from shared.grounding import compact_nulls, verify_quote
 from ..prompts import SKILL_JUDGE_PROMPT
 from ..schemas import SkillJudgement
 from ..state import AgentState
@@ -108,6 +108,27 @@ _MAX_QUALITY = {
 _RANK = {"low": 0, "medium": 1, "high": 2}
 
 
+def _clean_evidence_quote(verdict: dict[str, Any], source_text: str) -> dict[str, Any]:
+    """Drop an ``evidence_quote`` that is not actually a span of the documents.
+
+    The contract calls this field an exact substring of the source, and a consumer
+    is entitled to read it that way. In practice the model returned its own
+    reasoning there — real output carried "used in a named project" and, via the
+    derived-skills path, the prompt's own rubric line "taught in a completed
+    course, or in a certification's curriculum". Those are descriptions of *why*,
+    not evidence, and publishing them in an evidence field is a small lie that
+    costs a consumer their ability to trust any of the field.
+
+    Nulled rather than corrected: the rating and rationale still stand on their
+    own, and "no quote" is honest where a paraphrase is not.
+    """
+    quote = verdict.get("evidence_quote")
+    if quote and not verify_quote(quote, source_text):
+        verdict = dict(verdict)
+        verdict["evidence_quote"] = None
+    return verdict
+
+
 def _enforce_quality_rules(verdict: dict[str, Any]) -> dict[str, Any]:
     """Clamp quality to what the evidence actually supports.
 
@@ -170,6 +191,7 @@ def make_judge_skills_node(llm: Any, config: Config):
                         "quality": "low",
                         "category": c.get("category") or "unknown",
                         "evidence_type": "claim_only",
+                        "origin": "unjudged_claim",
                         "rationale": "not judged — skill assessment failed",
                     }
                     for c in claims
@@ -179,6 +201,12 @@ def make_judge_skills_node(llm: Any, config: Config):
                 "trace": ["judge_skills(failed)"],
             }
 
+        cv_doc = state.get("cv_doc") or {}
+        transcript_doc = state.get("transcript_doc") or {}
+        source_text = "\n\n".join(
+            t for t in (cv_doc.get("text", ""), transcript_doc.get("text", "")) if t
+        )
+
         claimed_names = {c["name"].casefold(): c["name"] for c in claims}
         verdicts: dict[str, dict[str, Any]] = {}
 
@@ -187,7 +215,10 @@ def make_judge_skills_node(llm: Any, config: Config):
             # The prompt forbids inventing skills; enforce it rather than trust it.
             if key not in claimed_names or key in verdicts:
                 continue
-            verdicts[key] = _enforce_quality_rules(verdict)
+            verdict = _clean_evidence_quote(verdict, source_text)
+            verdict = _enforce_quality_rules(verdict)
+            verdict["origin"] = "cv_claim"
+            verdicts[key] = verdict
 
         # A skill the model simply failed to return must not vanish. Dropping it
         # silently loses a real claim and makes the count depend on model whim —
@@ -200,6 +231,10 @@ def make_judge_skills_node(llm: Any, config: Config):
                 "quality": "low",
                 "category": "unknown",
                 "evidence_type": "claim_only",
+                # Machine-readable, so a consumer can weight "the judge ruled on
+                # this" differently from "the judge never saw it" without having to
+                # string-match the English rationale below.
+                "origin": "unjudged_claim",
                 "rationale": "not returned by the skill judge; recorded as an unverified claim",
             }
 

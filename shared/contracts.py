@@ -45,6 +45,12 @@ class FieldProvenance(BaseModel):
     score: float = 0.0
     method: GroundingMethod = "fuzzy"
     evidence_quote: Optional[str] = None
+    # For a skill: could the span the extractor cited be found verbatim? None when
+    # no span was offered. Deliberately advisory — it reports how well the model
+    # quoted, which is a fact about the model, not about the candidate, and must
+    # never override the field's own grounding (doing so once deleted every skill
+    # on a real CV).
+    span_verified: Optional[bool] = None
 
 
 class CredentialCurriculum(BaseModel):
@@ -71,10 +77,29 @@ class CredentialCurriculum(BaseModel):
     grade_achieved: Optional[str] = None
 
 
+class UnresolvedGap(BaseModel):
+    """Something the producer knows is missing, stated as a fact rather than prose.
+
+    The agent computes this deterministically (a required field absent, a field the
+    OCR read too weakly to trust) and used to discard it — the structured list
+    existed only in memory while the envelope carried nothing but the model's
+    free-text `summary.gaps_or_unknowns`. Publishing it lets a consumer distinguish
+    "the candidate has no LinkedIn" from "we could not read it", and lets an
+    operator running --no-hitl see what a human would have been asked.
+    """
+
+    field_path: str
+    reason: str
+    ocr_confidence: Optional[float] = None
+
+
 class Provenance(BaseModel):
     grounding: dict[str, FieldProvenance] = Field(default_factory=dict)
     human_supplied_fields: list[str] = Field(default_factory=list)
     dropped_fields: list[str] = Field(default_factory=list)
+    # What is still missing at the end of the run — including gaps never put to a
+    # human because the prompt was already full.
+    unresolved_gaps: list[UnresolvedGap] = Field(default_factory=list)
     review_rounds: int = 0
     # Credentials whose curriculum was used as corroborating evidence. Anything
     # the model did not recognise never appears here.
@@ -82,8 +107,23 @@ class Provenance(BaseModel):
 
 
 class Confidence(BaseModel):
-    overall: float = 0.0
+    """How trustworthy is this profile — asked as two separate questions.
+
+    ``overall`` describes the artifact that SHIPPED: the mean grounding score of
+    the fields present in this envelope. ``extraction_precision`` describes the
+    model that produced it: the share of proposed fields that survived
+    verification. They were previously multiplied into a single number, which had
+    the perverse property of falling when the anti-hallucination layer worked —
+    a profile got *less* confident as its unsupported fields were removed.
+
+    Both are None when nothing was measured, which is not the same as 0.0.
+    """
+
+    overall: Optional[float] = None
     per_section: dict[str, float] = Field(default_factory=dict)
+    extraction_precision: Optional[float] = None
+    # {verified, human, dropped} — the raw counts behind the ratios.
+    fields: dict[str, int] = Field(default_factory=dict)
 
 
 class CandidateProfile(BaseModel):

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from shared import config as _config  # noqa: F401  — sets env vars before paddle import
+from shared.text_norm import is_rtl
 
 # Keyed by language: a run may legitimately process an Arabic CV alongside an
 # English transcript, and a single cached engine would silently return the first
@@ -56,13 +57,19 @@ def _poly_bounds(poly: Any) -> tuple[float, float, float]:
     return min(ys), min(xs), max(ys) - min(ys)
 
 
-def order_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sort blocks into human reading order: top-to-bottom, then left-to-right.
+def order_blocks(blocks: list[dict[str, Any]], *, rtl: bool = False) -> list[dict[str, Any]]:
+    """Sort blocks into human reading order: top-to-bottom, then along the line.
 
     Paddle's native order is usually fine for single-column documents, but CVs
     love two-column layouts and those come back interleaved — contact details
     from the sidebar spliced into the middle of a job description. Bucketing by
     vertical band before sorting horizontally fixes that.
+
+    ``rtl`` reverses the within-line direction. Reading order is a property of the
+    script, not of the page: sorting an Arabic line by ascending x puts its last
+    word first, so every line came out reversed and the extractor was handed word
+    salad. Blocks are still bucketed into lines top-to-bottom either way — only
+    the direction along each line flips.
     """
     if not blocks:
         return blocks
@@ -81,7 +88,7 @@ def order_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     result: list[dict[str, Any]] = []
     for line in lines:
-        result.extend(sorted(line, key=lambda b: b["_left"]))
+        result.extend(sorted(line, key=lambda b: b["_left"], reverse=rtl))
     return result
 
 
@@ -119,7 +126,7 @@ def run_ocr(image_paths: list[Path], lang: str = "en") -> dict[str, Any]:
                     }
                 )
 
-        blocks = order_blocks(blocks)
+        blocks = order_blocks(blocks, rtl=is_rtl(lang))
         for block in blocks:  # sort keys were internal only
             block.pop("_top", None)
             block.pop("_left", None)

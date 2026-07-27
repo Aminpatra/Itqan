@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from shared.config import Config
+from shared.text_norm import normalize_ar as _shared_normalize_ar
 
 # ---------------------------------------------------------------------------
 # Weights. Ordered by how strongly each independently indicates a scam.
@@ -112,6 +113,13 @@ class Assessment:
 # forms of the same letter (أ إ آ ا, ى/ي, ة/ه). Matching raw text would make a
 # rule silently miss the same phrase typed a different way — and a scam filter
 # that fails on an orthographic variant fails exactly where it matters.
+#
+# The folding itself now lives in shared/text_norm.py: Agent A's grounder became a
+# second consumer (an Arabic name was being deleted as a hallucination), and this
+# project promotes on the second consumer rather than duplicating — the same move
+# shared/scraping/ made. Imported back here so the scam filter and the grounder can
+# never drift on what "the same text" means. The regexes below stay because
+# _fold_with_map needs them character-by-character to keep spans verbatim.
 # ---------------------------------------------------------------------------
 _DIACRITICS = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")
 _ALEF = re.compile(r"[آأإٱ]")
@@ -119,11 +127,8 @@ _WS = re.compile(r"\s+")
 
 
 def normalize_ar(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text or "")
-    text = _DIACRITICS.sub("", text)
-    text = _ALEF.sub("ا", text)
-    text = text.replace("ى", "ي").replace("ة", "ه")
-    return _WS.sub(" ", text).strip()
+    """Delegates to the shared folding — see the note above."""
+    return _shared_normalize_ar(text)
 
 
 def _fold(text: str) -> str:

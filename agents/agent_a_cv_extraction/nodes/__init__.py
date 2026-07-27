@@ -2,7 +2,7 @@
 
 from .curriculum import make_research_curriculum_node
 from .derive_skills import make_derive_coursework_skills_node
-from .gaps import make_assess_gaps_node, make_route_gaps
+from .gaps import make_assess_gaps_node, make_route_gaps, route_after_ingest
 from .human_review import human_review
 from .ingest import make_extract_text_node, make_ingest_node
 from .judge_skills import make_judge_skills_node
@@ -25,6 +25,7 @@ __all__ = [
     "make_verify_node",
     "make_assess_gaps_node",
     "make_route_gaps",
+    "route_after_ingest",
     "make_research_curriculum_node",
     "make_derive_coursework_skills_node",
     "human_review",

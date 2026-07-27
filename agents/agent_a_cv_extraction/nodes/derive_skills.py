@@ -131,6 +131,13 @@ def make_derive_coursework_skills_node(llm: Any, config: Config):
             v = _enforce_quality_rules(v)            # course -> caps quality at "medium"
             v["corroborating_credential"] = cand["corroborating_credential"]
             v["origin"] = "coursework_derived"
+            # A derived skill has no source span by construction — it is precisely
+            # the skill the CV never mentioned. Carrying the judge's text through
+            # published the prompt's own rubric ("taught in a completed course, or
+            # in a certification's curriculum") in a field the contract defines as a
+            # verbatim quote from the documents. corroborating_credential above is
+            # the honest provenance; this stays null.
+            v["evidence_quote"] = None
             note = "[derived from completed coursework; not claimed in the CV]"
             v["rationale"] = f"{(v.get('rationale') or '').strip()} {note}".strip()
             derived.append(v)

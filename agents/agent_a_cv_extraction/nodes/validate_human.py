@@ -87,6 +87,15 @@ def make_validate_human_node(llm: Any, config: Config):
             for path in raw
         ]
 
+        warnings: list[str] = []
+
+        def _as_typed(paths) -> list[dict[str, Any]]:
+            """Treat these answers as accepted exactly as the user wrote them."""
+            return [
+                {"field_path": p, "accepted": True, "normalized_value": raw[p], "issue": None}
+                for p in paths
+            ]
+
         try:
             validation = as_dict(
                 chain.invoke(
@@ -96,14 +105,31 @@ def make_validate_human_node(llm: Any, config: Config):
                     }
                 )
             )
-            fields = validation.get("fields", [])
+            fields = list(validation.get("fields", []))
         except Exception as exc:
-            return {
-                "review_rounds": rounds,
-                "human_input": {},
-                "warnings": [f"Could not validate manual input ({exc}); discarding it."],
-                "trace": ["validate_human_input(failed)"],
-            }
+            # Never discard what the user typed. This used to return early with
+            # human_input={} while still incrementing review_rounds, so a five-second
+            # timeout cost the operator an entire round of manual entry — and with
+            # max_review_rounds=2 they might never be asked again. The validator
+            # normalizes formats; it is not a trust boundary (a frontend can write
+            # any path via human_review), so falling back to the raw answer loses
+            # nothing that was being protected.
+            fields = _as_typed(raw)
+            warnings.append(
+                f"Could not validate manual input ({exc}); accepting it as typed."
+            )
+
+        # A path the model simply failed to return must not vanish — the same
+        # failure judge_skills already guards against, where one run silently
+        # discarded four of twenty skills.
+        returned = {f.get("field_path") for f in fields if isinstance(f, dict)}
+        unreturned = [p for p in raw if p not in returned]
+        if unreturned:
+            fields.extend(_as_typed(unreturned))
+            warnings.append(
+                f"{len(unreturned)} manual answer(s) were not returned by the validator "
+                f"and were kept as typed: {', '.join(sorted(unreturned)[:6])}"
+            )
 
         extraction = dict(state.get("cv_extraction") or {})
         transcript = dict(state.get("transcript_extraction") or {})
@@ -168,6 +194,8 @@ def make_validate_human_node(llm: Any, config: Config):
             updates["human_supplied_fields"] = accepted_paths
         if notes:
             updates["human_validation_notes"] = notes
+        if warnings:
+            updates["warnings"] = warnings
         return updates
 
     return validate_human_input

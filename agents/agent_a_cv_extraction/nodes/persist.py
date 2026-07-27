@@ -20,17 +20,24 @@ from shared.contracts import (
     FieldProvenance,
     Provenance,
     SourceDocument,
+    UnresolvedGap,
 )
 
 from shared.grounding import compact_nulls
 from ..state import AgentState
 
 
-def _section_confidence(report: dict[str, Any], prefix: str) -> float | None:
+def _section_confidence(grounding: dict[str, Any], prefix: str) -> float | None:
+    """Mean score of the fields in this section that actually SHIPPED.
+
+    Computed on the same basis as ``overall`` (grounded fields only, human values
+    included) so the two numbers are comparable. It previously averaged the raw
+    report — dropped fields and all — which put it on a different scale from
+    ``overall`` and made a section look worse precisely when the grounder had
+    successfully removed the bad values from it.
+    """
     scores = [
-        entry.get("score", 0.0)
-        for path, entry in report.items()
-        if path.startswith(prefix)
+        g.score for path, g in grounding.items() if path.startswith(prefix) and g.grounded
     ]
     return round(sum(scores) / len(scores), 4) if scores else None
 
@@ -100,6 +107,7 @@ def make_persist_node(config: Config):
                 score=float(entry.get("score", 0.0)),
                 method=entry.get("method", "fuzzy"),
                 evidence_quote=entry.get("evidence_quote"),
+                span_verified=entry.get("span_verified"),
             )
             for path, entry in report.items()
         }
@@ -111,12 +119,30 @@ def make_persist_node(config: Config):
         for path in human_supplied:
             grounding[path] = FieldProvenance(grounded=True, score=1.0, method="human")
 
+        # Two different questions, so two different numbers. Publishing one that
+        # silently answered both is why the old value was a flat 1.0 on every real
+        # run while also dropping whenever the grounder did its job.
+        #
+        #   overall              — how well supported is what we SHIPPED?
+        #   extraction_precision — how much of what the model proposed survived?
+        #
+        # The old formula multiplied the two, so catching a hallucination LOWERED
+        # confidence in a profile that had just become more trustworthy, and a lazy
+        # three-field extraction outscored a thorough one. None (not 0.0) when
+        # nothing was measured: "unmeasured" and "measured and worthless" are
+        # different answers and a consumer must be able to tell them apart.
         grounded_scores = [g.score for g in grounding.values() if g.grounded]
-        overall = round(sum(grounded_scores) / len(grounded_scores), 4) if grounded_scores else 0.0
-        # An extraction nobody could verify should not report high confidence just
-        # because the few fields that survived scored well.
-        if grounding:
-            overall = round(overall * (len(grounded_scores) / len(grounding)), 4)
+        overall = (
+            round(sum(grounded_scores) / len(grounded_scores), 4) if grounded_scores else None
+        )
+        extraction_precision = (
+            round(len(grounded_scores) / len(grounding), 4) if grounding else None
+        )
+        counts = {
+            "verified": sum(1 for g in grounding.values() if g.grounded and g.method != "human"),
+            "human": sum(1 for g in grounding.values() if g.method == "human"),
+            "dropped": len(dict.fromkeys(state.get("dropped_fields") or [])),
+        }
 
         profile = CandidateProfile(
             run_id=state["run_id"],
@@ -132,6 +158,15 @@ def make_persist_node(config: Config):
                 grounding=grounding,
                 human_supplied_fields=human_supplied,
                 dropped_fields=list(dict.fromkeys(state.get("dropped_fields") or [])),
+                unresolved_gaps=[
+                    UnresolvedGap(
+                        field_path=gap.get("field_path", ""),
+                        reason=gap.get("reason", ""),
+                        ocr_confidence=gap.get("ocr_confidence"),
+                    )
+                    for gap in (state.get("unresolved_gaps") or [])
+                    if gap.get("field_path")
+                ],
                 review_rounds=state.get("review_rounds", 0),
                 curriculum_researched=[
                     CredentialCurriculum(
@@ -148,6 +183,8 @@ def make_persist_node(config: Config):
             ),
             confidence=Confidence(
                 overall=overall,
+                extraction_precision=extraction_precision,
+                fields=counts,
                 per_section={
                     section: value
                     for section, prefix in (
@@ -155,8 +192,9 @@ def make_persist_node(config: Config):
                         ("education", "education"),
                         ("experience", "experience"),
                         ("skills", "skills"),
+                        ("transcript", "transcript."),
                     )
-                    if (value := _section_confidence(report, prefix)) is not None
+                    if (value := _section_confidence(grounding, prefix)) is not None
                 },
             ),
             warnings=list(state.get("warnings") or []),

@@ -87,6 +87,10 @@ class AgentState(TypedDict, total=False):
 
     # ---- human in the loop ----------------------------------------------
     gaps: list[Gap]
+    # Every gap the last assessment found, including the ones not put to the user
+    # this round. `gaps` is capped for prompt length; this is the full picture and
+    # is what gets published, so nothing the agent knows is missing is lost.
+    unresolved_gaps: list[Gap]
     human_input: dict[str, str]
     human_supplied_fields: Annotated[list[str], operator.add]
     review_rounds: int
