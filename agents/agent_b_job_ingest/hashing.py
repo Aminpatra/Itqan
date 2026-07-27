@@ -21,6 +21,7 @@ already guards against for view counts, restated here for relative dates.
 from __future__ import annotations
 
 import hashlib
+import re
 
 from .sources.base import RawPosting
 
@@ -71,3 +72,21 @@ def content_hash(posting: RawPosting) -> str:
 def id_for(posting: RawPosting) -> str:
     """The posting_id for a RawPosting, using its already-canonical source_url."""
     return posting_id(posting.source, posting.source_url)
+
+
+_SLUG_STRIP = re.compile(r"[^a-z0-9]+")
+
+
+def child_source_url(post_url: str, role_title: str | None, index: int) -> str:
+    """The source_url for one vacancy SPLIT out of a multi-job post.
+
+    ``post_url#slug`` so each split vacancy is a distinct, stable key under the
+    ``UNIQUE (source, source_url)`` constraint — and so a vacancy reached both as
+    its own posting and as part of a roundup would still differ only by the
+    fragment. The slug is the normalised role title (stable across cycles when
+    the title is stable); the index is the fallback when a role has no usable
+    title, and also disambiguates two roles that normalise to the same slug.
+    """
+    slug = _SLUG_STRIP.sub("-", (role_title or "").strip().casefold()).strip("-")
+    fragment = f"{slug}-{index}" if slug else f"job-{index}"
+    return f"{post_url}#{fragment}"

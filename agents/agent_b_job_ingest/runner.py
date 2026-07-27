@@ -34,7 +34,8 @@ class CycleResult:
     state: dict[str, Any] | None = None
 
 
-def _build_deps(config: Config, store: JobStore, *, fake_llm: bool, no_embed: bool) -> GraphDeps:
+def _build_deps(config: Config, store: JobStore, *, fake_llm: bool, no_embed: bool,
+                root_fetcher: Any = None) -> GraphDeps:
     """Assemble the graph's dependencies.
 
     ``fake_llm`` swaps in the offline test doubles so a full cycle can run with
@@ -44,7 +45,7 @@ def _build_deps(config: Config, store: JobStore, *, fake_llm: bool, no_embed: bo
     """
     from .prompts.extraction import EXTRACTION_PROMPT
     from .prompts.legitimacy import LEGITIMACY_PROMPT
-    from .schemas import JobExtraction, LegitimacyVerdict
+    from .schemas import JobExtractionBatch, LegitimacyVerdict
 
     if fake_llm:
         from shared.llm import structured
@@ -65,9 +66,10 @@ def _build_deps(config: Config, store: JobStore, *, fake_llm: bool, no_embed: bo
     return GraphDeps(
         config=config,
         store=store,
-        extractor=EXTRACTION_PROMPT | structured(llm, JobExtraction),
+        extractor=EXTRACTION_PROMPT | structured(llm, JobExtractionBatch),
         adjudicator=LEGITIMACY_PROMPT | structured(llm, LegitimacyVerdict),
         embedder=embedder,
+        root_fetcher=root_fetcher,
         model_name=model_name,
     )
 
@@ -97,10 +99,20 @@ def run_cycle(
 
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:6]
 
+    # Real runs get a RootFetcher so a posting's skills can come from the
+    # employer's own job page (robots-gated, best-effort). Offline/fake cycles
+    # make no network calls, so they get None.
+    root_fetcher = None
+    if not fake_llm and config.enrich_from_root_source:
+        from .root_fetch import RootFetcher
+
+        root_fetcher = RootFetcher(config, interval_s=config.root_fetch_interval_s)
+
     with JobStore(dsn) as store:
         try:
             with store.cycle_lock():
-                deps = _build_deps(config, store, fake_llm=fake_llm, no_embed=no_embed)
+                deps = _build_deps(config, store, fake_llm=fake_llm, no_embed=no_embed,
+                                   root_fetcher=root_fetcher)
                 graph = build_ingest_graph(deps)
                 state = graph.invoke({
                     "run_id": run_id,
@@ -111,6 +123,9 @@ def run_cycle(
                 })
         except LockNotAcquired:
             return CycleResult(ran=False, exit_code=0)
+        finally:
+            if root_fetcher is not None:
+                root_fetcher.close()
 
     # A partial cycle exits non-zero so a scheduler's only signal — the exit
     # code — reflects that inventory was fetched incompletely.

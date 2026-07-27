@@ -46,6 +46,11 @@ class JobExtraction(BaseModel):
     downstream numbers cannot absorb.
     """
 
+    # The role's own title. Usually None for a single-vacancy posting (the
+    # posting title is used). For a multi-vacancy posting that is SPLIT into
+    # several jobs, each job states its own role here (e.g. "Accountant",
+    # "Storekeeper") so the split rows are distinguishable and identifiable.
+    title: Optional[str] = None
     # ISCO-08 major group as its single-digit code, or None when the posting
     # does not make the occupation clear. Never guessed into a default: a NULL
     # sector is excluded from aggregation, a wrong one silently miscounts.
@@ -96,7 +101,7 @@ class JobExtraction(BaseModel):
             raise ValueError(f"country {value!r} is not an ISO-3166 alpha-2 code")
         return value
 
-    @field_validator("company", "seniority_level", "location")
+    @field_validator("company", "seniority_level", "location", "title")
     @classmethod
     def _empty_is_none(cls, value: Optional[str]) -> Optional[str]:
         # The model sometimes emits "" or "N/A" for absent fields; normalise them
@@ -122,6 +127,18 @@ class JobExtraction(BaseModel):
                 seen.add(key)
                 out.append(cleaned)
         return out
+
+
+class JobExtractionBatch(BaseModel):
+    """One posting's text can advertise SEVERAL distinct vacancies (a "roundup"
+    post — e.g. one article hiring an accountant, a storekeeper and a driver).
+    Extraction returns one ``JobExtraction`` per distinct vacancy; a single-role
+    posting simply yields a list of one. Splitting here — at the point that reads
+    the text — is what lets each vacancy carry its OWN skills instead of one row
+    with everything merged.
+    """
+
+    jobs: list[JobExtraction] = Field(default_factory=list)
 
 
 class LegitimacyVerdict(BaseModel):

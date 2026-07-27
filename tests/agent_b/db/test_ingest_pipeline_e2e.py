@@ -13,7 +13,11 @@ from datetime import datetime, timezone
 from agents.agent_b_job_ingest.pipeline import IngestPipeline
 from agents.agent_b_job_ingest.prompts.extraction import EXTRACTION_PROMPT
 from agents.agent_b_job_ingest.prompts.legitimacy import LEGITIMACY_PROMPT
-from agents.agent_b_job_ingest.schemas import JobExtraction, LegitimacyVerdict
+from agents.agent_b_job_ingest.schemas import (
+    JobExtraction,
+    JobExtractionBatch,
+    LegitimacyVerdict,
+)
 from agents.agent_b_job_ingest.sources.base import RawPosting
 from shared.config import Config
 from shared.llm import structured
@@ -68,6 +72,55 @@ def test_two_runs_ingest_once_and_the_second_does_no_work(store):
     assert embedder2.embed_calls == 0
     # And crucially, no new rows.
     assert store.counts().get("active", 0) == 2
+
+
+def _batch_pipeline(store, llm, embedder):
+    return IngestPipeline(
+        store=store,
+        extractor=EXTRACTION_PROMPT | structured(llm, JobExtractionBatch),
+        adjudicator=LEGITIMACY_PROMPT | structured(llm, LegitimacyVerdict),
+        embedder=embedder, config=Config(), model_name="fake",
+    )
+
+
+def test_a_roundup_splits_into_distinct_rows_and_warm_reruns_do_nothing(store):
+    """One roundup post -> three rows with distinct skills, distinct #-fragment
+    URLs (satisfying UNIQUE(source, source_url)), and a shared source_post_url —
+    then a second run touches all three and writes no new rows."""
+    jobs = JobExtractionBatch(jobs=[
+        JobExtraction(title="Accountant", sector="2", required_skills=["Bookkeeping"],
+                      listing_intent="vacancy", poster_type="unknown"),
+        JobExtraction(title="Storekeeper", sector="4", required_skills=["Inventory Management"],
+                      listing_intent="vacancy", poster_type="unknown"),
+        JobExtraction(title="Driver", sector="8", required_skills=["Driving Licence"],
+                      listing_intent="vacancy", poster_type="unknown"),
+    ])
+    post = _posting(
+        "https://oman.el7far.com/roundup.html",
+        title="Company Careers: 3 Jobs",
+        raw_description="Hiring an Accountant, a Storekeeper and a Driver. Apply by email.",
+    )
+
+    first = _batch_pipeline(store, FakeStructuredLLM(JobExtractionBatch=jobs), FakeEmbedder()).run([post])
+    assert first.written == 3
+    assert store.counts().get("active", 0) == 3
+
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT source_url, source_post_url, required_skills FROM job_postings "
+                    "ORDER BY source_url")
+        rows = cur.fetchall()
+    assert len({r["source_url"] for r in rows}) == 3               # distinct keys, no unique clash
+    assert all(r["source_post_url"] == "https://oman.el7far.com/roundup.html" for r in rows)
+    skills = sorted(s for r in rows for s in r["required_skills"])
+    assert skills == ["Bookkeeping", "Driving Licence", "Inventory Management"]  # not merged
+
+    # warm rerun: same post, zero work, no new rows
+    emb2 = FakeEmbedder()
+    second = _batch_pipeline(store, FakeStructuredLLM(JobExtractionBatch=jobs), emb2).run([post])
+    assert second.unchanged == 3 and second.extractions == 0 and second.embeddings == 0
+    assert emb2.embed_calls == 0
+    assert store.counts().get("active", 0) == 3
 
 
 def test_a_three_way_near_duplicate_batch_survives_the_real_fk(store):

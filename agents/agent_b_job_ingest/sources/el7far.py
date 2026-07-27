@@ -21,6 +21,7 @@ handed it — so no third-party XML hardening dependency is needed.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree as ET
@@ -146,6 +147,18 @@ class El7farAdapter(BaseAdapter):
                 if posting.posted_date and posting.posted_date < cutoff:
                     return
 
+                # A roundup/index post links to several same-site job pages. Expand
+                # it into one posting per linked job (fetched from its own page), so
+                # distinct vacancies are distinct rows instead of one merged job.
+                children = self._expand_if_index(posting, seen_ids)
+                if children is not None:
+                    known_run = 0
+                    for child in children:
+                        result.postings.append(child)
+                        if limit is not None and len(result.postings) >= limit:
+                            return
+                    continue
+
                 if self._is_known_unchanged and self._is_known_unchanged(posting):
                     known_run += 1
                     if known_run >= KNOWN_RUN_TO_STOP:
@@ -204,6 +217,130 @@ class El7farAdapter(BaseAdapter):
             ),
             outbound_links=links,
         )
+
+    # ------------------------------------------------------------------
+    def _expand_if_index(
+        self, index_posting: RawPosting, seen_ids: set[str]
+    ) -> list[RawPosting] | None:
+        """Turn a roundup/index post into one posting per linked job page.
+
+        Returns ``None`` when the post is not an index (fewer than the configured
+        number of same-site job links) or when expansion enrichment is off — the
+        caller then handles it as an ordinary single posting. Returns the fetched
+        child postings otherwise; an empty result also degrades to ``None`` so a
+        detected-but-unfetchable roundup is not silently dropped.
+        """
+        if not self.config.blogger_expand_roundups:
+            return None
+
+        host = urlsplit(index_posting.source_url).netloc.lower()
+        job_links: list[str] = []
+        seen_links: set[str] = set()
+        for url in index_posting.outbound_links:
+            if url == index_posting.source_url or url in seen_links:
+                continue
+            if _is_individual_post_link(url, host):
+                seen_links.add(url)
+                job_links.append(url)
+
+        if len(job_links) < self.config.blogger_roundup_min_links:
+            return None
+        job_links = job_links[: self.config.blogger_max_links_per_post]
+
+        children: list[RawPosting] = []
+        for link in job_links:
+            # Same page reached twice this cycle (its own feed entry, or another
+            # roundup) — emit once; the shared canonical URL makes them one row.
+            if link in seen_ids:
+                continue
+            child = self._fetch_job_page(link, index_posting)
+            if child is None:
+                continue
+            seen_ids.add(link)
+            children.append(child)
+
+        return children or None
+
+    def _fetch_job_page(self, url: str, index_posting: RawPosting) -> RawPosting | None:
+        """Fetch one linked job page (same site, robots-checked) and parse it into
+        its own RawPosting. Best-effort: any block/error/empty page returns None so
+        the other jobs in the roundup still ingest."""
+        assert self._client is not None and self._robots is not None
+        try:
+            self._robots.require(url)
+            html = self._client.get_text(url)
+        except (Blocked, ResponseTooLarge):
+            return None
+        except Exception:  # noqa: BLE001 - one bad page must not sink the roundup
+            return None
+
+        canonical = canonical_url(url)
+        title, text, links = _extract_post_body(html, base_url=url, self_url=canonical)
+        if not title and not text:
+            return None
+
+        return RawPosting(
+            source=self.name,
+            source_group=self.source_group,
+            source_type=self.source_type,
+            source_url=canonical,
+            title=title or index_posting.title,
+            raw_description=text[:MAX_DESCRIPTION_CHARS],
+            company=None,
+            location_text=None,
+            # The individual page rarely re-states its publish date in the body;
+            # the index entry's date is the honest publication window for it, and
+            # content_hash excludes the date so this never destabilises change
+            # detection.
+            posted_date=index_posting.posted_date,
+            posted_date_text=None,
+            labels=index_posting.labels,
+            outbound_links=links,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Blogger individual-post permalink: /YYYY/MM/slug.html on the source's own host.
+# A roundup links to several of these; an ordinary post's apply link is usually
+# off-site (a careers page) and does not match, which keeps false positives low.
+_POST_PATH = re.compile(r"^/\d{4}/\d{2}/[^/]+\.html$")
+
+
+def _is_individual_post_link(url: str, host: str) -> bool:
+    parts = urlsplit(url)
+    return parts.netloc.lower() == host and bool(_POST_PATH.match(parts.path))
+
+
+def _extract_post_body(
+    html: str, *, base_url: str, self_url: str = ""
+) -> tuple[str, str, tuple[str, ...]]:
+    """A fetched Blogger post page -> (job title, body text, outbound links).
+
+    Isolates the post body (``.post-body`` / ``.entry-content`` / ``article``)
+    from the page chrome before extracting text, so navigation, sidebars and SEO
+    furniture do not leak into raw_description. Falls back to the whole document
+    when the theme uses none of those containers."""
+    if not html.strip():
+        return "", "", ()
+
+    tree = HTMLParser(html)
+
+    title = ""
+    for selector in (".post-title", "h1.entry-title", ".entry-title", "h1", "title"):
+        node = tree.css_first(selector)
+        if node and (node.text() or "").strip():
+            title = node.text().strip()
+            break
+
+    body_html = html
+    for selector in (".post-body", ".entry-content", "article"):
+        node = tree.css_first(selector)
+        if node:
+            body_html = node.html or html
+            break
+
+    text, links = _html_to_text_and_links(body_html, base_url=base_url, self_url=self_url)
+    return title, text, links
 
 
 # ---------------------------------------------------------------------------

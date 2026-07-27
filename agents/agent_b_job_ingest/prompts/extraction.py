@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from langchain_core.prompts import ChatPromptTemplate
 
-SYSTEM = """You extract structured facts from a single job posting for a labour-market \
+SYSTEM = """You extract structured facts from a job posting for a labour-market \
 database. The database reports which skills are in demand, so a fabricated field \
 becomes a fabricated statistic that misleads someone planning their career.
 
@@ -26,7 +26,24 @@ know about the company, the industry, or typical roles. If the posting does not 
 state something, return null for it. A truthful null is always better than a \
 plausible guess.
 
-Field by field:
+ONE OR SEVERAL VACANCIES — decide this FIRST. Return a `jobs` list:
+- Most postings advertise ONE role -> return a list with a SINGLE entry.
+- Some postings advertise SEVERAL DISTINCT roles at once (a "roundup", e.g. "we \
+are hiring: an Accountant, a Storekeeper and a Driver", or a title like \
+"5 Jobs in Marketing, HR, Finance…"). Return ONE entry PER DISTINCT ROLE, each \
+with its OWN title and its OWN skills — never merge several roles' skills into \
+one entry, and never split one role that is merely described across several \
+sentences or bullet points into several entries. The test is the ROLE, not the \
+paragraph: different job titles / positions = different entries; one position \
+with many requirements = one entry.
+- `title`: the role's own title, copied from the posting. For a single-role \
+posting you may leave it null (the posting's own title is used). For a split \
+roundup, EACH entry must name its role, so the roles are distinguishable.
+- Skills, sector, seniority, location, company, intent and poster are PER ROLE: \
+fill each entry only from the text about THAT role. If the roundup states one \
+employer/location for all roles, repeat it on each entry.
+
+Field by field (these describe each entry in `jobs`):
 
 - sector: the ISCO-08 major group as a single digit '0'-'9'. Choose from:
   1 Managers · 2 Professionals · 3 Technicians/Associate Professionals ·
@@ -82,6 +99,7 @@ HUMAN = """POSTING TITLE: {title}
 POSTING TEXT:
 {body}
 
-Extract the structured fields. Return null for anything the posting does not state."""
+Return `jobs`: one entry per DISTINCT vacancy in this posting (a single entry if \
+it advertises one role). Return null for anything the posting does not state."""
 
 EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([("system", SYSTEM), ("human", HUMAN)])

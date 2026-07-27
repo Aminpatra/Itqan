@@ -33,6 +33,7 @@ def test_real_migrations_are_discoverable_and_ordered():
         "indexes",
         "listing_provenance",
         "esco",
+        "source_post_url",
     ]
 
 

@@ -230,6 +230,32 @@ class JobStore:
             )
             return {r["posting_id"]: r["content_hash"] for r in cur.fetchall()}
 
+    def lookup_posts(self, source_post_urls: list[str]) -> dict[str, dict[str, Any]]:
+        """Post-level change detection for split roundups.
+
+        Maps each source_post_url to ``{"content_hash": <the post's hash>,
+        "posting_ids": [child ids]}``. All rows of one post share a content_hash
+        (the POST is the unit of change), so any child's hash answers "has this
+        post changed?" without re-extracting the vacancies it split into; the ids
+        are what ``touch_seen`` marks when it has not. Absent url -> new post.
+        """
+        if not source_post_urls:
+            return {}
+        conn = self.connect()
+        out: dict[str, dict[str, Any]] = {}
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT source_post_url, content_hash, posting_id "
+                "FROM job_postings WHERE source_post_url = ANY(%s)",
+                (source_post_urls,),
+            )
+            for r in cur.fetchall():
+                entry = out.setdefault(
+                    r["source_post_url"], {"content_hash": r["content_hash"], "posting_ids": []}
+                )
+                entry["posting_ids"].append(r["posting_id"])
+        return out
+
     def existing_ids(self, posting_ids: list[str]) -> set[str]:
         """Which of these ids already exist — used by link dedup to tell an
         in-cycle canonical from one already persisted."""
@@ -754,7 +780,7 @@ class JobStore:
 # definition, seen this cycle.
 _UPSERT_SQL = """
 INSERT INTO job_postings (
-    posting_id, source, source_group, source_type, source_url,
+    posting_id, source, source_group, source_type, source_url, source_post_url,
     title, raw_description, content_hash,
     status, sector, required_skills, seniority_level, location, country, posted_date,
     legitimacy_score, review_reason, duplicate_of,
@@ -762,6 +788,7 @@ INSERT INTO job_postings (
     first_seen_at, last_seen_at, missed_cycles, stale_since
 ) VALUES (
     %(posting_id)s, %(source)s, %(source_group)s, %(source_type)s, %(source_url)s,
+    %(source_post_url)s,
     %(title)s, %(raw_description)s, %(content_hash)s,
     %(status)s, %(sector)s, %(required_skills)s, %(seniority_level)s, %(location)s,
     %(country)s, %(posted_date)s,
@@ -774,6 +801,7 @@ ON CONFLICT (posting_id) DO UPDATE SET
     source_group = EXCLUDED.source_group,
     source_type = EXCLUDED.source_type,
     source_url = EXCLUDED.source_url,
+    source_post_url = EXCLUDED.source_post_url,
     title = EXCLUDED.title,
     raw_description = EXCLUDED.raw_description,
     content_hash = EXCLUDED.content_hash,
@@ -804,6 +832,9 @@ def _row_params(row: Any) -> dict[str, Any]:
         "source_group": row.source_group,
         "source_type": row.source_type,
         "source_url": row.source_url,
+        # Empty means "an ordinary single-vacancy posting" -> the post IS the row,
+        # so its post-url is its own source_url.
+        "source_post_url": row.source_post_url or row.source_url,
         "title": row.title,
         "raw_description": row.raw_description,
         "content_hash": row.content_hash,

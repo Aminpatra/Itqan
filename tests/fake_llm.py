@@ -188,6 +188,14 @@ class FakeStructuredLLM:
         # ---- Agent B ----
         # Kept in the one fake, per the established convention. Imported lazily so
         # Agent A's tests do not pull in Agent B's schema module.
+        if schema.__name__ == "JobExtractionBatch":
+            # The live extractor returns a batch (one entry per vacancy). By
+            # default wrap the single canned extraction in a one-job batch; a test
+            # exercising the split passes a JobExtractionBatch override.
+            from agents.agent_b_job_ingest.schemas import JobExtraction, JobExtractionBatch
+
+            return JobExtractionBatch(jobs=[self.respond(JobExtraction, payload)])
+
         if schema.__name__ == "JobExtraction":
             from agents.agent_b_job_ingest.schemas import JobExtraction
 

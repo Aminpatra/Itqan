@@ -25,13 +25,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from shared.grounding import normalize, verify_quote
 
 from . import legitimacy as legit
-from .hashing import content_hash, id_for
+from .hashing import child_source_url, content_hash, id_for, posting_id
 from .records import PersistedPosting
-from .schemas import JobExtraction, LegitimacyVerdict
+from .root_fetch import candidate_job_link
+from .schemas import JobExtraction, JobExtractionBatch, LegitimacyVerdict
 from .sources.base import RawPosting
 
 
@@ -51,6 +53,10 @@ class IngestSummary:
     adjudications: int = 0
     embeddings: int = 0
     written: int = 0
+    # Root-source enrichment: pages fetched, and postings whose skills were
+    # replaced by the real job page's.
+    root_fetches: int = 0
+    root_enrichments: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {k: v for k, v in self.__dict__.items()}
@@ -67,7 +73,8 @@ class IngestSummary:
 
 @dataclass
 class _Work:
-    """One posting in flight through the tail."""
+    """One VACANCY in flight through the tail — a single source post may fan out
+    into several of these when it is a multi-job roundup."""
 
     raw: RawPosting
     posting_id: str
@@ -75,6 +82,10 @@ class _Work:
     row: PersistedPosting
     # Set once dedup resolves it; suppresses embedding.
     is_link_duplicate: bool = False
+    # True when this row is one of several split out of a multi-vacancy post. Such
+    # a row has no per-job outbound link (the links belong to the whole post), so
+    # link-dedup skips it and relies on essence near-dup instead.
+    is_split: bool = False
 
 
 class IngestPipeline:
@@ -87,11 +98,15 @@ class IngestPipeline:
         embedder: Any,
         config: Any,
         model_name: str = "unknown",
+        root_fetcher: Any = None,
     ) -> None:
         self.store = store
-        self.extractor = extractor          # prompt | structured(llm, JobExtraction)
+        self.extractor = extractor          # prompt | structured(llm, JobExtractionBatch)
         self.adjudicator = adjudicator      # prompt | structured(llm, LegitimacyVerdict)
         self.embedder = embedder
+        # Optional: fetches a posting's root job page for real skills. None
+        # disables root enrichment (offline tests, dry runs).
+        self.root_fetcher = root_fetcher
         self.config = config
         self.model_name = model_name
 
@@ -100,32 +115,46 @@ class IngestPipeline:
         summary = IngestSummary(received=len(postings))
 
         deduped = _dedupe_within_batch(postings)
-        stored_hashes = self.store.lookup_hashes([id_for(p) for p in deduped])
+        # Change detection is at the POST level: one source post may split into
+        # several vacancy rows, so "has this changed?" is decided once, by the
+        # post's content_hash, before re-extracting the vacancies it contains.
+        stored = self.store.lookup_posts([p.source_url for p in deduped])
 
         unchanged_ids: list[str] = []
-        work: list[_Work] = []
+        to_extract: list[tuple[RawPosting, str]] = []
 
         for raw in deduped:
-            pid = id_for(raw)
-            chash = content_hash(raw)
-            if stored_hashes.get(pid) == chash:
-                unchanged_ids.append(pid)
+            post_url = raw.source_url
+            post_hash = content_hash(raw)
+            entry = stored.get(post_url)
+            if entry and entry["content_hash"] == post_hash:
+                # Unchanged post: touch all the rows it produced last cycle.
+                unchanged_ids.extend(entry["posting_ids"])
                 continue
-            summary.new += pid not in stored_hashes
-            summary.changed += pid in stored_hashes
-            work.append(self._new_work(raw, pid, chash))
+            summary.new += post_url not in stored
+            summary.changed += post_url in stored
+            to_extract.append((raw, post_hash))
 
         summary.unchanged = self.store.touch_seen(unchanged_ids)
 
-        # legitimacy gate — decides reject/clean/adjudicate on the raw text
-        for item in work:
-            self._gate_legitimacy(item, summary)
+        # legitimacy gate (on the whole POST) then extraction -> one _Work per
+        # vacancy. A rejected post yields a single audit row, never a split.
+        work: list[_Work] = []
+        for raw, post_hash in to_extract:
+            assessment, band = self._assess(raw, summary)
+            if band == "reject":
+                work.append(self._rejected_work(raw, post_hash, assessment))
+                summary.rejected += 1
+                continue
+            jobs = self._extract_jobs(raw, summary)
+            for index, job in enumerate(jobs):
+                work.append(self._child_work(raw, post_hash, job, index, len(jobs), assessment))
 
         live = [w for w in work if w.row.status != "rejected"]
 
-        # extraction — only for postings that survived the gate
-        for item in live:
-            self._extract(item, summary)
+        # root-source enrichment — replace thin aggregator skills with the real
+        # job page's, before embedding so the essence reflects the true skills.
+        self._enrich_from_root(live, summary)
 
         # link dedup — deterministic, before any embedding
         self._resolve_link_duplicates(live, summary)
@@ -148,14 +177,16 @@ class IngestPipeline:
         return summary
 
     # ------------------------------------------------------------------
-    def _new_work(self, raw: RawPosting, pid: str, chash: str) -> _Work:
-        row = PersistedPosting(
+    def _base_row(self, raw: RawPosting, pid: str, src_url: str, chash: str,
+                  title: str) -> PersistedPosting:
+        return PersistedPosting(
             posting_id=pid,
             source=raw.source,
             source_group=raw.source_group,
             source_type=raw.source_type,
-            source_url=raw.source_url,
-            title=raw.title,
+            source_url=src_url,
+            source_post_url=raw.source_url,
+            title=title,
             raw_description=raw.raw_description,
             content_hash=chash,
             posted_date=raw.posted_date.date() if raw.posted_date else None,
@@ -163,92 +194,152 @@ class IngestPipeline:
             poster_type=raw.poster_type,
             extraction_model=self.model_name,
         )
+
+    def _rejected_work(self, raw: RawPosting, chash: str, assessment: Any) -> _Work:
+        """A post the legitimacy gate rejected — one audit row for the WHOLE post,
+        never split (there is nothing worth splitting a scam into)."""
+        pid = id_for(raw)
+        row = self._base_row(raw, pid, raw.source_url, chash, raw.title)
+        row.legitimacy_score = assessment.score
+        row.status = "rejected"
+        row.review_reason = f"legitimacy: {', '.join(assessment.codes) or 'adjudicated'}"
         return _Work(raw=raw, posting_id=pid, content_hash=chash, row=row)
 
+    def _child_work(self, raw: RawPosting, chash: str, job: JobExtraction,
+                    index: int, total: int, assessment: Any) -> _Work:
+        """One vacancy -> one row. A single-vacancy post keeps the post's own URL
+        and id (byte-identical to before); a split vacancy gets post_url#role so
+        each is a distinct, stable key under UNIQUE (source, source_url)."""
+        is_split = total > 1
+        title = (job.title or "").strip() or raw.title
+        if is_split:
+            src_url = child_source_url(raw.source_url, job.title, index)
+            pid = posting_id(raw.source, src_url)
+        else:
+            src_url = raw.source_url
+            pid = id_for(raw)
+
+        row = self._base_row(raw, pid, src_url, chash, title)
+        row.legitimacy_score = assessment.score
+        row.sector = job.sector
+        row.required_skills = job.required_skills
+        row.seniority_level = job.seniority_level
+        row.location = job.location
+        row.country = job.country
+
+        # Ground the employer the same way Agent A grounds a skill span: a company
+        # the model named must actually appear in the posting, or it is a
+        # hallucination. Not a stored column, but it gates poster_type below — a
+        # claim of 'company' is only trustworthy if a real employer name backs it.
+        grounded_company = (
+            job.company
+            if job.company and normalize(job.company) in normalize(raw.raw_description)
+            else None
+        )
+        # Extraction reads the content, so it may refine intent/poster the adapter
+        # left unknown — but never overwrites a value the source already stated.
+        if raw.listing_intent == "unknown":
+            row.listing_intent = job.listing_intent
+        if raw.poster_type == "unknown":
+            if job.poster_type == "company" and grounded_company is None:
+                row.poster_type = "unknown"
+            else:
+                row.poster_type = job.poster_type
+
+        return _Work(raw=raw, posting_id=pid, content_hash=chash, row=row, is_split=is_split)
+
     # ---- legitimacy --------------------------------------------------
-    def _gate_legitimacy(self, item: _Work, summary: IngestSummary) -> None:
-        # employer_extracted=False: extraction has not run yet, so the
-        # no_employer_named signal must stay silent — the Phase 2b gate showed
-        # that firing it here scores every posting as employer-less. The gate
-        # runs on the phrase, contact and role-structure signals, which are all
-        # present in the raw text.
+    def _assess(self, raw: RawPosting, summary: IngestSummary) -> tuple[Any, str]:
+        """Score the WHOLE post for legitimacy, before any split. employer_
+        extracted=False: extraction has not run yet, so the no_employer_named
+        signal must stay silent (firing it here scores every posting employer-
+        less); the phrase/contact/role signals all read from the raw text."""
         assessment = legit.score_text(
-            item.raw.raw_description,
-            company=None,
-            title=item.raw.title,
-            employer_extracted=False,
+            raw.raw_description, company=None, title=raw.title, employer_extracted=False,
         )
         band = assessment.band(self.config)
-
         if band == "adjudicate":
-            assessment = self._adjudicate(item, assessment, summary)
+            assessment = self._adjudicate(raw, assessment, summary)
             band = assessment.band(self.config)
+        return assessment, band
 
-        item.row.legitimacy_score = assessment.score
-        if band == "reject":
-            item.row.status = "rejected"
-            item.row.review_reason = f"legitimacy: {', '.join(assessment.codes) or 'adjudicated'}"
-            summary.rejected += 1
-
-    def _adjudicate(self, item: _Work, assessment: Any, summary: IngestSummary) -> Any:
-        """One LLM call for a posting the rules could not resolve.
-
-        The verdict is trusted only if its quote is real. A fabricated quote is
-        discarded and the deterministic rule score stands — the model does not
-        get to reject a posting on evidence it cannot produce.
-        """
+    def _adjudicate(self, raw: RawPosting, assessment: Any, summary: IngestSummary) -> Any:
+        """One LLM call for a post the rules could not resolve. Trusted only if
+        its quote is real; a fabricated quote is discarded and the rule score
+        stands, so the model cannot reject on evidence it cannot produce."""
         summary.adjudications += 1
-        verdict: LegitimacyVerdict = self.adjudicator.invoke({"body": item.raw.raw_description})
-        if not verify_quote(verdict.evidence_quote, item.raw.raw_description):
+        verdict: LegitimacyVerdict = self.adjudicator.invoke({"body": raw.raw_description})
+        if not verify_quote(verdict.evidence_quote, raw.raw_description):
             return assessment  # ungrounded — rules stand
         if verdict.is_scam:
-            # Blend: take the stronger of rule risk and the model's confidence,
-            # so a confident scam call can push a borderline posting over the
-            # reject line but a weak one cannot pull a clear scam back.
+            # Blend: the stronger of rule risk and model confidence.
             risk = max(assessment.risk, verdict.scam_confidence)
             return legit.Assessment(risk=risk, signals=assessment.signals)
-        # Model cleared it with real evidence: relax toward legitimate but never
-        # below the band floor, so a single clearance cannot whitewash a posting
-        # with strong rule signals.
+        # Cleared with real evidence: relax toward legitimate but never below the
+        # band floor, so one clearance cannot whitewash strong rule signals.
         return legit.Assessment(risk=min(assessment.risk, 0.35), signals=assessment.signals)
 
     # ---- extraction --------------------------------------------------
-    def _extract(self, item: _Work, summary: IngestSummary) -> None:
+    def _extract_jobs(self, raw: RawPosting, summary: IngestSummary) -> list[JobExtraction]:
+        """Extract the vacancies in one post. ONE call per post (so the warm-cycle
+        gate still holds), returning one JobExtraction per distinct vacancy — a
+        list of one for an ordinary posting, several for a roundup. Tolerates an
+        extractor that returns a bare JobExtraction (the offline test harness) as
+        well as a JobExtractionBatch (the live runner)."""
         summary.extractions += 1
-        result: JobExtraction = self.extractor.invoke(
-            {"title": item.raw.title, "body": item.raw.raw_description}
-        )
-        row = item.row
-        row.sector = result.sector
-        row.required_skills = result.required_skills
-        row.seniority_level = result.seniority_level
-        row.location = result.location
-        row.country = result.country
+        result = self.extractor.invoke({"title": raw.title, "body": raw.raw_description})
+        jobs = list(result.jobs) if isinstance(result, JobExtractionBatch) else [result]
+        # A post the model read nothing usable out of is still one row (thin, but
+        # honestly thin), exactly as a single empty extraction was before.
+        return jobs or [JobExtraction()]
 
-        # Ground the employer the same way Agent A grounds a skill span: a
-        # company the model named must actually appear in the posting, or it is a
-        # hallucination. It is not a stored column (the two-table contract omits
-        # it deliberately), but it gates poster_type below — a claim of 'company'
-        # is only trustworthy if a real employer name backs it.
-        grounded_company = (
-            result.company
-            if result.company and normalize(result.company) in normalize(item.raw.raw_description)
-            else None
-        )
+    # ---- root-source enrichment -------------------------------------
+    def _enrich_from_root(self, live: list[_Work], summary: IngestSummary) -> None:
+        """Replace a posting's aggregator skills with the real job page's.
 
-        # Extraction reads the content, so it may refine intent/poster the
-        # adapter left unknown — but never overwrites a value the source already
-        # stated (e.g. Dubizzle's 'seeking' from its own category).
-        if item.raw.listing_intent == "unknown":
-            row.listing_intent = result.listing_intent
-        if item.raw.poster_type == "unknown":
-            if result.poster_type == "company" and grounded_company is None:
-                # The model asserted an organisation posted this but named none
-                # in the text — unsupported, so it stays unknown and out of
-                # aggregation rather than being taken on faith.
-                row.poster_type = "unknown"
-            else:
-                row.poster_type = result.poster_type
+        Bounded + robots-respecting (the fetcher enforces both): follow a link
+        ONLY when it is a single external job-detail page; re-extract it; enrich
+        ONLY when that page is a SINGLE job (several jobs means it was a hub —
+        skip, never split external content). Enrich-only: a failed fetch, a hub,
+        or an empty page leaves the aggregator's skills untouched. Split children
+        are skipped — their post's links are hubs, not per-role pages.
+        """
+        if self.root_fetcher is None or not self.config.enrich_from_root_source:
+            return
+
+        for item in live:
+            if item.is_split:
+                continue
+            self_host = urlsplit(item.raw.source_url).netloc.lower()
+            link = candidate_job_link(item.raw.outbound_links, self_host)
+            if not link:
+                continue
+
+            text = self.root_fetcher.fetch(link)
+            summary.root_fetches += 1
+            if not text:
+                continue
+
+            result = self.extractor.invoke({"title": item.raw.title, "body": text})
+            jobs = list(result.jobs) if isinstance(result, JobExtractionBatch) else [result]
+            # Exactly one job = a real single job page. More = a listing/hub we
+            # do not deep-crawl. Zero/no skills = nothing better than we have.
+            if len(jobs) != 1 or not jobs[0].required_skills:
+                continue
+
+            self._merge_root(item.row, jobs[0])
+            summary.root_enrichments += 1
+
+    @staticmethod
+    def _merge_root(row: PersistedPosting, job: JobExtraction) -> None:
+        """Root page is authoritative for the job's facts: its skills REPLACE the
+        aggregator's, and each scalar fact is taken from the root when it states
+        one, else the aggregator's value is kept."""
+        row.required_skills = job.required_skills
+        row.sector = job.sector or row.sector
+        row.seniority_level = job.seniority_level or row.seniority_level
+        row.location = job.location or row.location
+        row.country = job.country or row.country
 
     # ---- link dedup --------------------------------------------------
     def _resolve_link_duplicates(self, live: list[_Work], summary: IngestSummary) -> None:
@@ -259,13 +350,19 @@ class IngestPipeline:
         needed. Only the FIRST outbound link is treated as the subject; later
         links are unrelated (a Telegram post appends an unrelated next job), so
         merging on any link would collapse two real vacancies.
+
+        Split vacancies are excluded: the outbound links belong to the WHOLE post,
+        not to any one of the roles split out of it, so attributing them to a
+        child would merge every sibling into the post's link target. Splits rely
+        on essence near-dup instead.
         """
+        candidates = [w for w in live if not w.is_split]
         # url -> posting_id, from the store and from this very batch.
-        in_batch = {w.raw.source_url: w.posting_id for w in live}
-        all_links = [w.raw.outbound_links[0] for w in live if w.raw.outbound_links]
+        in_batch = {w.row.source_url: w.posting_id for w in candidates}
+        all_links = [w.raw.outbound_links[0] for w in candidates if w.raw.outbound_links]
         stored = self.store.find_by_source_urls(all_links) if all_links else {}
 
-        for item in live:
+        for item in candidates:
             if not item.raw.outbound_links:
                 continue
             target_url = item.raw.outbound_links[0]
@@ -427,7 +524,10 @@ def _essence_text(item: _Work) -> str:
     before ever reaching the embedder anyway.
     """
     row = item.row
-    parts = [(item.raw.title or "").strip()]
+    # The row's title (the per-role title for a split vacancy), not the raw
+    # post title — otherwise every role split out of one roundup shares a title
+    # line and near-dup would wrongly merge distinct vacancies.
+    parts = [(row.title or item.raw.title or "").strip()]
     scalars = " ".join(p for p in (row.seniority_level, row.location, row.country) if p)
     if scalars:
         parts.append(scalars)

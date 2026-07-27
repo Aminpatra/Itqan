@@ -30,6 +30,14 @@ class PersistedPosting:
 
     status: str = "active"
 
+    # The URL of the SOURCE POST this row came from. Empty means "same as
+    # source_url" (the store falls back to source_url when writing). It differs
+    # only for a vacancy SPLIT out of a multi-job roundup: then source_url is
+    # post_url#role and this is the roundup's own URL. It is what lets change
+    # detection work at the POST level — decide "has this post changed?" once,
+    # before re-extracting all the vacancies it split into.
+    source_post_url: str = ""
+
     # Extracted. All optional — a null is an honest "the posting did not say",
     # never a placeholder.
     sector: Optional[str] = None

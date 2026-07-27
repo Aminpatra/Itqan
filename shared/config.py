@@ -222,6 +222,29 @@ class Config:
     blogger_lookback_days: int = 21
     telegram_max_pages: int = 3
 
+    # A "roundup" Blogger post is an index listing several distinct vacancies,
+    # each linking to its own same-site detail page (e.g. "…5 Jobs in Marketing,
+    # HR, …"). When a post carries at least this many same-site individual-post
+    # links, expand it: fetch each linked job page and ingest it as its OWN
+    # posting, instead of collapsing all the jobs into one merged row. The job
+    # count is whatever the links yield — never assumed. Set expand False to keep
+    # the old single-row behaviour.
+    blogger_expand_roundups: bool = True
+    blogger_roundup_min_links: int = 2
+    # Politeness/safety cap: never fetch more than this many job pages from one
+    # roundup, however many links it lists.
+    blogger_max_links_per_post: int = 12
+
+    # When a posting links to the employer's own SINGLE job page (a "root
+    # source"), fetch it and take the real required skills from there instead of
+    # the aggregator's thin summary. Bounded and robots-respecting: only single
+    # job-detail links (never careers hubs), every host's robots.txt honored, and
+    # enrich-only (a failed/blocked fetch just keeps the aggregator's skills — no
+    # posting is ever deleted). Set False to skip all root-page fetching.
+    enrich_from_root_source: bool = True
+    # Per-host politeness floor for those root-page fetches.
+    root_fetch_interval_s: float = 1.0
+
     def require_api_key(self) -> str:
         key = os.getenv("OPENAI_API_KEY")
         if not key:

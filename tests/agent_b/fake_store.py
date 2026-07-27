@@ -31,6 +31,17 @@ class FakeStore:
     def lookup_hashes(self, posting_ids: list[str]) -> dict[str, str]:
         return {pid: self.rows[pid].content_hash for pid in posting_ids if pid in self.rows}
 
+    def lookup_posts(self, source_post_urls: list[str]) -> dict[str, dict[str, Any]]:
+        wanted = set(source_post_urls)
+        out: dict[str, dict[str, Any]] = {}
+        for pid, row in self.rows.items():
+            post_url = row.source_post_url or row.source_url
+            if post_url not in wanted:
+                continue
+            entry = out.setdefault(post_url, {"content_hash": row.content_hash, "posting_ids": []})
+            entry["posting_ids"].append(pid)
+        return out
+
     def existing_ids(self, posting_ids: list[str]) -> set[str]:
         return {pid for pid in posting_ids if pid in self.rows}
 

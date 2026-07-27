@@ -49,6 +49,7 @@ class GraphDeps:
     extractor: Any = None
     adjudicator: Any = None
     embedder: Any = None
+    root_fetcher: Any = None
     model_name: str = "unknown"
     source_configs: tuple[SourceConfig, ...] = DEFAULT_SOURCES
     # Overridable so tests can supply fake adapters without a network. Real runs
@@ -68,6 +69,7 @@ class GraphDeps:
             embedder=self.embedder,
             config=self.config,
             model_name=self.model_name,
+            root_fetcher=self.root_fetcher,
         )
 
     def config_by_name(self, name: str) -> SourceConfig:
