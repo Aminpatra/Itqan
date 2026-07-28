@@ -124,10 +124,26 @@ def test_exactly_four_usable_postings_trigger_the_fallback(profile_path, tmp_pat
     state = run_graph(profile_path, tmp_path, postings=postings, stats=stats)
 
     assert state["used_fallback"] is True
-    assert state["matched_jobs"] == []
     # modal sector over ALL retrievals: eleven 5s beat four 2s
     assert state["inferred_sector"] == "5"
     assert state["fallback_sector_gap"]["sector"] == "5"
+
+
+def test_the_fallback_supplements_the_per_job_results_it_does_not_replace_them(
+    profile_path, tmp_path
+):
+    """Four excellent matches used to be DELETED because a fifth did not exist:
+    `matched_jobs` was suppressed whenever the fallback fired. "Too thin for a
+    stable market average" and "not worth showing you" are different claims, and
+    only the first was ever true — so the per-job evidence now always survives and
+    the sector block is merely computed in addition."""
+    postings = [_posting(f"p{i}", 0.85) for i in range(4)]
+    state = run_graph(profile_path, tmp_path, postings=postings,
+                      stats=[_stat("Welding", sector="2", freq=3)])
+
+    assert state["used_fallback"] is True
+    assert len(state["matched_jobs"]) == 4, "the best evidence available was discarded"
+    assert state["fallback_sector_gap"] is not None
 
 
 def test_sector_override_beats_modal_inference(profile_path, tmp_path):
@@ -213,8 +229,13 @@ def test_esco_identity_beats_a_low_phrase_similarity(profile_path, tmp_path):
 # weights
 # ---------------------------------------------------------------------------
 def test_demand_frequency_weights_the_gap_score(profile_path, tmp_path):
-    """One missing skill with freq 9 vs matched(1) + two possible(1 each):
-    gap = 9 / 12 = 0.75. The floor keeps un-aggregated skills alive at 1."""
+    """A high-demand missing skill still dominates the score — but log1p-damped.
+
+    Raw counts span 1..95 on the live corpus, so an undamped weight let ONE
+    boilerplate phrase outweigh two dozen specific skills. Damping preserves the
+    ORDER of demand while removing the tyranny of the mode:
+    log1p(9) / (log1p(9) + 3*log1p(1)) = 2.3026 / 4.3820.
+    """
     embedder = PinnedEmbedder({
         "alpha": CANDIDATE_AXIS,
         "heavy-missing": _pin(0.10),
@@ -228,18 +249,24 @@ def test_demand_frequency_weights_the_gap_score(profile_path, tmp_path):
     state = run_graph(profile_path, tmp_path, postings=postings, stats=stats,
                       embedder=embedder)
 
-    assert state["matched_jobs"][0]["gap_score"] == pytest.approx(9 / 12)
+    expected = math.log1p(9) / (math.log1p(9) + 3 * math.log1p(1))
+    assert state["matched_jobs"][0]["gap_score"] == pytest.approx(expected, abs=1e-4)
     assert state["aggregate"]["most_common_missing_skills"][0] == "heavy-missing"
 
 
-def test_missing_skill_details_carries_esco_and_priority_for_agent_e(profile_path, tmp_path):
-    """The additive per-skill detail Agent E inherits: same skills and order as
-    most_common_missing_skills, each with its esco_code (or None when the skill
-    never mapped — never guessed) and its summed-demand priority_score."""
+def test_priority_is_demand_counted_once_not_multiplied_by_retrieval(
+    profile_path, tmp_path
+):
+    """`priority_score` used to add the market-wide frequency ONCE PER JOB, giving
+    freq x job_count — a squared prevalence term, part of which merely measured how
+    often retrieval repeated a posting. It ranked a generic phrase (24x3=72) above
+    a specific one (8), which is how an interview-skills course became the top
+    recommendation for a data engineer. Demand is now counted once; how many jobs
+    wanted it is its own field."""
     embedder = PinnedEmbedder({
         "alpha": CANDIDATE_AXIS,
-        "heavy-missing": _pin(0.10),   # esco-coded, freq 9 over 5 jobs -> priority 45
-        "light-missing": _pin(0.10),   # unmapped, freq 2 over 5 jobs -> priority 10, esco None
+        "heavy-missing": _pin(0.10),
+        "light-missing": _pin(0.10),
         "hit": _pin(0.90),
     })
     postings = [_posting(f"p{i}", 0.85, skills=["heavy-missing", "light-missing", "hit"])
@@ -250,17 +277,20 @@ def test_missing_skill_details_carries_esco_and_priority_for_agent_e(profile_pat
                       embedder=embedder)
 
     details = state["aggregate"]["missing_skill_details"]
-    # order + membership mirror most_common_missing_skills
     assert [d["skill"] for d in details] == state["aggregate"]["most_common_missing_skills"]
     by_skill = {d["skill"]: d for d in details}
-    # priority_score is the demand weight summed across every job the skill is
-    # missing in (freq 9 x 5 postings = 45; freq 2 x 5 = 10).
-    assert by_skill["heavy-missing"] == {
-        "skill": "heavy-missing", "esco_code": "uri:HM", "priority_score": 45,
-    }
-    assert by_skill["light-missing"] == {
-        "skill": "light-missing", "esco_code": None, "priority_score": 10,
-    }
+
+    heavy = by_skill["heavy-missing"]
+    assert heavy["esco_code"] == "uri:HM"
+    # Counted ONCE (log1p(9)), not five times for five postings.
+    assert heavy["priority_score"] == pytest.approx(math.log1p(9), abs=1e-4)
+    # ...and the occurrence count is preserved as its own, separate fact.
+    assert heavy["jobs_missing_in"] == 5
+
+    light = by_skill["light-missing"]
+    assert light["esco_code"] is None
+    assert light["priority_score"] == pytest.approx(math.log1p(2), abs=1e-4)
+    assert heavy["priority_score"] > light["priority_score"], "demand still ranks"
     # 'hit' matched -> never a missing detail
     assert "hit" not in by_skill
 

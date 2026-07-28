@@ -26,6 +26,9 @@ class GapState(TypedDict, total=False):
     # ---- build_query_embedding -------------------------------------------
     profile: Any                       # CandidateProfile
     candidate_skills: list[str]        # accepted skill names, order preserved
+    # The accepted-skill dicts as Agent A published them, carrying quality /
+    # evidence_type / origin. Used to stop a weakly-evidenced claim closing a gap.
+    candidate_skill_records: list[dict[str, Any]]
     essence: str
     query_embedding: list[float]
 

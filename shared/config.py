@@ -200,6 +200,17 @@ class Config:
     # missing.
     agent_c_skill_match: float = 0.80
     agent_c_skill_possible: float = 0.60
+    # Below this many usable postings, per-job matching says more about retrieval
+    # luck than about the market, so the sector fallback is ALSO computed. It no
+    # longer suppresses the per-job results — four excellent matches are better
+    # evidence than a sector aggregate, and hiding them was pure loss.
+    agent_c_min_usable_postings: int = 5
+    # The one model call in Agent C: it settles requirements the deterministic
+    # tiers cannot, because cosine similarity is symmetric and cannot express
+    # "TensorFlow is an instance of machine learning". Measured cost of not
+    # having it: an ML engineering role scored a 100% gap for a candidate with
+    # TensorFlow, PyTorch and scikit-learn. Off = fully deterministic, as before.
+    agent_c_llm_matching: bool = True
 
     # --- Agent E (course recommender) ---
     # When several courses tie on coverage value, break the tie by these fields

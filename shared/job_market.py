@@ -122,6 +122,18 @@ def export_for_agent_c(
                      WHERE {AGGREGABLE_POSTING_PREDICATE}
                        AND country = ANY(%(countries)s)
                        AND embedding IS NOT NULL
+                       -- The SAME window the demand stats use, and the same
+                       -- COALESCE expression (aggregate.py's _ELIGIBLE_CTE).
+                       -- Without it the two halves of one export were drawn from
+                       -- different time populations: stats windowed to 30 days,
+                       -- postings unbounded. Nothing is currently older than the
+                       -- window, but only as a side effect of the scraper's
+                       -- lookback and cycle cadence — an index page that keeps
+                       -- re-listing a dead vacancy would keep it 'active' forever
+                       -- and Agent C would serve it as current demand while Agent
+                       -- B had already stopped counting it.
+                       AND COALESCE(posted_date, first_seen_at::date)
+                           > current_date - %(window_days)s::int
                      ORDER BY embedding <=> %(emb)s::vector
                      LIMIT %(k)s
                     """,
@@ -129,6 +141,7 @@ def export_for_agent_c(
                         "emb": query_embedding,
                         "countries": list(config.in_scope_countries),
                         "k": top_k,
+                        "window_days": config.window_days,
                     },
                 )
                 postings = [_posting_row(dict(r)) for r in cur.fetchall()]

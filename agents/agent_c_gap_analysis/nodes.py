@@ -22,6 +22,8 @@ The three honesty rules the arithmetic follows:
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -30,18 +32,20 @@ from shared.config import Config
 from shared.contracts import load_profile
 from shared.job_market import export_for_agent_c, map_skills_to_esco
 
+from .skill_resolver import resolve_skills
 from .state import GapState
 
 SCHEMA_VERSION = "itqan.skill_gap/1.0"
 
 # Below this many usable postings, per-job matching says more about retrieval
 # luck than about the market, and the aggregated stats are the honest basis.
-MIN_USABLE_POSTINGS = 5
-
 GAP_SCORE_FORMULA = (
     "sum(weight of missing) / sum(weight of matched + missing + possible_match); "
-    "weight = frequency_count in the latest skill_demand_stats window "
-    "(by esco_code, else by skill_key), floor 1"
+    "weight = log1p(frequency_count in the latest skill_demand_stats window, "
+    "scoped to THIS JOB'S sector, by esco_code else by skill_key, floor 1). "
+    "null when the posting listed no parsable requirements — never 0.0, which "
+    "would read as a perfect fit. gap_score_range gives [lower, upper] where the "
+    "upper bound counts every unresolved possible_match as missing."
 )
 
 
@@ -55,6 +59,14 @@ class Deps:
     embedder: Any
     exporter: Callable[..., dict[str, list[Any]]] = export_for_agent_c
     mapper: Callable[..., list[Any]] = map_skills_to_esco
+    # The ONE model in this agent, and it is optional: absent (or with
+    # agent_c_llm_matching off) the whole agent stays deterministic, exactly as
+    # it was. Injected like every other dependency so offline tests never reach a
+    # network.
+    llm: Any = None
+
+    def resolve_skills(self, **kwargs: Any) -> dict[str, dict[str, Any]]:
+        return resolve_skills(llm=self.llm, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -65,11 +77,11 @@ def make_build_query_embedding(deps: Deps) -> Callable[[GapState], dict]:
         profile = load_profile(state["profile_path"])
         warnings: list[str] = []
 
-        skills = [
-            s.get("name", "").strip()
-            for s in profile.skills.get("accepted", [])
-            if s.get("name", "").strip()
+        accepted = [
+            s for s in profile.skills.get("accepted", [])
+            if isinstance(s, dict) and s.get("name", "").strip()
         ]
+        skills = [s["name"].strip() for s in accepted]
         if not skills:
             warnings.append(
                 "profile has no accepted skills; retrieval will rest on the headline alone"
@@ -98,6 +110,11 @@ def make_build_query_embedding(deps: Deps) -> Callable[[GapState], dict]:
         return {
             "profile": profile,
             "candidate_skills": skills,
+            # The full records, not just names. Agent A publishes quality,
+            # evidence_type and origin per skill and Agent C was discarding every
+            # one of them — so a skill the candidate merely claimed cancelled a
+            # requirement as forcefully as one demonstrated in a project.
+            "candidate_skill_records": accepted,
             "essence": essence,
             "query_embedding": list(deps.embedder.embed_query(essence)),
             "warnings": warnings,
@@ -121,7 +138,10 @@ def make_retrieve_postings(deps: Deps) -> Callable[[GapState], dict]:
         stats = out["skill_demand_stats"]
 
         usable = [p for p in postings if p.similarity >= config.agent_c_match_threshold]
-        used_fallback = len(usable) < MIN_USABLE_POSTINGS
+        # "Too thin for a stable market read" — it no longer means "discard the
+        # per-job results", which conflated a statistical-stability question with
+        # an evidence question and threw away the best evidence available.
+        used_fallback = len(usable) < config.agent_c_min_usable_postings
 
         warnings: list[str] = []
         sector = state.get("sector_override")
@@ -179,29 +199,77 @@ def make_gap_analysis(deps: Deps) -> Callable[[GapState], dict]:
         candidate_skills = state.get("candidate_skills", [])
 
         candidate_esco = {m.esco_uri for m in mappings if m.esco_uri}
+        warnings: list[str] = []
 
-        # Demand-stat lookups (latest window, served by the export):
-        #   skill_key -> esco_code, for resolving a JOB skill to the vocabulary
-        #   esco/skill_key -> summed frequency, for weights
+        # Candidate skills whose evidence is too weak to CANCEL a requirement.
+        # Agent A publishes quality/evidence_type/origin per skill and Agent C
+        # was discarding all of it, so an unverified `claim_only` claim closed a
+        # gap exactly as forcefully as a project-evidenced skill. The error is
+        # asymmetric in the harmful direction — it shrinks the gap — so weak
+        # evidence is capped at `possible_match` and can never read `matched`.
+        weak_skills = {
+            (s.get("name") or "").strip().lower()
+            for s in (state.get("candidate_skill_records") or [])
+            if s.get("quality") == "low"
+            or s.get("evidence_type") in {"claim_only", "adjacent"}
+        }
+
+        # Demand-stat lookups (latest window, served by the export). Weights are
+        # SECTOR-SCOPED: summing a skill's frequency across all nine ISCO groups
+        # made "professional communication" weigh 95 when its largest single
+        # sector is 58 — a nationwide generic phrase outranking a candidate's
+        # real sector-specific gaps, and the distortion pulls every candidate
+        # toward the largest sector regardless of their own.
         key_to_esco: dict[str, Optional[str]] = {}
-        weight_by_esco: dict[str, int] = {}
-        weight_by_key: dict[str, int] = {}
+        w_sector_esco: dict[tuple[str, str], int] = {}
+        w_sector_key: dict[tuple[str, str], int] = {}
+        w_any_esco: dict[str, int] = {}
+        w_any_key: dict[str, int] = {}
+        sector_volume: dict[str, int] = {}
+        low_conf_sectors: set[str] = set()
         for row in stats:
+            # Never let a NULL overwrite a real code (setdefault alone would pin
+            # the first row seen, even if a later row carries the mapping).
+            if row.esco_code and not key_to_esco.get(row.skill_key):
+                key_to_esco[row.skill_key] = row.esco_code
             key_to_esco.setdefault(row.skill_key, row.esco_code)
-            if row.esco_code:
-                weight_by_esco[row.esco_code] = (
-                    weight_by_esco.get(row.esco_code, 0) + row.frequency_count
-                )
-            weight_by_key[row.skill_key] = (
-                weight_by_key.get(row.skill_key, 0) + row.frequency_count
-            )
 
-        def weight(skill_key: str, esco: Optional[str]) -> int:
+            if row.esco_code:
+                k = (row.sector, row.esco_code)
+                w_sector_esco[k] = w_sector_esco.get(k, 0) + row.frequency_count
+                w_any_esco[row.esco_code] = w_any_esco.get(row.esco_code, 0) + row.frequency_count
+            k2 = (row.sector, row.skill_key)
+            w_sector_key[k2] = w_sector_key.get(k2, 0) + row.frequency_count
+            w_any_key[row.skill_key] = w_any_key.get(row.skill_key, 0) + row.frequency_count
+
+            if row.sector_volume:
+                sector_volume[row.sector] = max(
+                    sector_volume.get(row.sector, 0), row.sector_volume
+                )
+            if row.low_confidence:
+                low_conf_sectors.add(row.sector)
+
+        def raw_demand(skill_key: str, esco: Optional[str], sector: Optional[str]) -> int:
+            """This skill's demand IN THIS JOB'S SECTOR, falling back to the
+            nationwide total only when the sector has no row for it."""
+            if sector:
+                if esco and (sector, esco) in w_sector_esco:
+                    return w_sector_esco[(sector, esco)]
+                if (sector, skill_key) in w_sector_key:
+                    return w_sector_key[(sector, skill_key)]
+            if esco and esco in w_any_esco:
+                return w_any_esco[esco]
+            return w_any_key.get(skill_key, 0)
+
+        def weight(skill_key: str, esco: Optional[str], sector: Optional[str] = None) -> float:
             # Floor 1: a skill nobody has aggregated yet still exists. Without
             # the floor, un-aggregated skills would vanish from gap_score.
-            if esco and esco in weight_by_esco:
-                return max(1, weight_by_esco[esco])
-            return max(1, weight_by_key.get(skill_key, 0))
+            #
+            # log1p damping: raw counts span 1..95 here, so one boilerplate
+            # phrase outweighed two dozen specific skills and dictated the whole
+            # ranking. Damping preserves the ORDER of demand while stopping the
+            # mode from being tyrannical.
+            return math.log1p(max(1, raw_demand(skill_key, esco, sector)))
 
         # One embedding batch for every phrase the banding will compare —
         # candidate skills, every usable job's skills, and (for fallback) the
@@ -223,114 +291,310 @@ def make_gap_analysis(deps: Deps) -> Callable[[GapState], dict]:
             phrases.update(r.skill_key for r in sector_rows)
         vectors = _embed_phrases(deps, sorted(phrases))
 
-        def band(job_phrase: str) -> str:
-            """matched / possible_match / missing by best cosine against the
-            candidate's skills. The middle band is a refusal to decide, and it
-            stays one."""
-            best = max(
-                (
-                    _dot(vectors[job_phrase.lower()], vectors[c.lower()])
-                    for c in candidate_skills
-                ),
-                default=0.0,
-            )
-            if best >= config.agent_c_skill_match:
-                return "matched"
-            if best >= config.agent_c_skill_possible:
-                return "possible_match"
-            return "missing"
+        def nearest(job_phrase: str) -> tuple[float, Optional[str]]:
+            """Best cosine against the candidate's skills, and which skill it was."""
+            best, who = 0.0, None
+            target = vectors.get(job_phrase.lower())
+            if target is None:
+                return 0.0, None
+            for c in candidate_skills:
+                vec = vectors.get(c.lower())
+                if vec is None:
+                    continue
+                sim = _dot(target, vec)
+                if sim > best:
+                    best, who = sim, c
+            return best, who
 
-        def classify(skill: str, esco: Optional[str]) -> str:
+        def classify(skill: str, esco: Optional[str]) -> dict[str, Any]:
+            """Resolve one requirement, recording HOW it was resolved.
+
+            Tiers, strongest first. Each is deterministic; the LLM tier that runs
+            afterwards only ever looks at what these could not settle.
+            """
+            key = skill.strip().lower()
+            best, who = nearest(skill)
+            out = {
+                "skill": skill, "key": key, "esco": esco,
+                "best_similarity": round(best, 4), "nearest_candidate_skill": who,
+            }
+
+            # 1. Same ESCO concept — the shared vocabulary, strongest evidence.
             if esco and esco in candidate_esco:
-                return "matched"
-            return band(skill)
+                by_esco = next(
+                    (m.skill for m in mappings if m.esco_uri == esco), who
+                )
+                return {**out, "verdict": "matched", "resolved_by": "esco",
+                        "satisfied_by": by_esco}
 
-        def score(entries: list[tuple[str, Optional[str], str]]) -> float:
-            total = sum(weight(k, e) for k, e, _ in entries)
-            miss = sum(weight(k, e) for k, e, verdict in entries if verdict == "missing")
-            return round(miss / total, 4) if total else 0.0
+            # 2. Exact normalised string equality.
+            for c in candidate_skills:
+                if c.strip().lower() == key:
+                    return {**out, "verdict": "matched", "resolved_by": "exact",
+                            "satisfied_by": c}
+
+            # 3. Asymmetric token containment: the candidate's phrase contains the
+            #    requirement as whole tokens ("data analytics engineering" satisfies
+            #    "data analytics"). Cosine cannot express this direction at all.
+            for c in candidate_skills:
+                if _contains_tokens(c, key):
+                    return {**out, "verdict": "matched", "resolved_by": "containment",
+                            "satisfied_by": c}
+
+            # 4. Cosine bands. Measured: at 0.80 this is an exact-string detector
+            #    (zero non-identical matches on the live run), so it is kept as a
+            #    conservative confirmer, not relied on to find synonyms.
+            if best >= config.agent_c_skill_match:
+                return {**out, "verdict": "matched", "resolved_by": "cosine",
+                        "satisfied_by": who}
+            if best >= config.agent_c_skill_possible:
+                return {**out, "verdict": "possible_match", "resolved_by": "cosine",
+                        "satisfied_by": who}
+            return {**out, "verdict": "missing", "resolved_by": "cosine",
+                    "satisfied_by": None}
+
+        def cap_weak_evidence(entry: dict[str, Any]) -> dict[str, Any]:
+            """A requirement cancelled by a weak claim is not `matched`.
+
+            An unverified claim_only/low/adjacent skill closing a gap outright is
+            the asymmetric error: it makes the candidate look readier than the
+            evidence supports. Capped at possible_match so the uncertainty stays
+            visible instead of being silently resolved in their favour.
+            """
+            who = (entry.get("satisfied_by") or "").strip().lower()
+            if entry["verdict"] == "matched" and who in weak_skills:
+                return {**entry, "verdict": "possible_match", "weak_evidence": True}
+            return entry
+
+        def score(entries: list[dict[str, Any]]) -> tuple[Optional[float], Optional[list]]:
+            """(gap_score, [lower, upper]) — or (None, None) when undefined.
+
+            None, never 0.0. Returning the BEST value on the scale for "this
+            posting listed nothing we could parse" was a false claim of a perfect
+            fit: 5 of 15 jobs on the live run scored 0.0 having matched nothing,
+            two of them listing no requirements at all.
+
+            The interval is what `possible_match` honestly implies. Putting it in
+            the denominator only is not neutral — it quietly decides "not
+            missing", and every unresolved requirement therefore lowers the score.
+            The bounds say plainly: at best `lower`, at worst `upper`.
+            """
+            if not entries:
+                return None, None
+            total = sum(e["weight"] for e in entries)
+            if total <= 0:
+                return None, None
+            miss = sum(e["weight"] for e in entries if e["verdict"] == "missing")
+            poss = sum(e["weight"] for e in entries if e["verdict"] == "possible_match")
+            # Everything unresolved -> the point estimate is arithmetically 0.0 but
+            # means nothing: not one requirement was settled either way. Publishing
+            # 0.0 there reads as "perfect fit" at a glance, which is the same lie
+            # the empty-denominator case told, so it gets the same answer: null,
+            # with the [0, 1] range saying exactly how little is known.
+            if poss >= total:
+                return None, [0.0, 1.0]
+            return round(miss / total, 4), [
+                round(miss / total, 4), round((miss + poss) / total, 4)
+            ]
+
+        # ---- classify every requirement, then let the LLM tier settle what the
+        # deterministic tiers could not -------------------------------------
+        # matched_jobs is built for whatever cleared the retrieval bar, WHETHER OR
+        # NOT the fallback also runs. Suppressing it under `used_fallback` threw
+        # away the per-job evidence entirely: four excellent matches at 0.85
+        # produced an empty list while five mediocre ones became "the market".
+        # "Too few for a stable average" and "not worth showing" are different
+        # claims, and only the first was ever true.
+        job_entries: list[tuple[Any, list[dict[str, Any]]]] = []
+        for job in state.get("usable_postings", []):
+            entries = []
+            for skill in job.required_skills:
+                key = skill.strip().lower()
+                entries.append(classify(skill, key_to_esco.get(key)))
+            job_entries.append((job, entries))
+
+        fallback_entries: list[dict[str, Any]] = []
+        if state.get("used_fallback") and sector is not None:
+            fallback_entries = [
+                classify(row.skill, row.esco_code) for row in sector_rows
+            ]
+
+        all_entries = [e for _job, es in job_entries for e in es] + fallback_entries
+        resolutions = deps.resolve_skills(
+            unresolved=[e for e in all_entries if e["verdict"] != "matched"],
+            candidate_skills=candidate_skills,
+            skill_records=state.get("candidate_skill_records") or [],
+            config=config,
+        )
+        for entry in all_entries:
+            verdict = resolutions.get(entry["key"])
+            if verdict is not None:
+                entry.update(verdict)
+        # Weak evidence is capped AFTER resolution, so neither tier can promote an
+        # unverified claim to a confident match.
+        for i, entry in enumerate(all_entries):
+            all_entries[i] = cap_weak_evidence(entry)
+        by_key = {e["key"]: e for e in all_entries}
+        job_entries = [
+            (job, [by_key.get(e["key"], e) for e in es]) for job, es in job_entries
+        ]
+        fallback_entries = [by_key.get(e["key"], e) for e in fallback_entries]
+
+        def _bucket(entries: list[dict[str, Any]]) -> dict[str, list[str]]:
+            out: dict[str, list[str]] = {"matched": [], "possible_match": [], "missing": []}
+            for e in entries:
+                out[e["verdict"]].append(e["skill"])
+            return out
 
         # ---- direct path -------------------------------------------------
         matched_jobs: list[dict[str, Any]] = []
-        if not state.get("used_fallback"):
-            for job in state.get("usable_postings", []):
-                entries = []
-                for skill in job.required_skills:
-                    key = skill.lower()
-                    esco = key_to_esco.get(key)
-                    entries.append((key, esco, classify(skill, esco)))
-                buckets: dict[str, list[str]] = {"matched": [], "possible_match": [], "missing": []}
-                for (key, _e, verdict), skill in zip(entries, job.required_skills):
-                    buckets[verdict].append(skill)
-                matched_jobs.append({
-                    "job_id": job.posting_id,
-                    "job_title": job.title,
-                    "similarity": round(job.similarity, 4),
-                    "matched_skills": buckets["matched"],
-                    "missing_skills": buckets["missing"],
-                    "possible_match_skills": buckets["possible_match"],
-                    "gap_score": score(entries),
-                })
+        for job, entries in job_entries:
+            for e in entries:
+                e["weight"] = weight(e["key"], e["esco"], job.sector)
+            gap, interval = score(entries)
+            buckets = _bucket(entries)
+            matched_jobs.append({
+                "job_id": job.posting_id,
+                "job_title": job.title,
+                # A report whose purpose is "roles you nearly fit" was unusable
+                # without a way to open the job: all four of these were retrieved
+                # and discarded.
+                "source_url": job.source_url,
+                "posted_date": job.posted_date,
+                "seniority_level": job.seniority_level,
+                "location": job.location,
+                "similarity": round(job.similarity, 4),
+                "matched_skills": buckets["matched"],
+                "missing_skills": buckets["missing"],
+                "possible_match_skills": buckets["possible_match"],
+                "gap_score": gap,
+                "gap_score_range": interval,
+                # Says plainly WHY the number is absent, instead of implying a
+                # perfect fit.
+                "insufficient_data": gap is None,
+                "low_confidence_demand": job.sector in low_conf_sectors,
+                "skill_resolution": [
+                    {k: e[k] for k in ("skill", "verdict", "resolved_by",
+                                       "satisfied_by", "best_similarity")}
+                    for e in entries
+                ],
+            })
 
         # ---- fallback path ----------------------------------------------
         fallback_gap: Optional[dict[str, Any]] = None
         if state.get("used_fallback") and sector is not None:
-            entries = [
-                (row.skill_key, row.esco_code, classify(row.skill_key, row.esco_code))
-                for row in sector_rows
-            ]
-            buckets = {"matched": [], "possible_match": [], "missing": []}
-            for (key, _e, verdict), row in zip(entries, sector_rows):
-                buckets[verdict].append(row.skill)
+            for e in fallback_entries:
+                e["weight"] = weight(e["key"], e["esco"], sector)
+            gap, interval = score(fallback_entries)
+            buckets = _bucket(fallback_entries)
+            if gap is None:
+                warnings.append(
+                    f"sector {sector} had no demand rows above the floor, so no "
+                    f"sector-level gap could be computed (reported as null, not zero)."
+                )
             fallback_gap = {
                 "sector": sector,
                 "matched_skills": buckets["matched"],
                 "missing_skills": buckets["missing"],
                 "possible_match_skills": buckets["possible_match"],
-                "gap_score": score(entries),
+                # Renamed from gap_score: this answers a DIFFERENT question from
+                # the per-job scores ("what fraction of everything demanded in this
+                # ISCO major group do you lack?"), so it must not be pooled with
+                # them or read as comparable.
+                "sector_coverage_gap": gap,
+                "sector_coverage_range": interval,
+                "insufficient_data": gap is None,
+                "sector_volume": sector_volume.get(sector),
+                "low_confidence": sector in low_conf_sectors,
+                "skills_considered": len(fallback_entries),
             }
 
         # ---- aggregate ---------------------------------------------------
-        missing_weight: dict[str, int] = {}
-        for job in matched_jobs:
-            for skill in job["missing_skills"]:
-                key = skill.lower()
-                missing_weight[key] = missing_weight.get(key, 0) + weight(
-                    key, key_to_esco.get(key)
-                )
+        # Demand and occurrence are SEPARATE facts. Adding the market-wide
+        # frequency once per job produced freq x job_count — a squared prevalence
+        # term, part of which merely measured Agent B's dedup quality (5 of 8
+        # titles in the live run appeared twice). It ranked "communication
+        # skills" (24x3=72) above "project management" (8), which is how an
+        # interview-skills course became the top recommendation for a data
+        # engineer. Demand is now counted ONCE; occurrence is its own field and
+        # only breaks ties.
+        missing_entries: list[dict[str, Any]] = []
+        for job, entries in job_entries:
+            missing_entries.extend(
+                {**e, "sector": job.sector} for e in entries if e["verdict"] == "missing"
+            )
         if fallback_gap:
-            for skill in fallback_gap["missing_skills"]:
-                key = skill.lower()
-                missing_weight[key] = missing_weight.get(key, 0) + weight(
-                    key, key_to_esco.get(key)
-                )
-        ranked_missing = sorted(
-            missing_weight.items(), key=lambda kv: (-kv[1], kv[0])
+            missing_entries.extend(
+                {**e, "sector": sector} for e in fallback_entries if e["verdict"] == "missing"
+            )
+
+        groups = _canonical_groups(missing_entries, key_to_esco, vectors, config)
+        ranked = sorted(
+            groups.values(),
+            key=lambda g: (-g["demand_weight"], -g["jobs_missing_in"], g["skill"]),
         )[:10]
-        top_missing = [k for k, _w in ranked_missing]
-        # Additive: the per-skill detail Agent E inherits — its esco_code (for
-        # course retrieval) and priority_score (the summed demand weight, used as
-        # the coverage-selection weight). Same skills, same order as
-        # most_common_missing_skills; esco_code is None when the skill never
-        # mapped to the vocabulary (never guessed).
+
         missing_skill_details = [
-            {"skill": k, "esco_code": key_to_esco.get(k), "priority_score": w}
-            for k, w in ranked_missing
+            {
+                "skill": g["skill"],
+                "esco_code": g["esco_code"],
+                # Kept as the name Agent E consumes, but now it is demand counted
+                # once — not demand multiplied by how often retrieval repeated it.
+                "priority_score": round(g["demand_weight"], 4),
+                "jobs_missing_in": g["jobs_missing_in"],
+                # Demand as a RATE. "58 postings ask for X" is uninterpretable
+                # without "out of how many"; the denominator was published by
+                # Agent B and ignored here.
+                "demand_rate": g["demand_rate"],
+                "low_confidence": g["low_confidence"],
+                "best_similarity": g["best_similarity"],
+                "nearest_candidate_skill": g["nearest_candidate_skill"],
+                # Phrasings merged into this one gap, so a consumer can see that
+                # "communication" and "communication skills" were one concept.
+                "also_phrased_as": g["variants"],
+            }
+            for g in ranked
         ]
 
-        scores = [j["gap_score"] for j in matched_jobs]
-        if fallback_gap:
-            scores.append(fallback_gap["gap_score"])
+        # Weight-pooled, and only over jobs that produced a defined score. The
+        # old mean averaged a 1-skill posting equally with a 15-skill one AND
+        # included the undefined 0.0s, publishing 0.5533 where the honest figure
+        # over real jobs was 0.757.
+        scored = [j for j in matched_jobs if j["gap_score"] is not None]
+        pooled_total = sum(
+            e["weight"] for _job, es in job_entries for e in es if "weight" in e
+        )
+        pooled_miss = sum(
+            e["weight"] for _job, es in job_entries for e in es
+            if e.get("verdict") == "missing" and "weight" in e
+        )
         aggregate = {
-            "most_common_missing_skills": top_missing,
+            "most_common_missing_skills": [g["skill"] for g in ranked],
             "missing_skill_details": missing_skill_details,
-            "average_gap_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            "average_gap_score": (
+                round(pooled_miss / pooled_total, 4) if pooled_total > 0 else None
+            ),
+            "jobs_scored": len(scored),
+            "jobs_without_parsable_requirements": len(matched_jobs) - len(scored),
+            # possible_match used to die inside each job. Published so a consumer
+            # can see what we declined to resolve rather than inferring silence.
+            "unresolved_skills": sorted(
+                {e["skill"] for e in all_entries if e["verdict"] == "possible_match"}
+            ),
         }
+
+        if len(matched_jobs) - len(scored):
+            warnings.append(
+                f"{len(matched_jobs) - len(scored)} retrieved job(s) listed no parsable "
+                f"requirements; they are reported with a null gap_score and excluded "
+                f"from the average rather than counted as a perfect fit."
+            )
 
         return {
             "matched_jobs": matched_jobs,
             "fallback_sector_gap": fallback_gap,
             "aggregate": aggregate,
+            "warnings": warnings,
         }
 
     def _embed_phrases(deps: Deps, phrases: list[str]) -> dict[str, list[float]]:
@@ -345,6 +609,88 @@ def make_gap_analysis(deps: Deps) -> Callable[[GapState], dict]:
 def _dot(a: list[float], b: list[float]) -> float:
     """Vectors from both embedders are unit-normalised, so this IS cosine."""
     return sum(x * y for x, y in zip(a, b))
+
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9+#.]+", (text or "").lower()) if t]
+
+
+def _contains_tokens(container: str, needle_key: str) -> bool:
+    """Does ``container`` contain ``needle_key`` as a whole-token subsequence?
+
+    The asymmetric relation cosine cannot express. "Data analytics engineering"
+    genuinely satisfies a requirement for "data analytics"; symmetric similarity
+    only knows the two phrases are 0.83 alike, which is the same number it gives
+    pairs that do NOT satisfy each other. Whole tokens, so "java" never matches
+    inside "javascript".
+    """
+    hay, needle = _tokens(container), _tokens(needle_key)
+    if not needle or len(needle) > len(hay):
+        return False
+    return any(
+        hay[i:i + len(needle)] == needle for i in range(len(hay) - len(needle) + 1)
+    )
+
+
+def _canonical_groups(
+    entries: list[dict[str, Any]],
+    key_to_esco: dict[str, Optional[str]],
+    vectors: dict[str, list[float]],
+    config: Config,
+) -> dict[str, dict[str, Any]]:
+    """Merge the same gap expressed several ways into one entry.
+
+    Missing skills were deduped on the job posting's raw phrasing, so one concept
+    occupied several of the ten slots a candidate actually sees: on the live run
+    `professional communication` (190), `communication skills` (55) and
+    `communication` (33) were three separate "top gaps", and Agent E duly spent
+    three of its ten recommendations on them.
+
+    Merge key: the ESCO concept where the vocabulary has one, else the strongest
+    already-seen phrase this one is a token-superset of or highly similar to.
+    Demand is the MAXIMUM over the group (not a sum — the phrasings describe one
+    demand, and adding them would re-inflate exactly what this removes).
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    for e in sorted(entries, key=lambda x: -x.get("weight", 0)):
+        key, esco = e["key"], e["esco"] or key_to_esco.get(e["key"])
+        gid = esco or None
+        if gid is None:
+            for existing in order:
+                g = groups[existing]
+                if g["esco_code"]:
+                    continue
+                if _contains_tokens(key, g["key"]) or _contains_tokens(g["key"], key):
+                    gid = existing
+                    break
+                a, b = vectors.get(key), vectors.get(g["key"])
+                if a is not None and b is not None and _dot(a, b) >= config.agent_c_skill_match:
+                    gid = existing
+                    break
+            gid = gid or key
+
+        if gid not in groups:
+            groups[gid] = {
+                "key": key, "skill": e["skill"], "esco_code": esco,
+                "demand_weight": e.get("weight", 0.0), "jobs_missing_in": 0,
+                "demand_rate": e.get("demand_rate"), "low_confidence": False,
+                "best_similarity": e.get("best_similarity"),
+                "nearest_candidate_skill": e.get("nearest_candidate_skill"),
+                "variants": [],
+            }
+            order.append(gid)
+
+        g = groups[gid]
+        g["jobs_missing_in"] += 1
+        g["demand_weight"] = max(g["demand_weight"], e.get("weight", 0.0))
+        if e["skill"] != g["skill"] and e["skill"] not in g["variants"]:
+            g["variants"].append(e["skill"])
+        if (e.get("best_similarity") or 0) > (g["best_similarity"] or 0):
+            g["best_similarity"] = e.get("best_similarity")
+            g["nearest_candidate_skill"] = e.get("nearest_candidate_skill")
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +718,19 @@ def make_persist(deps: Deps) -> Callable[[GapState], dict]:
                 "usable": len(state.get("usable_postings", [])),
                 "similarities": [round(p.similarity, 4) for p in state.get("postings", [])],
                 "inferred_sector": state.get("inferred_sector"),
+            },
+            # Every threshold that shaped the numbers above. Without these an
+            # output cannot be reproduced or even re-interpreted from itself —
+            # the one archived fallback run is only readable today because its
+            # threshold happened to be recorded.
+            "calibration": {
+                "agent_c_match_threshold": deps.config.agent_c_match_threshold,
+                "agent_c_skill_match": deps.config.agent_c_skill_match,
+                "agent_c_skill_possible": deps.config.agent_c_skill_possible,
+                "agent_c_fallback_min_freq": deps.config.agent_c_fallback_min_freq,
+                "agent_c_min_usable_postings": deps.config.agent_c_min_usable_postings,
+                "agent_c_llm_matching": deps.config.agent_c_llm_matching,
+                "top_k": state.get("top_k"),
             },
             # The user-decided home for candidate-side ESCO evidence,
             # including near-miss scores for unmapped skills.

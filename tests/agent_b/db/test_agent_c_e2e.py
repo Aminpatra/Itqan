@@ -9,7 +9,10 @@ read-only promise proven, not assumed.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
+
+import pytest
 
 from agents.agent_b_job_ingest.esco_map import sync_taxonomy
 from agents.agent_b_job_ingest.records import PersistedPosting
@@ -98,8 +101,12 @@ def test_full_gap_run_against_real_tables(store, tmp_path):
     # 'perform welding' shares no esco with the candidate and its FakeEmbedder
     # vector is unrelated to both candidate phrases -> missing.
     assert "perform welding" in job["missing_skills"]
-    # weights: missing 'perform welding' floor 1; matched 'manage time' freq 7
-    assert job["gap_score"] == round(1 / 8, 4)
+    # Weights are log1p-damped (raw counts span 1..95 live, so an undamped weight
+    # let one boilerplate phrase outweigh two dozen specific skills):
+    # missing 'perform welding' floor 1, matched 'manage time' freq 7 ->
+    # log1p(1) / (log1p(1) + log1p(7)).
+    expected = math.log1p(1) / (math.log1p(1) + math.log1p(7))
+    assert job["gap_score"] == pytest.approx(expected, abs=1e-4)
 
     # Tier fallthrough through real SQL: exact hit + honest unmapped-with-score.
     methods = {m.skill_key: m.method for m in state["candidate_mappings"]}

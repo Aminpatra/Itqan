@@ -68,8 +68,15 @@ def main(argv: list[str] | None = None) -> int:
     from .nodes import Deps
 
     # Built ONCE — in watch mode the same embedder and compiled graph serve
-    # every arriving profile.
-    deps = Deps(config=config, embedder=build_embedder(config))
+    # every arriving profile. The LLM is the fenced skill-matching tier only; it
+    # sees two lists of skill names and nothing else. With agent_c_llm_matching
+    # off it is never called and the agent is deterministic end to end.
+    llm = None
+    if config.agent_c_llm_matching:
+        from shared.llm import build_llm
+
+        llm = build_llm(config)
+    deps = Deps(config=config, embedder=build_embedder(config), llm=llm)
     graph = build_gap_graph(deps)
 
     def analyse(profile_path: str, *, run_id=None, output_dir=None) -> dict:
@@ -132,15 +139,34 @@ def _print_result(state: dict, config: Config) -> None:
           f"{config.agent_c_match_threshold} "
           f"{'-> FALLBACK to sector stats' if state.get('used_fallback') else '-> direct matching'}")
     if state.get("used_fallback"):
-        print(f"  sector     {state.get('inferred_sector') or 'UNKNOWN (fallback skipped)'}")
+        print(f"  sector     {state.get('inferred_sector') or 'UNKNOWN (fallback skipped)'}"
+              f"  (per-job results below are still shown)")
     for job in state.get("matched_jobs", []):
-        print(f"    gap {job['gap_score']:.2f}  {arabize(job['job_title'][:56])}")
+        title = arabize(job["job_title"][:52])
+        if job["gap_score"] is None:
+            # Printed as what it is. A dash cannot be misread as a perfect fit.
+            print(f"    gap   --  {title}   (no parsable requirements)")
+        else:
+            lo, hi = job["gap_score_range"]
+            span = f" [{lo:.2f}-{hi:.2f}]" if hi > lo else ""
+            print(f"    gap {job['gap_score']:.2f}{span}  {title}")
     fallback = state.get("fallback_sector_gap")
     if fallback:
-        print(f"    sector gap {fallback['gap_score']:.2f}: "
+        cov = fallback["sector_coverage_gap"]
+        shown = "--" if cov is None else f"{cov:.2f}"
+        print(f"    sector coverage gap {shown} (sector {fallback['sector']}, "
+              f"{fallback['skills_considered']} skills): "
               f"{len(fallback['matched_skills'])} matched, "
               f"{len(fallback['missing_skills'])} missing, "
               f"{len(fallback['possible_match_skills'])} possible")
+
+    top = (state.get("aggregate") or {}).get("missing_skill_details") or []
+    if top:
+        print("  top gaps:")
+        for d in top[:5]:
+            also = f" (+{len(d['also_phrased_as'])} phrasings)" if d["also_phrased_as"] else ""
+            print(f"    {d['priority_score']:.2f}  {arabize(d['skill'][:40]):<40}"
+                  f" in {d['jobs_missing_in']} job(s){also}")
     for warning in state.get("warnings", []):
         print(f"  ! {warning}")
     print(f"\n  output -> {state.get('output_path')}\n")
