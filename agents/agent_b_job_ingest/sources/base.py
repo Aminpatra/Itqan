@@ -124,6 +124,18 @@ class AdapterResult:
     partial: bool = False
     blocked_after_n: int | None = None
 
+    # True when the fetch stopped for a reason of OUR choosing rather than the
+    # source's: a --limit cap, or the "ten known posts in a row" early stop. The
+    # source was healthy and there was more to read, so the inventory we hold is
+    # just as incomplete as after a block — and ageing it would age postings we
+    # deliberately did not ask for.
+    #
+    # Separate from `partial` because it is not a failure: the run is fine, the
+    # health record should stay green, and only the ageing decision changes. That
+    # distinction was missing, and it cost real data — a sequence of `--limit 40`
+    # runs pushed 139 live postings to missed_cycles=2, one cycle from stale.
+    truncated: bool = False
+
     pages_fetched: int = 0
     bytes_fetched: int = 0
 
@@ -132,6 +144,16 @@ class AdapterResult:
         """Complete and clean. Note `partial` alone makes this False even with
         postings in hand and no error — that is the entire point of the flag."""
         return self.error is None and not self.partial
+
+    @property
+    def may_age_inventory(self) -> bool:
+        """Is this fetch a trustworthy census of what the source still lists?
+
+        Only a clean AND complete pass may age inventory toward deletion. A
+        blocked, errored, or deliberately truncated fetch saw a subset, so
+        everything it did not see is 'not observed', never 'gone'.
+        """
+        return self.ok and not self.truncated
 
     def extend(self, postings: Iterable[RawPosting]) -> None:
         self.postings.extend(postings)
@@ -197,7 +219,13 @@ class BaseAdapter:
             self._fetch(result, limit=limit)
         except Exception as exc:  # noqa: BLE001 - deliberate boundary, see docstring
             result.fail(f"{type(exc).__name__}: {exc}")
-        if limit is not None and len(result.postings) > limit:
+        # Hitting the cap means the source had more to give. Marked here, once,
+        # rather than at each adapter's several `return` sites — every adapter
+        # honours `limit` through this method, so this cannot be forgotten by a
+        # new one. (Early stops that are the adapter's own idea set the flag
+        # themselves; see el7far's known-run stop.)
+        if limit is not None and len(result.postings) >= limit:
+            result.truncated = True
             del result.postings[limit:]
         return result
 

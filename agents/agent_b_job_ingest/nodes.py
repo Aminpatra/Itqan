@@ -126,15 +126,28 @@ def make_scrape(deps: GraphDeps) -> Callable[[dict], dict]:
 def make_ingest(deps: GraphDeps) -> Callable[[IngestState], dict]:
     def ingest(state: IngestState) -> dict:
         outcomes = state.get("scraped", [])
-        healthy = [o["source"] for o in outcomes if o["result"].ok]
+        # `may_age_inventory`, not `ok`: a --limit cap or an early stop leaves the
+        # fetch clean but INCOMPLETE, and ageing on an incomplete census marks live
+        # postings as missing. That gap cost real data — a run of capped cycles
+        # pushed 139 live el7far postings to missed_cycles=2, one short of stale.
+        censused = [o["source"] for o in outcomes if o["result"].may_age_inventory]
         partial = any(not o["result"].ok for o in outcomes)
+        truncated = [o["source"] for o in outcomes if o["result"].truncated]
         store = deps.store
 
-        # Age the inventory of cleanly-fetched sources BEFORE the pipeline resets
-        # the ones it sees. A partial/blocked source is absent from `healthy`, so
-        # its inventory is left untouched rather than aged toward deletion.
+        # Age the inventory of fully-censused sources BEFORE the pipeline resets
+        # the ones it sees. A partial, blocked or truncated source is absent from
+        # `censused`, so its inventory is left untouched rather than aged.
         with store.transaction():
-            store.age_missed(healthy)
+            store.age_missed(censused)
+
+        warnings: list[str] = []
+        if truncated:
+            warnings.append(
+                f"{', '.join(truncated)}: fetch was truncated (limit or early stop), so "
+                f"its inventory was not aged this cycle — counts stay accurate but "
+                f"delisted postings will linger until an uncapped run."
+            )
 
         # Link targets before linkers: a Telegram post resolves to a blog post by
         # URL, so the blog batch must commit first. Sorting telegram last makes
@@ -147,11 +160,30 @@ def make_ingest(deps: GraphDeps) -> Callable[[IngestState], dict]:
             postings = list(outcome["result"].postings)
             if not postings:
                 continue
-            # One transaction per source batch.
-            with store.transaction():
-                total.merge(pipe.run(postings))
+            # One transaction per source batch — and one error boundary, because
+            # the tail had none. A 429, a timeout, or the pydantic ValidationError
+            # that `_known_sector`/`_iso_alpha2` raise BY DESIGN on bad model
+            # output would abort the transaction, propagate out of this node, and
+            # take down the whole graph: no run log written, no source_health row
+            # recorded, every posting from that source lost for the cycle. The
+            # adapters have had this boundary since phase 2; the tail did not.
+            try:
+                with store.transaction():
+                    total.merge(pipe.run(postings))
+            except Exception as exc:  # noqa: BLE001 - deliberate boundary
+                warnings.append(
+                    f"{outcome['source']}: ingestion failed ({type(exc).__name__}: {exc}); "
+                    f"{len(postings)} posting(s) were not written this cycle. Other "
+                    f"sources and the run log are unaffected."
+                )
+                # The cycle did not do what it was asked to. Contained, but not fine —
+                # so the exit code says so rather than reporting a clean run.
+                partial = True
 
-        return {"ingest_summary": total.as_dict(), "partial_cycle": partial}
+        updates = {"ingest_summary": total.as_dict(), "partial_cycle": partial}
+        if warnings:
+            updates["warnings"] = warnings
+        return updates
 
     return ingest
 

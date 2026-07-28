@@ -74,6 +74,9 @@ class El7farAdapter(BaseAdapter):
         # questions is one step from an adapter that writes to it. Absent, every
         # entry is treated as new, which is correct for a dry run.
         self._is_known_unchanged = is_known_unchanged
+        # Set once the site refuses a roundup child fetch; stops further expansion
+        # for this run rather than asking a host that already said no.
+        self._blocked = False
 
     # ------------------------------------------------------------------
     @property
@@ -131,6 +134,19 @@ class El7farAdapter(BaseAdapter):
                 result.fail(f"feed did not parse as XML: {exc}")
                 return
 
+            # "Nothing published" and "this is no longer the feed we think it is"
+            # both yield zero entries, and treating them alike is how a site
+            # redesign silently deletes an inventory: the empty result reads as
+            # healthy, so every posting is aged, goes stale in 3 cycles, and is
+            # pruned at 60 days. A genuinely quiet feed is still a well-formed
+            # Atom <feed>; an HTML error page or a renamed namespace is not.
+            if root.tag != f"{{{ATOM}}}feed":
+                result.fail(
+                    f"expected an Atom <feed> root, got <{root.tag}> — the source may "
+                    f"have changed shape; not treating this as an empty day"
+                )
+                return
+
             entries = root.findall("a:entry", NS)
             if not entries:
                 return
@@ -162,6 +178,10 @@ class El7farAdapter(BaseAdapter):
                 if self._is_known_unchanged and self._is_known_unchanged(posting):
                     known_run += 1
                     if known_run >= KNOWN_RUN_TO_STOP:
+                        # We stopped reading, but the feed had more. Everything
+                        # behind this point is unobserved, not gone — so this
+                        # fetch must not be used to age inventory.
+                        result.truncated = True
                         return
                     continue
                 known_run = 0
@@ -253,6 +273,12 @@ class El7farAdapter(BaseAdapter):
             # roundup) — emit once; the shared canonical URL makes them one row.
             if link in seen_ids:
                 continue
+            if self._blocked:
+                # The site already refused us. Continuing to request the next child
+                # is precisely the "retry a block harder" behaviour the HTTP layer's
+                # contract forbids — measured, a 429 on the first child still sent
+                # two more requests, and would send up to 11 per roundup.
+                break
             child = self._fetch_job_page(link, index_posting)
             if child is None:
                 continue
@@ -263,13 +289,17 @@ class El7farAdapter(BaseAdapter):
 
     def _fetch_job_page(self, url: str, index_posting: RawPosting) -> RawPosting | None:
         """Fetch one linked job page (same site, robots-checked) and parse it into
-        its own RawPosting. Best-effort: any block/error/empty page returns None so
-        the other jobs in the roundup still ingest."""
+        its own RawPosting. Best-effort: any error/empty page returns None so the
+        other jobs in the roundup still ingest — but an explicit refusal stops the
+        expansion for this cycle rather than being swallowed per URL."""
         assert self._client is not None and self._robots is not None
         try:
             self._robots.require(url)
             html = self._client.get_text(url)
-        except (Blocked, ResponseTooLarge):
+        except Blocked:
+            self._blocked = True
+            return None
+        except ResponseTooLarge:
             return None
         except Exception:  # noqa: BLE001 - one bad page must not sink the roundup
             return None

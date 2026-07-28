@@ -461,17 +461,40 @@ class JobStore:
     # aggregation (phase 5) — see recompute_stats in aggregate.py
     # ------------------------------------------------------------------
     def replace_stats_window(self, *, sql: str, params: dict[str, Any]) -> int:
-        """Run the aggregation INSERT for one window and return rows written.
+        """REPLACE one window's stats: write this run's rows, drop what it did not
+        produce. Returns rows written.
 
         The SQL itself lives in ``aggregate.py`` beside the reasoning about what
         it counts, rather than as one more opaque string in this module; this
         method exists only so that aggregate.py does not open its own cursor and
         the "all SQL executes through the store" boundary holds.
+
+        The delete is why this is called *replace*. The upsert alone left behind
+        any ``(sector, skill_key)`` a previous run of the same window had produced
+        and this one no longer supports — measured on the live corpus: **114 rows
+        (117 demand units) whose sample_postings cited URLs that no longer
+        resolve**, still being weighted by Agent C. A window is a statement about
+        the corpus as it stands now, so recomputing it has to be able to say
+        "that skill is no longer in evidence", and only a delete can say that.
+
+        Stamped by ``computed_at`` rather than by diffing keys: every row this run
+        wrote (inserted or updated) carries the run's timestamp, so anything still
+        holding an older one is precisely what the recompute did not reproduce.
         """
         conn = self.connect()
         with conn.cursor() as cur:
+            cur.execute("SELECT now() AS t")
+            started = (cur.fetchone() or {})["t"]
+
             cur.execute(sql, params)
-            return cur.rowcount
+            written = cur.rowcount
+
+            cur.execute(
+                "DELETE FROM skill_demand_stats "
+                " WHERE window_end = %(w_end)s AND computed_at < %(started)s",
+                {"w_end": params["w_end"], "started": started},
+            )
+        return written
 
     def scalar(self, sql: str, params: dict[str, Any] | None = None) -> Any:
         conn = self.connect()

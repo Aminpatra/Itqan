@@ -24,18 +24,32 @@ from urllib.parse import urlsplit
 from selectolax.parser import HTMLParser
 
 from shared.config import Config
-from shared.scraping.http import PoliteClient, SourcePolicy
+from shared.scraping.http import Blocked, PoliteClient, SourcePolicy
 from shared.scraping.robots import RobotsPolicy
 
 # A fetched job page is capped like the adapters cap descriptions: enough for the
 # requirements, bounded so one huge page cannot blow up the extraction prompt.
 MAX_PAGE_CHARS = 20_000
 
-# Hosts (substrings) that are never a job page: sharing widgets and messaging.
-_SOCIAL = (
-    "facebook.", "twitter.", "x.com", "t.me", "telegram.", "wa.me", "whatsapp",
-    "linkedin.", "instagram.", "youtube.", "pinterest.", "blogger.com", "google.",
-)
+# Domains that are never a job page: sharing widgets and messaging. Matched as
+# whole domains (exact or as a parent domain), NEVER as substrings of the URL.
+# Substring matching silently discarded real employer job pages — measured:
+# `careers.recruitment.medgulf.com` contains "t.me" inside "recruitmen(t.me)dgulf"
+# and `hr.omanunix.com` contains "x.com" inside "omanuni(x.com)". Both were dropped
+# as "social", with no counter to notice it.
+_SOCIAL_DOMAINS = frozenset({
+    "facebook.com", "twitter.com", "x.com", "t.me", "telegram.me", "telegram.org",
+    "wa.me", "whatsapp.com", "api.whatsapp.com", "chat.whatsapp.com",
+    "linkedin.com", "instagram.com", "youtube.com", "pinterest.com",
+    "blogger.com", "google.com",
+})
+
+
+def _is_social(host: str) -> bool:
+    """Exact domain or a subdomain of one — `careers.medgulf.com` is not social
+    just because some social domain is a substring of it."""
+    host = (host or "").lower().removeprefix("www.")
+    return any(host == d or host.endswith("." + d) for d in _SOCIAL_DOMAINS)
 
 # Path segments that name a job listing. A job DETAIL page has one of these
 # followed by an id/slug (or is a viewjob/jobdetail page); a bare hub does not.
@@ -65,13 +79,12 @@ def candidate_job_link(outbound_links, self_host: str) -> str | None:
     adapters already put the posting's primary link first."""
     self_host = (self_host or "").lower()
     for url in outbound_links or ():
-        low = url.lower()
-        if any(s in low for s in _SOCIAL):
-            continue
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https"):
             continue
         host = parts.netloc.lower()
+        if _is_social(host):
+            continue
         if not host or host == self_host:
             continue  # same-site links here are el7far nav/search, not a root page
         if _looks_like_job_detail(url):
@@ -101,6 +114,14 @@ class RootFetcher:
         self.config = config or Config()
         self.interval_s = interval_s
         self._hosts: dict[str, tuple[PoliteClient, RobotsPolicy]] = {}
+        # Hosts that have refused us this cycle. `Blocked` means 403/429/robots —
+        # a decision by the operator, not a transient hiccup — and the project's
+        # own HTTP contract says retrying it harder is exactly what we must not
+        # do. Without this the refusal was swallowed per URL and every subsequent
+        # posting linking there cost another request: measured, 7 requests to a
+        # host that refused on the first.
+        self._refused: set[str] = set()
+        self.blocked = 0
 
     def _for_host(self, url: str) -> tuple[PoliteClient, RobotsPolicy]:
         host = urlsplit(url).netloc.lower()
@@ -117,11 +138,21 @@ class RootFetcher:
         return self._hosts[host]
 
     def fetch(self, url: str) -> str | None:
+        host = urlsplit(url).netloc.lower()
+        if host in self._refused:
+            return None               # already said no; do not ask again
         try:
             client, robots = self._for_host(url)
             if not robots.can_fetch(url):
-                return None            # robots refuses -> keep aggregator skills
+                # robots is a per-path answer, so this does not condemn the host —
+                # but it is still a refusal, and we keep the aggregator's skills.
+                return None
             html = client.get_text(url)
+        except Blocked:
+            # An explicit refusal. Remember it for the rest of the cycle.
+            self._refused.add(host)
+            self.blocked += 1
+            return None
         except Exception:              # noqa: BLE001 - best-effort; never sink a posting
             return None
         return _readable_text(html) or None

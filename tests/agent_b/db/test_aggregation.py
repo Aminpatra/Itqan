@@ -110,12 +110,41 @@ def test_a_duplicate_is_not_counted(store):
 
 # ---------------------------------------------------------------------------
 # trend
+#
+# The prior count comes from the PREVIOUS WINDOW'S STORED ROW, not from
+# re-deriving the past out of today's live postings. These tests therefore seed a
+# stats row for an earlier window rather than inserting old postings.
+#
+# That distinction is the whole bug: the old query read the prior from `eligible`,
+# which requires status='active'. In a test, freshly-inserted "prior" postings ARE
+# active, so it passed. In production those postings were delisted and had gone
+# stale within ~36h, so the prior was ALWAYS 0 — measured across all 1153 rows of
+# the live table, with 23 of them published as 'rising' off zero observations.
+# A test that seeds live prior postings cannot see that; this one can.
 # ---------------------------------------------------------------------------
+PRIOR_WINDOW_END = date(2026, 7, 21)   # the window before AS_OF
+
+
+def _seed_prior_stats(store, sector, skill_key, freq, *, skill=None):
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO skill_demand_stats
+              (sector, skill, skill_key, window_start, window_end,
+               frequency_count, prior_frequency_count, trend, computed_at)
+            VALUES (%s,%s,%s,%s,%s,%s,0,'stable',now())
+            """,
+            (sector, skill or skill_key, skill_key,
+             PRIOR_WINDOW_END - (AS_OF - date(2026, 6, 22)), PRIOR_WINDOW_END, freq),
+        )
+    conn.commit()
+
+
 def test_rising_when_current_exceeds_prior_by_the_ratio(store):
     for i in range(6):
         _ins(store, f"cur{i}", skills=("Python",))
-    for i in range(5):
-        _ins(store, f"pri{i}", skills=("Python",), posted=PRIOR)
+    _seed_prior_stats(store, "2", "python", 5)
 
     _run(store)
     row = _stats(store, "2", "python")
@@ -126,23 +155,87 @@ def test_rising_when_current_exceeds_prior_by_the_ratio(store):
 def test_falling_when_current_drops_below_the_ratio(store):
     for i in range(5):
         _ins(store, f"cur{i}", skills=("Excel",))
-    for i in range(10):
-        _ins(store, f"pri{i}", skills=("Excel",), posted=PRIOR)
+    _seed_prior_stats(store, "2", "excel", 10)
 
     _run(store)
     row = _stats(store, "2", "excel")
     assert row["trend"] == "falling"  # 5/10 = 0.50
 
 
-def test_a_low_volume_skill_is_always_stable(store):
-    """1 -> 2 postings is +100% noise, not a rising trend. Below trend_min_volume
-    the label is pinned to stable so noise is never published as a finding."""
+def test_a_low_volume_skill_on_both_sides_is_stable(store):
+    """1 -> 2 postings is +100% noise, not a rising trend."""
     for i in range(2):
         _ins(store, f"cur{i}", skills=("Rust",))
-    _ins(store, "pri0", skills=("Rust",), posted=PRIOR)
+    _seed_prior_stats(store, "2", "rust", 1)
 
     _run(store)
-    assert _stats(store, "2", "rust")["trend"] == "stable"  # freq 2 < trend_min 5
+    assert _stats(store, "2", "rust")["trend"] == "stable"
+
+
+def test_a_collapse_is_not_hidden_by_the_volume_floor(store):
+    """The floor suppresses noise, not disappearances. 20 -> 4 was reported
+    'stable' because only the CURRENT count was tested against the floor."""
+    for i in range(4):
+        _ins(store, f"cur{i}", skills=("Cobol",))
+    _seed_prior_stats(store, "2", "cobol", 20)
+
+    _run(store)
+    assert _stats(store, "2", "cobol")["trend"] == "falling"
+
+
+def test_no_prior_window_is_not_reported_as_rising(store):
+    """'We have never measured this' is not a rise — it used to be published as
+    one, on zero observations."""
+    for i in range(6):
+        _ins(store, f"cur{i}", skills=("Python",))
+
+    _run(store)
+    row = _stats(store, "2", "python")
+    assert row["trend"] == "no_prior_data" and row["prior_frequency_count"] == 0
+
+
+def test_a_skill_absent_from_the_prior_window_is_new_not_rising(store):
+    for i in range(6):
+        _ins(store, f"cur{i}", skills=("Python",))
+    _seed_prior_stats(store, "2", "excel", 5)   # prior window exists, python absent
+
+    _run(store)
+    assert _stats(store, "2", "python")["trend"] == "new"
+
+
+# ---------------------------------------------------------------------------
+# the window is REPLACED, not merged into
+# ---------------------------------------------------------------------------
+def test_recomputing_a_window_drops_rows_it_no_longer_supports(store):
+    """Measured on the live corpus before this fix: 114 rows survived from an
+    earlier run of the same window, citing sample_postings URLs that no longer
+    resolved — and Agent C was weighting on them."""
+    _ins(store, "a", skills=("Python", "Cobol"))
+    _run(store)
+    assert _stats(store, "2", "cobol") is not None
+
+    # The posting is re-extracted and no longer mentions Cobol.
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE job_postings SET required_skills = %s WHERE posting_id='a'",
+                    (["Python"],))
+    conn.commit()
+
+    _run(store)
+    assert _stats(store, "2", "python") is not None
+    assert _stats(store, "2", "cobol") is None, "a stat no posting supports survived"
+
+
+def test_denominators_are_published(store):
+    """A count is not a rate without them."""
+    _ins(store, "a", skills=("Python",))
+    _ins(store, "b", skills=("Python",))
+    _ins(store, "c", skills=("Excel",))
+
+    _run(store)
+    row = _stats(store, "2", "python")
+    assert row["sector_volume"] == 3      # 3 eligible postings in sector 2
+    assert row["distinct_posts"] == 2     # from 2 distinct source posts
 
 
 # ---------------------------------------------------------------------------

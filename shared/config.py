@@ -219,7 +219,12 @@ class Config:
     )
     max_response_bytes: int = 5_000_000
     blogger_max_pages: int = 8
-    blogger_lookback_days: int = 21
+    # MUST be >= window_days. A posting is counted as demand for `window_days`, so
+    # if the feed is only read back `blogger_lookback_days`, everything in the gap
+    # is never re-seen — it accrues missed_cycles every cycle and goes stale while
+    # still being counted, silently undercounting the tail of every window. This
+    # was 21 against a 30-day window; the invariant is asserted in __post_init__.
+    blogger_lookback_days: int = 30
     telegram_max_pages: int = 3
 
     # A "roundup" Blogger post is an index listing several distinct vacancies,
@@ -244,6 +249,22 @@ class Config:
     enrich_from_root_source: bool = True
     # Per-host politeness floor for those root-page fetches.
     root_fetch_interval_s: float = 1.0
+    # Ceiling on root-page fetches per cycle. Without it "bounded" meant only
+    # one-per-posting at a 1s interval, which on a large batch is an unbounded
+    # crawl of third-party sites. None disables the cap.
+    max_root_fetches_per_cycle: int | None = 60
+
+    def __post_init__(self) -> None:
+        # An invariant, not a preference: a posting counted as demand for
+        # `window_days` must remain re-fetchable for at least that long, or it
+        # ages toward deletion while the aggregation still expects to count it.
+        # Raised here so the two values cannot drift apart unnoticed again.
+        if self.blogger_lookback_days < self.window_days:
+            raise ValueError(
+                f"blogger_lookback_days ({self.blogger_lookback_days}) is shorter than "
+                f"window_days ({self.window_days}): postings in the gap would be counted "
+                f"as demand but never re-seen, so they would go stale while still counted."
+            )
 
     def require_api_key(self) -> str:
         key = os.getenv("OPENAI_API_KEY")

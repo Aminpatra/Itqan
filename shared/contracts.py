@@ -226,6 +226,14 @@ class SkillDemandStatRow(BaseModel):
     sample_postings: list[dict[str, Any]] = Field(default_factory=list)
     low_confidence: bool = False
     computed_at: str
+    # The denominators. frequency_count is an absolute count that reads like a
+    # rate: "58 postings ask for X" means nothing without "out of how many". And
+    # since one roundup post can yield many postings, distinct_posts separates
+    # broad demand from a single employer's hiring drive — measured on the live
+    # corpus, one sector's 51 postings came from only 26 distinct posts.
+    # Optional because rows written before these columns existed carry NULL.
+    sector_volume: Optional[int] = None
+    distinct_posts: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

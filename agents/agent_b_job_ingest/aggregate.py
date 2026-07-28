@@ -79,6 +79,10 @@ class AggregationSummary:
 _ELIGIBLE_CTE = f"""
 eligible AS (
     SELECT posting_id, sector, title, source_url, required_skills,
+           -- Empty means "not split out of anything", so the posting IS its own
+           -- source post. Without the fallback every such row would share the
+           -- empty string and collapse into a single "post" in distinct_posts.
+           COALESCE(NULLIF(source_post_url, ''), source_url) AS source_post_url,
            COALESCE(posted_date, first_seen_at::date) AS eff_date
       FROM job_postings
      WHERE {AGGREGABLE_POSTING_PREDICATE}
@@ -91,30 +95,37 @@ _AGGREGATE_SQL = f"""
 INSERT INTO skill_demand_stats (
     sector, skill, skill_key, esco_code, window_start, window_end,
     frequency_count, prior_frequency_count, trend,
-    co_occurring_skills, sample_postings, low_confidence, computed_at
+    co_occurring_skills, sample_postings, low_confidence, computed_at,
+    sector_volume, distinct_posts
 )
 WITH {_ELIGIBLE_CTE},
 cur_postings AS (
     SELECT * FROM eligible WHERE eff_date > %(w_start)s AND eff_date <= %(w_end)s
 ),
-prior_postings AS (
-    SELECT * FROM eligible WHERE eff_date > %(p_start)s AND eff_date <= %(w_start)s
+-- The previous window's OWN STORED ROW is the history, not a re-derivation from
+-- today's postings. `eligible` requires status='active', and a posting from 30-60
+-- days ago was delisted long ago and went stale within ~36h — so re-deriving the
+-- past from the present could only ever find evergreen re-listings. Measured
+-- before this change: prior_frequency_count was 0 on ALL 1153 rows, which made
+-- every trend label unearned. History rows are kept precisely so the trend can be
+-- compared against what we actually recorded at the time; this reads them.
+prev_window AS (
+    SELECT max(window_end) AS w_end FROM skill_demand_stats WHERE window_end < %(w_end)s
+),
+prior_counts AS (
+    SELECT s.sector, s.skill_key, s.frequency_count AS freq
+      FROM skill_demand_stats s JOIN prev_window p ON s.window_end = p.w_end
 ),
 sector_volume AS (
-    SELECT sector, count(*) AS n FROM cur_postings GROUP BY sector
+    SELECT sector, count(*) AS n,
+           count(DISTINCT source_post_url) AS posts
+      FROM cur_postings GROUP BY sector
 ),
 cur_skills AS (
-    SELECT c.sector, c.posting_id, c.title, c.source_url,
+    SELECT c.sector, c.posting_id, c.title, c.source_url, c.source_post_url,
            btrim(s) AS skill, lower(btrim(s)) AS skill_key
       FROM cur_postings c, unnest(c.required_skills) AS s
      WHERE btrim(s) <> ''
-),
-prior_counts AS (
-    SELECT p.sector, lower(btrim(s)) AS skill_key,
-           count(DISTINCT p.posting_id) AS freq
-      FROM prior_postings p, unnest(p.required_skills) AS s
-     WHERE btrim(s) <> ''
-     GROUP BY p.sector, lower(btrim(s))
 ),
 cur_counts AS (
     SELECT sector, skill_key,
@@ -133,8 +144,17 @@ SELECT
     cc.freq,
     COALESCE(pc.freq, 0),
     CASE
-        WHEN cc.freq < %(trend_min)s THEN 'stable'
-        WHEN COALESCE(pc.freq, 0) = 0 THEN 'rising'
+        -- "We have never measured this before" is not a rise. Saying 'rising'
+        -- there published a finding from zero observations — measured: 23 rows
+        -- claimed 'rising' with prior_frequency_count = 0, on a table where ALL
+        -- 1153 priors were 0. These two states now have their own honest names.
+        WHEN NOT EXISTS (SELECT 1 FROM prev_window WHERE w_end IS NOT NULL)
+            THEN 'no_prior_data'
+        WHEN COALESCE(pc.freq, 0) = 0 THEN 'new'
+        -- The volume floor applies to BOTH sides. Testing only the current count
+        -- reported a 20 -> 4 collapse as 'stable': the floor exists to suppress
+        -- noise, not to hide a disappearance.
+        WHEN cc.freq < %(trend_min)s AND pc.freq < %(trend_min)s THEN 'stable'
         WHEN cc.freq::numeric / pc.freq >= %(rising)s THEN 'rising'
         WHEN cc.freq::numeric / pc.freq <= %(falling)s THEN 'falling'
         ELSE 'stable'
@@ -167,7 +187,12 @@ SELECT
           ) sp
     ), '[]'::jsonb),
     (sv.n < %(low_conf_min)s),
-    now()
+    now(),
+    sv.n,
+    -- Distinct SOURCE POSTS behind this count, so a consumer can tell 19 roles
+    -- from one roundup apart from 19 independent employers.
+    (SELECT count(DISTINCT cs4.source_post_url) FROM cur_skills cs4
+      WHERE cs4.sector = cc.sector AND cs4.skill_key = cc.skill_key)
 FROM cur_counts cc
 JOIN sector_volume sv ON sv.sector = cc.sector
 LEFT JOIN prior_counts pc ON pc.sector = cc.sector AND pc.skill_key = cc.skill_key
@@ -187,6 +212,8 @@ ON CONFLICT (sector, skill_key, window_end) DO UPDATE SET
     co_occurring_skills = EXCLUDED.co_occurring_skills,
     sample_postings = EXCLUDED.sample_postings,
     low_confidence = EXCLUDED.low_confidence,
+    sector_volume = EXCLUDED.sector_volume,
+    distinct_posts = EXCLUDED.distinct_posts,
     computed_at = now()
 """
 

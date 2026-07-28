@@ -18,6 +18,7 @@ Agent-neutral: this lives in ``shared/`` because both Agent B (jobs) and Agent D
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -209,11 +210,71 @@ class PoliteClient:
             self.bytes_fetched += total
             body = b"".join(chunks)
 
-        encoding = response.encoding or "utf-8"
-        # errors="replace": one bad byte in a large feed must not lose the rest.
-        # Mojibake is visible downstream; an exception here is a silently empty
-        # cycle.
-        return body.decode(encoding, errors="replace")
+        return decode_body(body, response.encoding)
+
+
+# <meta charset="..."> / <meta http-equiv="Content-Type" content="...; charset=...">
+# Read from the raw bytes: the declaration is ASCII, so it can be found before the
+# document has been decoded.
+_META_CHARSET = re.compile(
+    rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""", re.IGNORECASE
+)
+
+# Above this share of U+FFFD the decode did not merely hit a bad byte — it used the
+# wrong codec for the whole document.
+MAX_REPLACEMENT_RATIO = 0.10
+
+
+def decode_body(body: bytes, header_encoding: str | None) -> str:
+    """Bytes to text, preferring what the DOCUMENT declares over the header.
+
+    ``httpx.Response.encoding`` reflects the Content-Type header only. A great many
+    Arabic pages are served as bare ``text/html`` while declaring windows-1256 in a
+    ``<meta charset>`` — decoding those as UTF-8 produced a document of pure U+FFFD.
+    Measured: ``وظائف شاغرة`` in windows-1256 came back as ten replacement
+    characters. Nothing downstream could notice, because the result is non-empty,
+    hashes stably, and flows straight into the LLM and the embedding — so an entire
+    posting became noise while looking perfectly healthy.
+
+    Order: an explicit non-ASCII header wins (the server knows), else the document's
+    own declaration, else UTF-8. If the chosen codec still yields mostly replacement
+    characters, fall back to windows-1256 and keep whichever result is cleaner.
+    """
+    declared = None
+    match = _META_CHARSET.search(body[:4096])
+    if match:
+        try:
+            declared = match.group(1).decode("ascii").lower()
+        except UnicodeDecodeError:
+            declared = None
+
+    header = (header_encoding or "").lower() or None
+    # httpx falls back to these when the header says nothing useful, so they are
+    # not evidence of a real declaration and must not outrank the document's.
+    if header in {"ascii", "us-ascii", "iso-8859-1", "latin-1", "utf-8", "utf8"}:
+        header = header if declared is None else None
+
+    for candidate in (header, declared, "utf-8"):
+        if not candidate:
+            continue
+        try:
+            text = body.decode(candidate, errors="replace")
+        except LookupError:
+            continue          # unknown codec name; try the next
+        if not _is_mostly_replacement(text):
+            return text
+
+    # Everything tried came back as noise. windows-1256 is the common culprit in
+    # this corpus; take it if it decodes more cleanly, else keep the UTF-8 attempt.
+    fallback = body.decode("windows-1256", errors="replace")
+    utf8 = body.decode("utf-8", errors="replace")
+    return fallback if fallback.count("�") < utf8.count("�") else utf8
+
+
+def _is_mostly_replacement(text: str) -> bool:
+    if not text:
+        return False
+    return text.count("�") / len(text) > MAX_REPLACEMENT_RATIO
 
 
 def host_of(url: str) -> str:

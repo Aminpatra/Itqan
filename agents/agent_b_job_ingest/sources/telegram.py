@@ -95,7 +95,7 @@ class TelegramAdapter(BaseAdapter):
         known_run = 0
         seen: set[str] = set()
 
-        for _ in range(self.config.telegram_max_pages):
+        for page in range(self.config.telegram_max_pages):
             params = {"before": before} if before else None
             try:
                 body = client.get_text(self.channel_url, params=params)
@@ -112,6 +112,16 @@ class TelegramAdapter(BaseAdapter):
             tree = HTMLParser(body)
             messages = tree.css(MSG_SELECTOR)
             if not messages:
+                # A channel with no messages left to page through returns an empty
+                # page too — but only AFTER we have already read some. Finding
+                # nothing on the very first request means the selector no longer
+                # matches, and calling that "an empty day" ages (and eventually
+                # deletes) the whole inventory on a site redesign.
+                if page == 0:
+                    result.fail(
+                        f"no messages matched {MSG_SELECTOR!r} on the first page — the "
+                        f"channel layout may have changed; not treating this as empty"
+                    )
                 return
 
             oldest: str | None = None

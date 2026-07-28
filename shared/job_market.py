@@ -139,7 +139,8 @@ def export_for_agent_c(
                 f"""
                 SELECT sector, skill, skill_key, esco_code, window_start, window_end,
                        frequency_count, prior_frequency_count, trend,
-                       co_occurring_skills, sample_postings, low_confidence, computed_at
+                       co_occurring_skills, sample_postings, low_confidence, computed_at,
+                       sector_volume, distinct_posts
                   FROM skill_demand_stats
                  WHERE window_end = (SELECT max(window_end) FROM skill_demand_stats)
                        {sector_clause}

@@ -34,6 +34,7 @@ def test_real_migrations_are_discoverable_and_ordered():
         "listing_provenance",
         "esco",
         "source_post_url",
+        "stat_denominators",
     ]
 
 

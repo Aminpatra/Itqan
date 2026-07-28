@@ -115,7 +115,18 @@ class DubizzleAdapter(BaseAdapter):
             result.pages_fetched += 1
             result.bytes_fetched = client.bytes_fetched
 
-            for card in HTMLParser(html).css("article"):
+            cards = HTMLParser(html).css("article")
+            if not cards:
+                # A listing page always renders cards; zero means the markup moved,
+                # not that Dubizzle has no jobs. Reporting that as a clean empty
+                # fetch would age this source's whole inventory toward deletion.
+                result.fail(
+                    f"no <article> cards on {page_url} — the listing markup may have "
+                    f"changed; not treating this as an empty listing"
+                )
+                return
+
+            for card in cards:
                 href = _ad_href(card)
                 if not href:
                     result.skipped += 1

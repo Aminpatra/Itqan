@@ -141,14 +141,61 @@ class IngestPipeline:
         # vacancy. A rejected post yields a single audit row, never a split.
         work: list[_Work] = []
         for raw, post_hash in to_extract:
-            assessment, band = self._assess(raw, summary)
+            assessment, band, verdict = self._assess(raw, summary)
+
+            # Rejecting a MULTI-VACANCY post is a much heavier act than rejecting a
+            # single one: the score is computed over the whole text, so one
+            # "registration fee" line in a footer — common on aggregator pages —
+            # condemns every genuine vacancy alongside it, and this module's own
+            # docstring notes that a wrongly-rejected posting is invisible by
+            # construction (it is excluded from the very statistics anyone would
+            # use to notice). The evidence is also weaker per vacancy: a signal
+            # drawn from text about job 7 says little about job 2.
+            #
+            # So a roundup is held for review rather than deleted. needs_review is
+            # not aggregable, so it still cannot reach the demand statistics —
+            # the posting is quarantined, not trusted, and not destroyed.
+            roundup = "mass_vacancy_no_detail" in assessment.codes
+            if band == "reject" and roundup:
+                item = self._rejected_work(raw, post_hash, assessment)
+                item.row.status = "needs_review"
+                item.row.review_reason = (
+                    f"multi-vacancy post scored as a scam on whole-post evidence "
+                    f"({', '.join(assessment.codes)}); held for review rather than "
+                    f"rejecting every vacancy it advertises"
+                )
+                work.append(item)
+                summary.needs_review += 1
+                continue
+
             if band == "reject":
                 work.append(self._rejected_work(raw, post_hash, assessment))
                 summary.rejected += 1
                 continue
+
+            # The adjudicator said "scam" but the blended score did not clear the
+            # reject line. That used to be discarded entirely: the row was written
+            # `active` with no reason recorded, so a model call we paid for and a
+            # judgement it stated plainly had no effect whatsoever — it needed
+            # scam_confidence >= 0.70 to matter, while the schema's default is 0.5.
+            # Flagging keeps the posting for a human and, because needs_review is
+            # not aggregable, out of the demand statistics meanwhile.
+            flagged = None
+            if verdict is not None and verdict.is_scam:
+                flagged = (
+                    f"adjudicator: {verdict.reasoning.strip()} "
+                    f"(confidence {verdict.scam_confidence:.2f}; "
+                    f"cited: {verdict.evidence_quote.strip()!r})"
+                )
+
             jobs = self._extract_jobs(raw, summary)
             for index, job in enumerate(jobs):
-                work.append(self._child_work(raw, post_hash, job, index, len(jobs), assessment))
+                item = self._child_work(raw, post_hash, job, index, len(jobs), assessment)
+                if flagged:
+                    item.row.status = "needs_review"
+                    item.row.review_reason = flagged
+                    summary.needs_review += 1
+                work.append(item)
 
         live = [w for w in work if w.row.status != "rejected"]
 
@@ -249,35 +296,52 @@ class IngestPipeline:
         return _Work(raw=raw, posting_id=pid, content_hash=chash, row=row, is_split=is_split)
 
     # ---- legitimacy --------------------------------------------------
-    def _assess(self, raw: RawPosting, summary: IngestSummary) -> tuple[Any, str]:
+    def _assess(self, raw: RawPosting, summary: IngestSummary) -> tuple[Any, str, Any]:
         """Score the WHOLE post for legitimacy, before any split. employer_
         extracted=False: extraction has not run yet, so the no_employer_named
         signal must stay silent (firing it here scores every posting employer-
-        less); the phrase/contact/role signals all read from the raw text."""
+        less); the phrase/contact/role signals all read from the raw text.
+
+        Returns ``(assessment, band, verdict)`` — the verdict is the adjudicator's
+        answer when one was sought AND its quote checked out, so the caller can act
+        on the model's judgement and record the evidence behind it.
+        """
         assessment = legit.score_text(
             raw.raw_description, company=None, title=raw.title, employer_extracted=False,
         )
+        # The module's stated backstop, now actually called: a scorer bug that
+        # attaches a confident number to evidence that is not in the posting fails
+        # loudly here instead of being published. Cheap (a substring check per
+        # quoted signal) and it only fires on a genuine defect.
+        legit.assert_auditable(assessment, legit.audit_source(raw.title, raw.raw_description))
         band = assessment.band(self.config)
+        verdict = None
         if band == "adjudicate":
-            assessment = self._adjudicate(raw, assessment, summary)
+            assessment, verdict = self._adjudicate(raw, assessment, summary)
             band = assessment.band(self.config)
-        return assessment, band
+        return assessment, band, verdict
 
-    def _adjudicate(self, raw: RawPosting, assessment: Any, summary: IngestSummary) -> Any:
+    def _adjudicate(
+        self, raw: RawPosting, assessment: Any, summary: IngestSummary
+    ) -> tuple[Any, Any]:
         """One LLM call for a post the rules could not resolve. Trusted only if
         its quote is real; a fabricated quote is discarded and the rule score
-        stands, so the model cannot reject on evidence it cannot produce."""
+        stands, so the model cannot reject on evidence it cannot produce.
+
+        Returns ``(assessment, verdict)``; verdict is None when the model could not
+        produce a real quote, because an unevidenced verdict must not travel.
+        """
         summary.adjudications += 1
         verdict: LegitimacyVerdict = self.adjudicator.invoke({"body": raw.raw_description})
         if not verify_quote(verdict.evidence_quote, raw.raw_description):
-            return assessment  # ungrounded — rules stand
+            return assessment, None  # ungrounded — rules stand
         if verdict.is_scam:
             # Blend: the stronger of rule risk and model confidence.
             risk = max(assessment.risk, verdict.scam_confidence)
-            return legit.Assessment(risk=risk, signals=assessment.signals)
+            return legit.Assessment(risk=risk, signals=assessment.signals), verdict
         # Cleared with real evidence: relax toward legitimate but never below the
         # band floor, so one clearance cannot whitewash strong rule signals.
-        return legit.Assessment(risk=min(assessment.risk, 0.35), signals=assessment.signals)
+        return legit.Assessment(risk=min(assessment.risk, 0.35), signals=assessment.signals), verdict
 
     # ---- extraction --------------------------------------------------
     def _extract_jobs(self, raw: RawPosting, summary: IngestSummary) -> list[JobExtraction]:
@@ -307,7 +371,14 @@ class IngestPipeline:
         if self.root_fetcher is None or not self.config.enrich_from_root_source:
             return
 
+        budget = self.config.max_root_fetches_per_cycle
         for item in live:
+            # A per-cycle ceiling, not just a per-host interval. The docstrings
+            # called this "bounded" while the only limits were one-per-posting and
+            # a 1s gap — i.e. unbounded in the dimension that matters when a batch
+            # is large.
+            if budget is not None and summary.root_fetches >= budget:
+                break
             if item.is_split:
                 continue
             self_host = urlsplit(item.raw.source_url).netloc.lower()

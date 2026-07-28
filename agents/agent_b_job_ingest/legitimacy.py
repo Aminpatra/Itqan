@@ -55,7 +55,12 @@ SIGNAL_WEIGHTS: dict[str, float] = {
     "whatsapp_only_contact": 0.30,
     "no_employer_named": 0.25,
     "no_salary_deduction": 0.20,
+    # Short AND silent about the role — the classic "WhatsApp me" stub.
     "contact_only_no_role": 0.20,
+    # Long enough to have described the work and still didn't. Weaker evidence:
+    # plenty of legitimate long postings are pure company boilerplate, whereas a
+    # posting too short to say anything at all is the more suspicious shape.
+    "no_role_described": 0.10,
     "free_accommodation_bait": 0.15,
     "mass_vacancy_no_detail": 0.10,
 }
@@ -224,10 +229,19 @@ _MASS_VACANCY = re.compile(
 )
 
 # Words that indicate an actual role is described, in either language. Absence
-# of ALL of them is what contact_only_no_role means.
+# of ALL of them is what no_role_described means.
+#
+# The `(?:ال)?` prefixes are load-bearing, not tidying. Every Arabic term here was
+# written with the definite article while every English one is a bare stem, so the
+# common indefinite forms — مهام الوظيفة, شروط التقديم, خبرة لا تقل عن — matched
+# nothing. Measured on the same posting in three renderings: Arabic without the
+# article scored 0.560 and went to the paid adjudicator, while the article-prefixed
+# Arabic and the English both scored 0.700 and passed clean. A vacancy was being
+# penalised for its orthography, in the project's primary language.
 _ROLE_WORDS = re.compile(
     r"(?:responsibilit|requirement|qualification|experience|duties|skills?|role|shift"
-    r"|المهام|المسؤوليات|المتطلبات|المؤهلات|الخبره|الشروط)",
+    r"|(?:ال)?مهام|(?:ال)?مسؤوليات|(?:ال)?متطلبات|(?:ال)?مؤهلات|(?:ال)?خبره|(?:ال)?شروط"
+    r"|(?:ال)?وظيفه|(?:ال)?واجبات)",
     re.IGNORECASE,
 )
 
@@ -332,20 +346,47 @@ def score_text(
             )
         )
 
+    # Brevity and silence are different accusations, and joining them with OR made
+    # the signal state a falsehood: "Chef needed. Duties: cooking. Requirements: 2y
+    # experience. Muscat. Send CV to hr@x.com" is 86 characters and describes the
+    # role completely, yet fired a signal whose own basis line said it described
+    # none. Telegram vacancies are routinely under 120 characters, so this was the
+    # highest-volume false positive in the filter — and a required ingredient in
+    # most combinations that reach the reject threshold.
+    #
+    # A posting is only "contact only, no role" when it is BOTH short AND carries
+    # none of the role vocabulary. A short posting that names duties keeps its
+    # score; a long one that names none still fires on the vocabulary test.
     stripped = body.strip()
-    if len(stripped) < MIN_ROLE_CHARS or not _ROLE_WORDS.search(_fold(stripped)):
-        signals.append(
-            Signal(
-                code="contact_only_no_role",
-                weight=SIGNAL_WEIGHTS["contact_only_no_role"],
-                evidence=None,
-                basis=f"the posting describes no role: under {MIN_ROLE_CHARS} characters "
-                "or containing none of the responsibility/requirement vocabulary",
+    has_role_words = bool(_ROLE_WORDS.search(_fold(stripped)))
+    if not has_role_words:
+        if len(stripped) < MIN_ROLE_CHARS:
+            signals.append(
+                Signal(
+                    code="contact_only_no_role",
+                    weight=SIGNAL_WEIGHTS["contact_only_no_role"],
+                    evidence=None,
+                    basis=f"under {MIN_ROLE_CHARS} characters and containing none of the "
+                    "responsibility/requirement vocabulary",
+                )
             )
-        )
+        else:
+            signals.append(
+                Signal(
+                    code="no_role_described",
+                    weight=SIGNAL_WEIGHTS["no_role_described"],
+                    evidence=None,
+                    basis="contains none of the responsibility/requirement vocabulary",
+                )
+            )
 
-    mass = _find(_MASS_VACANCY, f"{title}\n{body}")
-    if mass and not _ROLE_WORDS.search(_fold(body)):
+    # Searched over title+body but audited against the body alone, so a span taken
+    # from the title ("15 vacancies available now") made assert_auditable raise on
+    # an ordinary posting — dormant only because nothing called it. The signal
+    # legitimately reads the title, so the AUDIT source is title+body too; see
+    # `audit_source` below, which is what callers must pass.
+    mass = _find(_MASS_VACANCY, audit_source(title, body))
+    if mass and not has_role_words:
         signals.append(
             Signal(
                 code="mass_vacancy_no_detail",
@@ -359,6 +400,17 @@ def score_text(
         risk=combine_signals([s.weight for s in signals]),
         signals=tuple(signals),
     )
+
+
+def audit_source(title: str | None, body: str | None) -> str:
+    """The exact text every signal is allowed to quote from.
+
+    One function so the scorer and ``assert_auditable`` cannot disagree about it.
+    They did: ``mass_vacancy_no_detail`` searched title+body while the audit was
+    handed the body alone, so a span quoted from a title failed verification — the
+    backstop would have crashed on ordinary postings the moment it was wired in.
+    """
+    return f"{title or ''}\n{body or ''}"
 
 
 def assert_auditable(assessment: Assessment, source_text: str) -> None:
