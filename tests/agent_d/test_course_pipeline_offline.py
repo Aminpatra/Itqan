@@ -34,12 +34,16 @@ def make_pipeline(store=None, llm=None, embedder=None):
 
 def course(url, *, source="coursera", group="coursera", stype="api",
            name="Python Basics", body=None, provider="Google Cloud",
-           rating=None, review_count=None, price=None):
+           rating=None, review_count=None, price=None, volatile_observed=True):
+    # volatile_observed defaults True: a fixture handing over a rating/price is
+    # modelling a fetch that SUCCEEDED. Pass False to model a failed enrichment,
+    # which must preserve stored values rather than overwrite them with None.
     return RawCourse(
         source=source, source_group=group, source_type=stype, source_url=url,
         name=name, raw_description=body or "Learn Python and SQL from the basics.",
         provider=provider, primary_language="en", license=None,
         rating=rating, review_count=review_count, price=price,
+        volatile_observed=volatile_observed,
     )
 
 
@@ -177,3 +181,74 @@ def test_within_batch_duplicate_urls_collapse():
     pipe, _, _ = make_pipeline(store=store)
     s = pipe.run([course("https://c.test/a"), course("https://c.test/a")])
     assert s.received == 2 and s.written == 1
+
+
+# ---------------------------------------------------------------------------
+# a failed extraction is not an empty course
+# ---------------------------------------------------------------------------
+class _ExplodingOnSecond:
+    """Fails for one specific course, succeeds for the rest."""
+
+    def __init__(self, bad_name: str):
+        self.bad_name, self.calls = bad_name, 0
+
+    def invoke(self, payload):
+        self.calls += 1
+        if payload["name"] == self.bad_name:
+            raise RuntimeError("429 rate limited")
+        return CourseExtraction(taught_skills=["python"])
+
+
+def test_one_failed_extraction_costs_one_course_not_the_batch():
+    """A bare `extractor.invoke` inside the batch meant a single 429 lost every
+    course from that source for the cycle."""
+    store = FakeCourseStore()
+    pipe, _, _ = make_pipeline(store=store)
+    pipe.extractor = _ExplodingOnSecond("Bad One")
+
+    summary = pipe.run([
+        course("https://c.test/a", name="Good One"),
+        course("https://c.test/b", name="Bad One"),
+        course("https://c.test/c", name="Another Good"),
+    ])
+
+    assert summary.extraction_failed == 1
+    assert summary.written == 2, "a single failure took down the batch"
+    assert {r.name for r in store.rows.values()} == {"Good One", "Another Good"}
+
+
+def test_a_failed_extraction_does_not_overwrite_a_good_stored_row():
+    """We did not fail to FIND skills, we failed to look. Writing the row would
+    publish a skill-less course — and a skill-less course is excluded from the
+    supply stats, so an API blip would silently remove real supply."""
+    store = FakeCourseStore()
+    pipe, _, _ = make_pipeline(store=store)
+    pipe.run([course("https://c.test/a", name="Data Science")])
+    stored = next(iter(store.rows.values()))
+    assert stored.taught_skills
+
+    # Same course, new description (so it re-extracts), but the call fails.
+    pipe2, _, _ = make_pipeline(store=store)
+    pipe2.extractor = _ExplodingOnSecond("Data Science")
+    summary = pipe2.run([course("https://c.test/a", name="Data Science",
+                                body="A completely rewritten description.")])
+
+    assert summary.extraction_failed == 1 and summary.written == 0
+    survivor = next(iter(store.rows.values()))
+    assert survivor.taught_skills, "a failed lookup emptied a good row"
+    assert survivor.status != "rejected", "a failed lookup was recorded as 'no skills'"
+
+
+def test_a_failed_enrichment_does_not_erase_stored_quality_signals():
+    """The offline mirror of the DB regression: an unchanged course whose rating
+    lookup failed keeps the rating it already had."""
+    store = FakeCourseStore()
+    pipe, _, _ = make_pipeline(store=store)
+    pipe.run([course("https://c.test/a", rating=4.7)])
+    assert next(iter(store.rows.values())).rating == 4.7
+
+    pipe2, _, _ = make_pipeline(store=store)
+    summary = pipe2.run([course("https://c.test/a", rating=None, volatile_observed=False)])
+
+    assert summary.volatile_refreshed == 1
+    assert next(iter(store.rows.values())).rating == 4.7

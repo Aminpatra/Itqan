@@ -46,6 +46,9 @@ RATIONALE_SYSTEM_PROMPT = (
     "- If used_fallback is true, use softer confidence language (\"a solid option "
     "based on general demand in your field\") rather than confident job-specific "
     "claims, since this came from aggregate demand stats, not matched postings.\n"
+    "- If 'Courses available' is low, say plainly that few courses cover this "
+    "skill, so this is one of a small number of options — do not dress a thin "
+    "field up as a strong endorsement of the single course found.\n"
     "- 2-3 sentences, plain and direct, no marketing language.\n"
     "- Never mention priority_score as a number, ESCO codes, gap_score, or "
     "internal pipeline terms — translate priority_bucket into plain language if "
@@ -274,6 +277,21 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
         esco_of = {m["skill"]: m["esco_code"] for m in missing}
         buckets = _compute_buckets(missing)
         courses_by_id = state.get("courses_by_id", {})
+        candidates = state.get("skill_candidates", {})
+
+        # How much supply exists for each gap. This is Agent D's whole reason for
+        # aggregating a supply side, and it costs nothing here: retrieval already
+        # fetched every eligible course per skill, so the depth is the length of
+        # that list — no second query, no join to the stats table.
+        #
+        # It matters to the candidate because "one obscure course exists" and
+        # "forty courses teach this" are very different situations behind the same
+        # single recommendation, and only one of them is a safe plan.
+        thin_below = deps.config.course_low_confidence_min_courses
+
+        def supply_for(skill: str) -> dict[str, Any]:
+            n = len(candidates.get(skill, []))
+            return {"courses_available": n, "thin": n < thin_below}
 
         recs: list[dict[str, Any]] = []
         for cid, covered in state.get("assigned", {}).items():
@@ -287,6 +305,7 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
                 "esco_code": esco_of.get(primary),
                 "priority_score": priority[primary],
                 "priority_bucket": buckets.get(primary, "some"),
+                "supply": supply_for(primary),
                 "course": {
                     "course_id": cc.course_id,
                     "title": cc.title,
@@ -310,6 +329,9 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
                 "esco_code": esco_of.get(skill),
                 "priority_score": priority.get(skill, 0.0),
                 "priority_bucket": buckets.get(skill, "some"),
+                # Explicit rather than implied by `course: null` — a consumer
+                # should not have to infer a zero.
+                "supply": {"courses_available": 0, "thin": True},
                 "course": None,
                 "no_course_found": True,
             })
@@ -352,6 +374,14 @@ def _render_user_message(rec: dict[str, Any], used_fallback: bool) -> str:
         "specific job postings you matched with" if not used_fallback
         else "general demand data for your field (fewer specific postings were available)"
     )
+    # A plain count of alternatives, not an internal score — it tells the reader
+    # whether this recommendation is a pick from many or the only thing there is.
+    supply = rec.get("supply") or {}
+    available = supply.get("courses_available")
+    supply_line = "not available" if available is None else str(available)
+    if supply.get("thin"):
+        supply_line += " (few courses cover this skill)"
+
     return "\n".join([
         f"Skill: {rec['skill']}",
         f"Also covers: {also}",
@@ -361,6 +391,7 @@ def _render_user_message(rec: dict[str, Any], used_fallback: bool) -> str:
         f"Price: {price_line}",
         f"Last updated: {last_updated}",
         f"Demand level for this skill: {rec['priority_bucket']}",
+        f"Courses available for this skill: {supply_line}",
         f"Recommendation basis: {basis}",
     ])
 

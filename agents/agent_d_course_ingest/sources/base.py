@@ -55,6 +55,15 @@ class RawCourse:
     # the provider reports no price at all. Free -> amount 0.0, is_free True.
     price: dict | None = None
 
+    # Did this fetch actually OBSERVE the volatile fields above?
+    #
+    # False means "we did not look, or looked and could not read" — not "the
+    # provider reports none". The distinction is load-bearing: the store writes
+    # these columns every cycle, so without it a robots refusal or a page
+    # redesign silently overwrote every stored rating with NULL. False makes the
+    # store preserve what it already has.
+    volatile_observed: bool = False
+
     def __post_init__(self) -> None:
         if self.source_type not in SOURCE_TYPES:
             raise ValueError(f"unknown source_type {self.source_type!r}; expected {SOURCE_TYPES}")
@@ -78,12 +87,42 @@ class AdapterResult:
     error: str | None = None
     partial: bool = False
     blocked_after_n: int | None = None
+
+    # True when the fetch stopped for a reason of OUR choosing rather than the
+    # source's: a --limit cap, or a page-count cap reached while the catalog had
+    # more to give. The source was healthy and there was more to read, so the
+    # inventory we hold is just as incomplete as after a block — and ageing it
+    # would age courses we deliberately did not ask for.
+    #
+    # Separate from `partial` because it is not a failure: the run is fine and
+    # the health record should stay green; only the ageing decision changes.
+    # Ported from Agent B, where the missing distinction cost real data.
+    truncated: bool = False
+
     pages_fetched: int = 0
     bytes_fetched: int = 0
+
+    # Enrichment telemetry (sources that fetch a second page for quality
+    # signals). `unparsed` is the one to watch: a page that loaded but yielded
+    # nothing is the signature of a layout change, and it used to be invisible.
+    enriched: int = 0
+    enrich_failed: int = 0
+    enrich_unparsed: int = 0
 
     @property
     def ok(self) -> bool:
         return self.error is None and not self.partial
+
+    @property
+    def may_age_inventory(self) -> bool:
+        """Is this fetch a trustworthy census of what the source still lists?
+
+        Only a clean, complete, untruncated pass may age inventory toward
+        deletion. Note this is necessary but NOT sufficient: a source whose
+        catalog cannot be enumerated in one cycle at all is excluded by
+        ``CourseSourceConfig.census`` regardless of what this returns.
+        """
+        return self.ok and not self.truncated
 
     def fail(self, message: str, *, partial: bool | None = None) -> "AdapterResult":
         self.error = message
@@ -91,6 +130,22 @@ class AdapterResult:
         if self.partial and self.blocked_after_n is None:
             self.blocked_after_n = len(self.courses)
         return self
+
+    def anchor_missed(self, detail: str) -> bool:
+        """Fail loudly when a page loaded but nothing in it parsed.
+
+        "The source published nothing" and "the source changed shape and our
+        selectors now match nothing" are indistinguishable by item count, and
+        treating the second as the first ages the whole inventory toward
+        deletion on the day a site is redesigned. A genuinely empty feed still
+        reports zero (pages_fetched > 0 with nothing parsed AND nothing skipped
+        is the shape that cannot happen naturally).
+        """
+        if self.pages_fetched > 0 and not self.courses and self.skipped == 0:
+            self.fail(f"no courses matched {detail}; the source may have changed shape",
+                      partial=False)
+            return True
+        return False
 
 
 @runtime_checkable
@@ -132,7 +187,13 @@ class BaseAdapter:
             self._fetch(result, limit=limit)
         except Exception as exc:  # noqa: BLE001 - deliberate boundary
             result.fail(f"{type(exc).__name__}: {exc}")
-        if limit is not None and len(result.courses) > limit:
+        # Reaching the cap means the source had more to give. Marked here, once,
+        # rather than at each adapter's several `return` sites — every adapter
+        # honours `limit` through this method, so a new one cannot forget it.
+        # (Caps of the adapter's own making — a page-count ceiling — set the flag
+        # themselves; see the Coursera adapter's pagination stop.)
+        if limit is not None and len(result.courses) >= limit:
+            result.truncated = True
             del result.courses[limit:]
         return result
 

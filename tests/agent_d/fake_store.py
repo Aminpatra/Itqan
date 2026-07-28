@@ -41,21 +41,23 @@ class FakeCourseStore:
                 self.rows[i].status = "active"
         return len(ids)
 
+    _VOLATILE = ("rating", "review_count", "enrollment_count", "last_updated",
+                 "price_amount", "price_currency", "price_is_free")
+
     def refresh_volatile(self, rows: list[dict]) -> int:
         """Mirror the store: update volatile columns on existing rows, no
-        re-embed. Only counts rows that actually exist (like the real UPDATE)."""
+        re-embed. Only counts rows that actually exist (like the real UPDATE).
+
+        Mirrors the real SQL's ``volatile_observed`` gate — an unobserved refresh
+        touches the lifecycle columns but leaves the stored values alone."""
         n = 0
         for r in rows:
             row = self.rows.get(r["course_id"])
             if row is None:
                 continue
-            row.rating = r["rating"]
-            row.review_count = r["review_count"]
-            row.enrollment_count = r["enrollment_count"]
-            row.last_updated = r["last_updated"]
-            row.price_amount = r["price_amount"]
-            row.price_currency = r["price_currency"]
-            row.price_is_free = r["price_is_free"]
+            if r.get("volatile_observed"):
+                for column in self._VOLATILE:
+                    setattr(row, column, r[column])
             if row.status == "stale":
                 row.status = "active"
             self.touched.append(r["course_id"])
@@ -71,5 +73,11 @@ class FakeCourseStore:
                 assert row.duplicate_of in present, (
                     f"FK violation: {row.course_id} -> {row.duplicate_of} not yet inserted"
                 )
+            # Same gate as the real ON CONFLICT branch: a changed course whose
+            # quality lookup failed keeps the stored signals.
+            existing = self.rows.get(row.course_id)
+            if existing is not None and not getattr(row, "volatile_observed", False):
+                for column in self._VOLATILE:
+                    setattr(row, column, getattr(existing, column, None))
             self.rows[row.course_id] = row
             present.add(row.course_id)

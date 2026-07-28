@@ -526,20 +526,29 @@ links; near-dup by essence embedding still runs). Skills taught are extracted wi
 recruiter-canonical-name discipline as job requirements, so the two sides aggregate on one
 vocabulary, and mapped into Agent D's own `course_esco_map` (never Agent B's `skill_esco_map`).
 
-**The payoff** — demand meets supply on `esco_code`:
+**The payoff** — demand meets supply:
 
-```sql
-SELECT es.preferred_label AS skill, d.frequency_count AS demand_jobs,
-       COALESCE(s.course_count, 0) AS supply_courses
-FROM skill_demand_stats d
-LEFT JOIN skill_supply_stats s USING (esco_code)
-JOIN esco_skills es ON es.esco_uri = d.esco_code
-WHERE d.window_end = (SELECT max(window_end) FROM skill_demand_stats)
-ORDER BY d.frequency_count DESC;
+```bash
+python main.py agent-d --supply-report
 ```
 
-A high `demand_jobs` with a low `supply_courses` is a real market gap — an in-demand skill with few
-courses teaching it.
+A command rather than a snippet, because the obvious query is wrong in two ways that are easy to
+miss:
+
+- **Join on the concept grain, not the skill grain.** Several raw skill keys map to one ESCO concept
+  (measured: one concept carried seven), so `LEFT JOIN skill_supply_stats USING (esco_code)` fans
+  out — on the live corpus, 131 matched concepts produced 273 rows and inflated summed demand from
+  237 to **407 (+72%)**. `concept_supply_stats` counts `DISTINCT course_id` per concept, so a course
+  teaching two phrasings of one skill counts once. No rollup of the skill grain can recover this:
+  summing double-counts, taking the max undercounts.
+- **Demand and supply are not a ratio.** Demand is a **flow** — vacancies open during a window.
+  Supply is a **stock** — courses that exist. "27 jobs want this, 3 courses teach it" has no ratio
+  interpretation, because one course serves unlimited learners. Read it as **coverage**: is a needed
+  skill taught at all, and by how few providers.
+
+Two supply tables, deliberately: `skill_supply_stats` is the raw audit grain (one row per skill
+phrase, carrying `total_courses` as its denominator), and `concept_supply_stats` is the ESCO-canonical
+grain that consumers join on.
 
 ---
 

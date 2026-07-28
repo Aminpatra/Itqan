@@ -18,7 +18,7 @@ UPDATE and no LLM or embedding.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .hashing import content_hash, id_for
@@ -42,8 +42,13 @@ class IngestSummary:
     # Unchanged courses whose volatile quality/price signals were refreshed this
     # cycle without re-extracting or re-embedding.
     volatile_refreshed: int = 0
+    # Courses whose extraction call raised. NOT the same as `rejected`: we did
+    # not fail to find skills, we failed to look. They are dropped from the
+    # cycle and retried next, leaving any stored row untouched.
+    extraction_failed: int = 0
+    extraction_errors: list[str] = field(default_factory=list)
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
 
     def merge(self, other: "IngestSummary") -> "IngestSummary":
@@ -93,13 +98,37 @@ class CoursePipeline:
         summary.volatile_refreshed = summary.unchanged
 
         # extract, then the quality gate (needs the skills to judge them)
+        extracted: list[_Work] = []
         for item in work:
-            self._extract(item, summary)
+            # A cheap gate BEFORE the call: a course with almost no text cannot
+            # yield skills, and paying an LLM call to discover that is pure
+            # waste at catalog scale. Deliberately generous — freeCodeCamp's
+            # one-line descriptions are real and must pass.
+            if not _has_enough_text(item.raw, self.config):
+                item.row.status = "rejected"
+                item.row.review_reason = "insufficient_text"
+                summary.rejected += 1
+                extracted.append(item)
+                continue
+            try:
+                self._extract(item, summary)
+            except Exception as exc:  # noqa: BLE001 - one course must not sink the batch
+                # A 429, a timeout or a schema violation means we never looked,
+                # which is NOT the same as looking and finding nothing. Writing
+                # the row now would either publish a skill-less course or
+                # overwrite a good stored row with an empty one, so this course
+                # is dropped from the cycle and retried next.
+                summary.extraction_failed += 1
+                summary.extraction_errors.append(
+                    f"{item.raw.source_url}: {type(exc).__name__}: {exc}")
+                continue
             if not item.row.taught_skills:
                 item.row.status = "rejected"
                 item.row.review_reason = "no_extractable_skills"
                 summary.rejected += 1
+            extracted.append(item)
 
+        work = extracted
         live = [w for w in work if w.row.status != "rejected"]
 
         if self.embedder is not None:
@@ -127,6 +156,7 @@ class CoursePipeline:
             # no LLM — they came straight from the provider response/page.
             rating=raw.rating, review_count=raw.review_count,
             enrollment_count=raw.enrollment_count, last_updated=raw.last_updated,
+            volatile_observed=raw.volatile_observed,
             **PersistedCourse.price_columns(raw.price),
         )
         return _Work(raw=raw, course_id=cid, content_hash=chash, row=row)
@@ -158,11 +188,35 @@ class CoursePipeline:
     def _resolve_neardup(self, embedded: list[_Work], summary: IngestSummary) -> None:
         """Same design as Agent B: in-group >= 0.97 auto-merges; cross-group
         >= 0.97 goes to needs_review, never auto-merges. Candidate set is the
-        union of the store and this cycle."""
+        union of the store and this cycle.
+
+        The in-cycle half is one matrix product rather than a Python double
+        loop. Agent B never needed this — a cycle brings in a few dozen postings
+        — but a course catalog batch is thousands, and n^2 pure-Python dot
+        products over 1536 dimensions is billions of operations. Same comparisons,
+        same order, same results.
+        """
+        import numpy as np
+
         recent = self.config.course_neardup_recent_days
         t_in = self.config.neardup_in_group_threshold
         t_cross = self.config.neardup_cross_group_threshold
         k = self.config.neardup_candidates
+
+        usable = [w for w in embedded if w.row.embedding is not None]
+        sims = None
+        if len(usable) > 1:
+            matrix = np.asarray([w.row.embedding for w in usable], dtype=np.float64)
+            # Vectors are L2-normalized by the embedder, so the dot product IS
+            # cosine — the same assumption the old per-pair loop made.
+            sims = matrix @ matrix.T
+            index = {id(w): i for i, w in enumerate(usable)}
+            groups = np.array([hash(w.raw.source_group) for w in usable])
+            ids = [w.course_id for w in usable]
+            # `active` mirrors the old loop's `other.row.duplicate_of is not None`
+            # skip: an item marked duplicate stops being a merge target for the
+            # items considered after it.
+            active = np.ones(len(usable), dtype=bool)
 
         for item in embedded:
             if item.row.duplicate_of is not None:
@@ -170,14 +224,22 @@ class CoursePipeline:
             best_in: tuple[float, str] | None = None
             best_cross: tuple[float, str] | None = None
 
-            for other in embedded:
-                if other is item or other.row.embedding is None or other.row.duplicate_of is not None:
-                    continue
-                sim = _cosine(item.row.embedding, other.row.embedding)
-                same = other.raw.source_group == item.raw.source_group
-                allow_cross = item.course_id > other.course_id
-                best_in, best_cross = _acc(best_in, best_cross, sim, other.course_id,
-                                           same_group=same, allow_cross=allow_cross)
+            if sims is not None and item.row.embedding is not None:
+                i = index[id(item)]
+                row = sims[i]
+                valid = active.copy()
+                valid[i] = False
+                same = valid & (groups == groups[i])
+                # Only the higher course_id of a cross-group pair reports it, so
+                # one pair yields one review rather than two.
+                cross = valid & (groups != groups[i]) & np.array(
+                    [item.course_id > other for other in ids])
+                for mask, is_same in ((same, True), (cross, False)):
+                    if not mask.any():
+                        continue
+                    j = int(np.argmax(np.where(mask, row, -np.inf)))
+                    best_in, best_cross = _acc(best_in, best_cross, float(row[j]), ids[j],
+                                               same_group=is_same, allow_cross=True)
 
             for cand in self.store.find_neardup_candidates(
                 item.row.embedding, recent_days=recent, limit=k, exclude_id=item.course_id
@@ -190,6 +252,8 @@ class CoursePipeline:
             if best_in and best_in[0] >= t_in:
                 item.row.duplicate_of = best_in[1]
                 summary.embed_duplicates += 1
+                if sims is not None and item.row.embedding is not None:
+                    active[index[id(item)]] = False
             elif best_cross and best_cross[0] >= t_cross:
                 item.row.status = "needs_review"
                 item.row.review_reason = "cross_group_duplicate"
@@ -224,12 +288,24 @@ def _volatile_row(cid: str, raw: RawCourse) -> dict:
     """The volatile-column payload for an unchanged course's cheap refresh."""
     return {
         "course_id": cid,
+        "volatile_observed": raw.volatile_observed,
         "rating": raw.rating,
         "review_count": raw.review_count,
         "enrollment_count": raw.enrollment_count,
         "last_updated": raw.last_updated,
         **PersistedCourse.price_columns(raw.price),
     }
+
+
+def _has_enough_text(raw: RawCourse, config: Any) -> bool:
+    """Is there enough here for skill extraction to be worth a call?
+
+    Name AND description together, because a descriptive title alone is real
+    evidence ("Machine Learning with Python" names its skills); it is the
+    genuinely empty record we refuse to pay for.
+    """
+    text = f"{raw.name or ''} {raw.raw_description or ''}".strip()
+    return len(text) >= getattr(config, "course_min_text_chars", 30)
 
 
 def _dedupe(courses: list[RawCourse]) -> list[RawCourse]:
@@ -255,10 +331,6 @@ def _essence_text(item: _Work) -> str:
     if row.taught_skills:
         parts.append("teaches: " + ", ".join(row.taught_skills))
     return "\n".join(p for p in parts if p)
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
 
 
 def _acc(best_in, best_cross, sim, cid, *, same_group, allow_cross):

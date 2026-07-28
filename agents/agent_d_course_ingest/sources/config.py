@@ -37,6 +37,18 @@ class CourseSourceConfig:
     # API's terms and accepts consuming it under them rather than under robots.
     terms_reviewed: bool = False
 
+    # Can ONE cycle enumerate this source's entire inventory?
+    #
+    # This governs whether absence from a fetch is evidence of removal. Agent B's
+    # sources are recent-first feeds, so "not in today's feed" eventually does
+    # mean delisted; a 23,101-course catalog fetched 800 at a time is a SAMPLE,
+    # and treating absence from a sample as removal deletes live courses for no
+    # reason but our own pagination. A non-census source is never aged: its rows
+    # leave only by an explicit operator purge.
+    #
+    # Set True only when the adapter provably reads the whole list every cycle.
+    census: bool = False
+
     def __post_init__(self) -> None:
         if self.source_type not in SOURCE_TYPES:
             raise SourceConfigError(f"{self.name}: source_type {self.source_type!r} not in {SOURCE_TYPES}")
@@ -63,6 +75,9 @@ DEFAULT_SOURCES: tuple[CourseSourceConfig, ...] = (
         # worked around silently.
         terms_reviewed=True,
         enabled=True,
+        # 23,101 courses read 800 at a time: every cycle sees a slice, so a
+        # course's absence says nothing about whether it still exists.
+        census=False,
     ),
     CourseSourceConfig(
         name="freecodecamp",
@@ -70,6 +85,11 @@ DEFAULT_SOURCES: tuple[CourseSourceConfig, ...] = (
         source_type="html_scrape",
         base_url="https://www.freecodecamp.org",
         enabled=True,
+        # The catalog is one server-rendered index read in full every cycle, so
+        # a course missing from it really has been withdrawn. If this adapter is
+        # ever broadened to a paginated or partial source, this MUST go back to
+        # False — it is the flag that licenses deletion.
+        census=True,
     ),
 )
 

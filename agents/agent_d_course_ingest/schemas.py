@@ -15,6 +15,11 @@ from pydantic import BaseModel, Field, field_validator
 
 LEVELS = ("beginner", "intermediate", "advanced")
 
+# Ceiling on skills per course. Each one is a unit of supply in
+# skill_supply_stats, so an unbounded list lets a single verbose syllabus swamp
+# the table.
+MAX_TAUGHT_SKILLS = 25
+
 
 class CourseExtraction(BaseModel):
     # Skills the course TEACHES, as 1-4 word canonical English names — the form a
@@ -40,7 +45,11 @@ class CourseExtraction(BaseModel):
             if cleaned and key not in seen:
                 seen.add(key)
                 out.append(cleaned)
-        return out
+        # Every skill is a unit of supply, so a model that pads a verbose
+        # syllabus into fifty entries manufactures fifty units of it. Kept
+        # generous — this is a guard against runaway output, not an editorial
+        # judgement about how much a course can teach.
+        return out[:MAX_TAUGHT_SKILLS]
 
     @field_validator("subject")
     @classmethod

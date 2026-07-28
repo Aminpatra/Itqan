@@ -202,45 +202,47 @@ class CourseStore:
         stamped now(), because the honest record of a fluctuating price is "this
         is what it was when we last looked".
 
-        Each row: {course_id, rating, review_count, enrollment_count,
-        last_updated, price_amount, price_currency, price_is_free}.
+        Each row: {course_id, volatile_observed, rating, review_count,
+        enrollment_count, last_updated, price_amount, price_currency,
+        price_is_free}.
+
+        **``volatile_observed`` decides whether these values are written at
+        all.** When it is false the fetch did not read the provider's page — a
+        robots refusal, a timeout, a layout change — and the incoming values are
+        all None. Writing them would erase good data on the strength of a failed
+        lookup, so the columns keep what they have and only the seen/staleness
+        touch applies. `price_observed_at` likewise advances only on a real
+        observation, so it stays an honest record of when we last actually saw a
+        price rather than when we last tried.
         """
         if not rows:
             return 0
         conn = self.connect()
-        n = 0
+        # Absent flag means False: a caller that cannot say it observed these
+        # values does not get to overwrite stored ones.
+        params = [{**r, "volatile_observed": bool(r.get("volatile_observed"))} for r in rows]
         with conn.cursor() as cur:
-            for row in rows:
-                cur.execute(
-                    """
-                    UPDATE courses SET
-                        rating = %(rating)s,
-                        review_count = %(review_count)s,
-                        enrollment_count = %(enrollment_count)s,
-                        last_updated = %(last_updated)s,
-                        price_amount = %(price_amount)s,
-                        price_currency = %(price_currency)s,
-                        price_is_free = %(price_is_free)s,
-                        price_observed_at = now(),
-                        last_seen_at = now(),
-                        missed_cycles = 0,
-                        status = CASE WHEN status = 'stale' THEN 'active' ELSE status END,
-                        stale_since = CASE WHEN status = 'stale' THEN NULL ELSE stale_since END
-                     WHERE course_id = %(course_id)s
-                    """,
-                    row,
-                )
-                n += cur.rowcount
-        return n
+            # executemany rather than a Python loop of execute(): psycopg3
+            # pipelines it into one round trip instead of one per course. At 31
+            # courses that was invisible; at catalog scale it is thousands of
+            # round trips per cycle for an update that changes nothing else.
+            cur.executemany(_REFRESH_VOLATILE_SQL, params)
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def upsert_batch(self, rows: list[Any]) -> None:
         if not rows:
             return
+        # Canonical rows first: a duplicate's FK points at one of them, so the
+        # order is a correctness requirement, not a nicety. Within each half the
+        # writes are independent, so they pipeline.
         ordered = sorted(rows, key=lambda r: r.duplicate_of is not None)
+        canonical = [_row_params(r) for r in ordered if r.duplicate_of is None]
+        duplicates = [_row_params(r) for r in ordered if r.duplicate_of is not None]
         conn = self.connect()
         with conn.cursor() as cur:
-            for row in ordered:
-                cur.execute(_UPSERT_SQL, _row_params(row))
+            for group in (canonical, duplicates):
+                if group:
+                    cur.executemany(_UPSERT_SQL, group)
 
     def find_neardup_candidates(
         self, embedding: list[float], *, recent_days: int, limit: int, exclude_id: str
@@ -361,6 +363,59 @@ class CourseStore:
             cur.execute(sql, params)
             return cur.rowcount
 
+    def supply_vs_demand(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        """In-demand skills and how much course supply exists for each.
+
+        Joins on ``concept_supply_stats``, NOT ``skill_supply_stats``: the latter
+        is keyed by raw skill_key and several keys map to one ESCO concept, so
+        joining it fans out — measured on the live corpus, 131 matched concepts
+        produced 273 rows and inflated summed demand from 237 to 407 (+72%).
+
+        Framed as COVERAGE, not a ratio. Demand is a flow (vacancies open in a
+        window); supply is a stock (courses that exist). "27 jobs want this, 3
+        courses teach it" has no ratio interpretation — one course serves
+        unlimited learners — so the useful question is whether a needed skill is
+        taught at all, and how thinly.
+        """
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH latest_demand AS (
+                    -- Grouped by CONCEPT only. Adding `skill` to the GROUP BY
+                    -- splits one concept back into its raw phrasings and prints
+                    -- the same skill twice with two demand figures — the very
+                    -- fan-out this report exists to avoid, one level up.
+                    SELECT esco_code,
+                           mode() WITHIN GROUP (ORDER BY skill) AS skill,
+                           sum(frequency_count) AS demand
+                      FROM skill_demand_stats
+                     WHERE window_end = (SELECT max(window_end) FROM skill_demand_stats)
+                       AND esco_code IS NOT NULL
+                     GROUP BY esco_code
+                ),
+                latest_supply AS (
+                    SELECT esco_code, label, course_count, provider_count, total_courses
+                      FROM concept_supply_stats
+                     WHERE window_end = (SELECT max(window_end) FROM concept_supply_stats)
+                )
+                SELECT COALESCE(s.label, d.skill) AS skill,
+                       d.demand,
+                       COALESCE(s.course_count, 0) AS supply,
+                       COALESCE(s.provider_count, 0) AS providers,
+                       (s.esco_code IS NULL OR s.course_count = 0) AS uncovered
+                  FROM latest_demand d
+                  LEFT JOIN latest_supply s USING (esco_code)
+                 -- Ranked by demand alone. Splitting covered from uncovered is
+                 -- the caller's job: ordering uncovered first here would let it
+                 -- consume the whole LIMIT and hide every taught skill.
+                 ORDER BY d.demand DESC, skill
+                 LIMIT %(k)s
+                """,
+                {"k": limit},
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def scalar(self, sql: str, params: dict[str, Any] | None = None) -> Any:
         conn = self.connect()
         with conn.cursor() as cur:
@@ -423,6 +478,26 @@ class CourseStore:
             return cur.rowcount
 
 
+_REFRESH_VOLATILE_SQL = """
+UPDATE courses SET
+    rating            = CASE WHEN %(volatile_observed)s THEN %(rating)s ELSE rating END,
+    review_count      = CASE WHEN %(volatile_observed)s THEN %(review_count)s ELSE review_count END,
+    enrollment_count  = CASE WHEN %(volatile_observed)s THEN %(enrollment_count)s
+                             ELSE enrollment_count END,
+    last_updated      = CASE WHEN %(volatile_observed)s THEN %(last_updated)s ELSE last_updated END,
+    price_amount      = CASE WHEN %(volatile_observed)s THEN %(price_amount)s ELSE price_amount END,
+    price_currency    = CASE WHEN %(volatile_observed)s THEN %(price_currency)s
+                             ELSE price_currency END,
+    price_is_free     = CASE WHEN %(volatile_observed)s THEN %(price_is_free)s ELSE price_is_free END,
+    price_observed_at = CASE WHEN %(volatile_observed)s THEN now() ELSE price_observed_at END,
+    last_seen_at      = now(),
+    missed_cycles     = 0,
+    status            = CASE WHEN status = 'stale' THEN 'active' ELSE status END,
+    stale_since       = CASE WHEN status = 'stale' THEN NULL ELSE stale_since END
+ WHERE course_id = %(course_id)s
+"""
+
+
 _UPSERT_SQL = """
 INSERT INTO courses (
     course_id, source, source_group, source_type, source_url,
@@ -453,10 +528,25 @@ ON CONFLICT (course_id) DO UPDATE SET
     review_reason = EXCLUDED.review_reason, duplicate_of = EXCLUDED.duplicate_of,
     attribution = EXCLUDED.attribution, license = EXCLUDED.license,
     extraction_model = EXCLUDED.extraction_model, embedding = EXCLUDED.embedding,
-    rating = EXCLUDED.rating, review_count = EXCLUDED.review_count,
-    enrollment_count = EXCLUDED.enrollment_count, last_updated = EXCLUDED.last_updated,
-    price_amount = EXCLUDED.price_amount, price_currency = EXCLUDED.price_currency,
-    price_is_free = EXCLUDED.price_is_free, price_observed_at = now(),
+    -- Volatile columns follow the same rule as refresh_volatile: a fetch that
+    -- did not observe them must not erase what is stored. A course's TEXT can
+    -- change (re-extracted here) while its rating lookup failed, so these two
+    -- halves of the row are gated independently.
+    rating = CASE WHEN %(volatile_observed)s THEN EXCLUDED.rating ELSE courses.rating END,
+    review_count = CASE WHEN %(volatile_observed)s THEN EXCLUDED.review_count
+                        ELSE courses.review_count END,
+    enrollment_count = CASE WHEN %(volatile_observed)s THEN EXCLUDED.enrollment_count
+                            ELSE courses.enrollment_count END,
+    last_updated = CASE WHEN %(volatile_observed)s THEN EXCLUDED.last_updated
+                        ELSE courses.last_updated END,
+    price_amount = CASE WHEN %(volatile_observed)s THEN EXCLUDED.price_amount
+                        ELSE courses.price_amount END,
+    price_currency = CASE WHEN %(volatile_observed)s THEN EXCLUDED.price_currency
+                          ELSE courses.price_currency END,
+    price_is_free = CASE WHEN %(volatile_observed)s THEN EXCLUDED.price_is_free
+                         ELSE courses.price_is_free END,
+    price_observed_at = CASE WHEN %(volatile_observed)s THEN now()
+                             ELSE courses.price_observed_at END,
     last_seen_at = now(), missed_cycles = 0, stale_since = NULL
 """
 
@@ -475,4 +565,5 @@ def _row_params(row: Any) -> dict[str, Any]:
         "enrollment_count": row.enrollment_count, "last_updated": row.last_updated,
         "price_amount": row.price_amount, "price_currency": row.price_currency,
         "price_is_free": row.price_is_free,
+        "volatile_observed": bool(getattr(row, "volatile_observed", False)),
     }

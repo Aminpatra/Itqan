@@ -24,6 +24,7 @@ from typing import Any, Iterator, Optional
 
 from .config import Config
 from .contracts import CourseCandidate, CoursePrice
+from .skill_match import covers_skill, tokens
 
 # ---------------------------------------------------------------------------
 # The eligibility predicate — single source of truth (imported by aggregate.py).
@@ -69,12 +70,17 @@ SELECT DISTINCT m.esco_uri AS matched, {_COURSE_COLUMNS}
  ORDER BY matched, c.course_id
 """
 
+# The unmapped fallback. Postgres narrows to courses sharing at least one token
+# with a requested key; Python then applies the whole-token containment rule, so
+# the loosening is auditable in one place rather than buried in SQL. `matched` is
+# resolved caller-side because one course can answer several requested keys.
 _BY_KEY_SQL = f"""
 SELECT DISTINCT lower(btrim(ts.skill)) AS matched, {_COURSE_COLUMNS}
   FROM courses c
   JOIN LATERAL unnest(c.taught_skills) AS ts(skill) ON true
  WHERE {AGGREGABLE_COURSE_PREDICATE}
-   AND lower(btrim(ts.skill)) = ANY(%(keys)s)
+   AND (lower(btrim(ts.skill)) = ANY(%(keys)s)
+        OR lower(btrim(ts.skill)) LIKE ANY(%(patterns)s))
  ORDER BY matched, c.course_id
 """
 
@@ -109,11 +115,63 @@ def courses_for_skills(
                     by_esco.setdefault(row["matched"], []).append(_candidate(row))
         if skill_keys:
             with conn.cursor() as cur:
-                cur.execute(_BY_KEY_SQL, {"keys": list(skill_keys)})
-                for row in cur.fetchall():
-                    by_key.setdefault(row["matched"], []).append(_candidate(row))
+                cur.execute(_BY_KEY_SQL, {
+                    "keys": list(skill_keys),
+                    "patterns": [f"%{_longest_token(k)}%" for k in skill_keys],
+                })
+                rows = cur.fetchall()
+            # 84% of course skills never map to an ESCO concept (measured on the
+            # live corpus), so this fallback carries most of the retrieval — and
+            # exact-string-only meant a gap in "problem-solving skills" found
+            # nothing while a "problem solving" course sat unread.
+            #
+            # CONTAINMENT IS A FALLBACK WITHIN THE FALLBACK: it runs only for a
+            # skill with no exact match at all. Measured on the real corpus, a gap
+            # in "project management" matches exactly AND drags in "environmental
+            # project management" and "project management office" — neither wrong
+            # exactly, but Agent E's tiebreak scores candidates on rating, so a
+            # loosely-related course can outrank the exact one. Widening only
+            # where the shelf is otherwise empty means it can add coverage and
+            # never dilute it.
+            seen: dict[str, set[str]] = {k: set() for k in skill_keys}
+            for row in rows:
+                if row["matched"] in by_key:
+                    key = row["matched"]
+                    if row["course_id"] not in seen[key]:
+                        seen[key].add(row["course_id"])
+                        by_key[key].append(_candidate(row))
 
+            for key in skill_keys:
+                if by_key[key]:
+                    continue        # an exact match exists; do not widen
+                for row in rows:
+                    if covers_skill(row["matched"], key) and row["course_id"] not in seen[key]:
+                        seen[key].add(row["course_id"])
+                        by_key[key].append(_candidate(row))
+
+    # Deterministic order regardless of which taught-skill phrasing matched.
+    for bucket in by_key.values():
+        bucket.sort(key=lambda c: c.course_id)
+
+    # A safety valve, not a filter. Set high enough that it does not bind on a
+    # realistic corpus (no single skill is taught by 200 distinct courses here),
+    # so that a catalog-scale ingest cannot turn one recommendation into tens of
+    # thousands of materialized rows. NOTE: if it ever does bind, Agent E's
+    # `courses_available` saturates at this number rather than being exact —
+    # which is why it is set well above where a real answer lives.
+    cap = config.agent_e_max_candidates_per_skill
+    for bucket in (by_esco, by_key):
+        for key, courses in bucket.items():
+            if len(courses) > cap:
+                bucket[key] = courses[:cap]
     return {"by_esco": by_esco, "by_key": by_key}
+
+
+def _longest_token(key: str) -> str:
+    """The token Postgres pre-filters on. Longest = most selective; the real
+    decision is `covers_skill`, this only avoids scanning every course."""
+    parts = tokens(key)
+    return max(parts, key=len) if parts else key
 
 
 def _candidate(row: dict[str, Any]) -> CourseCandidate:

@@ -94,7 +94,8 @@ def test_refresh_volatile_updates_price_and_rating_without_touching_embedding(st
     store.connect().commit()
 
     store.refresh_volatile([{
-        "course_id": "c", "rating": 4.8, "review_count": 500, "enrollment_count": 9000,
+        "course_id": "c", "volatile_observed": True,
+        "rating": 4.8, "review_count": 500, "enrollment_count": 9000,
         "last_updated": None, "price_amount": 0.0, "price_currency": None, "price_is_free": True,
     }])
     store.connect().commit()
@@ -109,6 +110,38 @@ def test_refresh_volatile_updates_price_and_rating_without_touching_embedding(st
     assert row["price_is_free"] is True and float(row["price_amount"]) == 0.0
     assert row["price_observed_at"] is not None
     assert row["embedding"] is not None, "refresh_volatile disturbed the embedding"
+
+
+def test_an_unobserved_refresh_preserves_the_stored_quality_signals(store):
+    """THE regression that matters: enrichment failing must not erase good data.
+
+    A robots refusal, a timeout or a Coursera layout change yields a course with
+    every volatile field None. Writing those Nones destroyed ratings the system
+    could not re-derive — and silently, because the row still looked fine. On the
+    live corpus 426 of 676 courses already had no rating; one bad cycle would
+    have taken the remaining 250.
+    """
+    vec = [0.25] * 1536
+    store.upsert_batch([_row("c", embedding=vec, rating=4.7)])
+    store.connect().commit()
+
+    # Exactly what a failed enrichment produces: nothing observed, all None.
+    store.refresh_volatile([{
+        "course_id": "c", "volatile_observed": False,
+        "rating": None, "review_count": None, "enrollment_count": None,
+        "last_updated": None, "price_amount": None, "price_currency": None,
+        "price_is_free": None,
+    }])
+    store.connect().commit()
+
+    conn = store.connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT rating, last_seen_at, missed_cycles FROM courses WHERE course_id='c'")
+        row = cur.fetchone()
+    assert float(row["rating"]) == 4.7, "a failed lookup erased a stored rating"
+    # The seen/staleness touch still applies — the course WAS observed to exist,
+    # we just could not read its page.
+    assert row["missed_cycles"] == 0
 
 
 def test_neardup_similarity_direction(store):
@@ -168,6 +201,105 @@ def test_supply_counts_courses_and_fills_esco_code(store):
     assert row["provider_count"] == 2               # IBM + Google
     assert row["esco_code"].endswith("/0004")       # accounting concept
     assert row["low_confidence"] is True            # 2 < course_low_confidence_min_courses (3)
+
+
+def test_a_course_older_than_the_window_is_still_supply(store):
+    """SUPPLY IS A STOCK, NOT A FLOW. The aggregation copied Agent B's
+    posting-date window, which is right for vacancies (one from 90 days ago is
+    not current demand) and wrong for courses (one from 90 days ago still teaches
+    what it teaches). With the filter in place, every course would have dropped
+    out of the table 90 days after we first saw it and course_count would decay
+    toward zero while nothing about the real supply changed — on the live corpus,
+    starting 2026-10-22.
+    """
+    _sync_esco(store)
+    store.upsert_batch([_row("ancient", taught_skills=["accounting"])])
+    with store.connect().cursor() as cur:
+        # Older than course_window_days (90) — and still an active, listed course.
+        cur.execute("UPDATE courses SET first_seen_at = now() - interval '200 days' "
+                    "WHERE course_id = 'ancient'")
+    store.connect().commit()
+
+    map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    with store.connect().cursor() as cur:
+        cur.execute("SELECT course_count FROM skill_supply_stats WHERE skill_key='accounting'")
+        row = cur.fetchone()
+    assert row is not None, "a course aged out of the supply table it should still be in"
+    assert row["course_count"] == 1
+
+
+def test_a_rerun_clears_rows_it_no_longer_reproduces(store):
+    """`replace_stats_window` never replaced: it only INSERT..ON CONFLICTed, so a
+    skill whose last course disappeared kept its row and was served forever as
+    current supply. Agent B measured 114 such phantom rows before its own fix."""
+    _sync_esco(store)
+    store.upsert_batch([_row("a", taught_skills=["accounting", "data analysis"])])
+    store.connect().commit()
+    map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    with store.connect().cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM skill_supply_stats WHERE window_end=%s", (AS_OF,))
+        assert cur.fetchone()["n"] == 2
+
+    # The course now teaches only one of them; the other has no supply at all.
+    store.upsert_batch([_row("a", taught_skills=["accounting"])])
+    store.connect().commit()
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    with store.connect().cursor() as cur:
+        cur.execute("SELECT skill_key FROM skill_supply_stats WHERE window_end=%s", (AS_OF,))
+        keys = {r["skill_key"] for r in cur.fetchall()}
+    assert keys == {"accounting"}, f"a phantom row survived the rerun: {keys}"
+
+
+def test_the_supply_count_publishes_its_denominator(store):
+    """`course_count = 3` is uninterpretable without "out of how many" — the same
+    omission Agent B's audit fixed with sector_volume."""
+    _sync_esco(store)
+    store.upsert_batch([
+        _row("a", taught_skills=["accounting"]),
+        _row("b", taught_skills=["data analysis"], source_url="https://c.test/b"),
+    ])
+    store.connect().commit()
+    map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    with store.connect().cursor() as cur:
+        cur.execute("SELECT course_count, total_courses, courses_without_provider "
+                    "FROM skill_supply_stats WHERE skill_key='accounting'")
+        row = cur.fetchone()
+    assert row["course_count"] == 1 and row["total_courses"] == 2
+
+
+def test_one_concept_counts_a_course_once_however_many_ways_it_phrases_it(store):
+    """The fan-out fix. skill_supply_stats is keyed by skill_key and several keys
+    map to one ESCO concept (measured: one concept carried SEVEN), so the
+    documented `USING (esco_code)` join multiplied — 131 matched concepts became
+    273 rows and inflated summed demand 237 -> 407 (+72%). No rollup of the skill
+    grain can fix that: summing double-counts a course teaching two phrasings,
+    max undercounts. The concept grain counts DISTINCT courses instead.
+    """
+    _sync_esco(store)
+    # One course, one concept, two phrasings that both map to it.
+    store.upsert_batch([_row("a", taught_skills=["accounting", "Accounting"])])
+    store.connect().commit()
+    map_new_course_skills(store, FakeEmbedder(), _cfg(store))
+    with store.transaction():
+        recompute_supply(store, Config(), as_of=AS_OF)
+
+    with store.connect().cursor() as cur:
+        cur.execute("SELECT esco_code, course_count, variant_keys FROM concept_supply_stats "
+                    "WHERE window_end=%s AND esco_code LIKE %s", (AS_OF, "%/0004"))
+        rows = cur.fetchall()
+    assert len(rows) == 1, "one concept produced several supply rows"
+    assert rows[0]["course_count"] == 1, "one course was counted twice for phrasing it twice"
 
 
 def test_rejected_and_duplicate_courses_are_not_counted(store):

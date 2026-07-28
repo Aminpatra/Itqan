@@ -87,22 +87,68 @@ def make_scrape(deps: GraphDeps) -> Callable[[dict], dict]:
 def make_ingest(deps: GraphDeps) -> Callable[[CourseIngestState], dict]:
     def ingest(state: CourseIngestState) -> dict:
         outcomes = state.get("scraped", [])
-        healthy = [o["source"] for o in outcomes if o["result"].ok]
         partial = any(not o["result"].ok for o in outcomes)
         store = deps.store
-
-        with store.transaction():
-            store.age_missed(healthy)
-
         pipe = deps.pipeline()
         total = IngestSummary()
+        aged: list[str] = []
+        not_aged: list[str] = []
+        failures: list[str] = []
+
         for outcome in outcomes:
-            courses = list(outcome["result"].courses)
-            if not courses:
-                continue
-            with store.transaction():
-                total.merge(pipe.run(courses))
-        return {"ingest_summary": total.as_dict(), "partial_cycle": partial}
+            source = outcome["source"]
+            result = outcome["result"]
+            courses = list(result.courses)
+
+            # TWO independent conditions, and both must hold before a course can
+            # be aged toward deletion:
+            #   census            — can one cycle enumerate this source at all?
+            #   may_age_inventory — did THIS fetch actually read it all?
+            # An unknown source defaults to census=False: never age what we
+            # cannot account for.
+            try:
+                census = deps.config_by_name(source).census
+            except KeyError:
+                census = False
+            ageable = census and result.may_age_inventory
+
+            # Chunked so a large walk commits as it goes. One transaction for the
+            # whole source is right for a 40-posting feed and wrong for a 2,000
+            # course backfill: it holds a connection 'idle in transaction' for
+            # twenty minutes of LLM calls, blocks vacuum, and loses every course
+            # if the last one fails. Near-dup still works across the boundary —
+            # committed chunks are found by the store query instead of the
+            # in-batch scan.
+            size = max(1, getattr(deps.config, "course_ingest_chunk_size", 200))
+            chunks = [courses[i:i + size] for i in range(0, len(courses), size)] or [[]]
+
+            for n, chunk in enumerate(chunks):
+                try:
+                    # Ageing and the batch that resets it share ONE transaction.
+                    # Ageing used to commit first and separately, so an extraction
+                    # failure left the whole source aged with nothing reset — the
+                    # failure itself pushed live courses toward deletion.
+                    with store.transaction():
+                        if n == 0:
+                            if ageable:
+                                store.age_missed([source])
+                                aged.append(source)
+                            elif result.ok:
+                                not_aged.append(source)
+                        if chunk:
+                            total.merge(pipe.run(chunk))
+                except Exception as exc:  # noqa: BLE001 - one chunk must not sink the cycle
+                    failures.append(f"{source}[{n}]: {type(exc).__name__}: {exc}")
+
+        return {
+            "ingest_summary": total.as_dict(),
+            # An ingest failure is a partial cycle: the run reports it and the
+            # CLI exits non-zero, rather than looking clean because the fetch
+            # half succeeded.
+            "partial_cycle": partial or bool(failures),
+            "ingest_errors": failures,
+            "ageing": {"aged": aged, "not_aged": not_aged},
+        }
     return ingest
 
 
@@ -146,6 +192,26 @@ def make_runlog(deps: GraphDeps) -> Callable[[CourseIngestState], dict]:
             if since is not None and (now - since).days > LONG_DEGRADED_DAYS:
                 warnings.append(f"source {row['source']} degraded since {since.date()}")
 
+        # A page that loaded but yielded no rating is the signature of a layout
+        # change. It used to be indistinguishable from "this course has no
+        # rating", which is how a redesign could quietly blank the whole corpus.
+        for o in outcomes:
+            r = o["result"]
+            attempted = r.enriched + r.enrich_failed + r.enrich_unparsed
+            if attempted and r.enrich_unparsed / attempted > 0.5:
+                warnings.append(
+                    f"{o['source']}: {r.enrich_unparsed} of {attempted} quality-signal pages "
+                    f"loaded but matched nothing — the page layout has probably changed. "
+                    f"Stored ratings were preserved rather than overwritten.")
+
+        for source in (state.get("ageing") or {}).get("not_aged", []):
+            warnings.append(
+                f"{source}: this fetch was a sample, not a census, so its unseen courses "
+                f"were not aged. Absence here is not evidence a course was withdrawn.")
+
+        for message in state.get("ingest_errors") or []:
+            warnings.append(f"ingest batch lost: {message}")
+
         run_log = _assemble(state, outcomes, health_rows)
         path = _write(state, cfg, run_log)
         return {"source_health": health_rows, "run_log": run_log,
@@ -160,6 +226,13 @@ def _assemble(state, outcomes, health_rows) -> dict[str, Any]:
         "source": o["source"], "courses": len(o["result"].courses),
         "skipped": o["result"].skipped, "pages_fetched": o["result"].pages_fetched,
         "ok": o["result"].ok, "partial": o["result"].partial, "error": o["result"].error,
+        # Whether this fetch was a census, and the quality-signal telemetry that
+        # makes a silent enrichment failure visible.
+        "truncated": o["result"].truncated,
+        "may_age_inventory": o["result"].may_age_inventory,
+        "enriched": o["result"].enriched,
+        "enrich_failed": o["result"].enrich_failed,
+        "enrich_unparsed": o["result"].enrich_unparsed,
     } for o in outcomes]
     return {
         "run_id": state.get("run_id"),
@@ -168,6 +241,8 @@ def _assemble(state, outcomes, health_rows) -> dict[str, Any]:
         "partial_cycle": state.get("partial_cycle", False),
         "sources": per_source,
         "ingest": ingest,
+        "ingest_errors": state.get("ingest_errors", []),
+        "ageing": state.get("ageing", {}),
         "staleness": state.get("staleness_summary", {}),
         "aggregation": agg,
         "signals": {

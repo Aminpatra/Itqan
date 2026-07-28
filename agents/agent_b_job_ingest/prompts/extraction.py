@@ -62,8 +62,13 @@ sentence is about, not to copy the sentence. One skill per entry: a sentence \
 that bundles several requirements becomes several entries. Rules:
   * Name skills mentioned in the text ONLY — condensing is allowed, adding is not. \
 Do NOT include skills you assume the role needs but the posting never mentions.
-  * Keep proper nouns exactly as written (a tool, platform, standard, or \
-certification name is already canonical — never rename or generalise it).
+  * Keep a proper noun as the PRODUCT's own short name — never rename or \
+generalise it, but never carry a vendor prefix, edition, or version either. \
+These are ONE skill and must come out as one string: "MS Excel", "Microsoft \
+Excel" and "Excel" -> "excel"; "Python 3" and "Python3" -> "python"; "Oracle \
+Database 19c" -> "oracle database". Renaming is still forbidden: "PyTorch" \
+never becomes "deep learning framework". This is what lets a demand count and a \
+course's supply count be the same concept instead of three near-identical rows.
   * "Demonstrated ability to <verb> <object> ..." names the skill "<object> \
 <verb-noun>" — e.g. a sentence about coordinating with clients and management \
 is the skill "stakeholder coordination"; one about preparing budgets is \

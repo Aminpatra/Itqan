@@ -228,10 +228,14 @@ class FakeStructuredLLM:
             # Scan ONLY the course text, not the whole prompt — the system
             # message lists example skills ("python", "machine learning") that
             # would otherwise leak into every extraction and defeat the
-            # "no skills -> rejected" path. The human template puts the course
-            # after "DESCRIPTION:".
+            # "no skills -> rejected" path. Anchored on the prompt's data fence
+            # rather than a prose label, since the fence exists precisely to mark
+            # where untrusted course text begins and ends.
             full = str(payload)
-            body = full.split("DESCRIPTION:", 1)[-1].casefold() if "DESCRIPTION:" in full else full.casefold()
+            if "<<<COURSE_TEXT" in full:
+                body = full.split("<<<COURSE_TEXT", 1)[-1].split("COURSE_TEXT", 1)[0].casefold()
+            else:
+                body = full.casefold()
             skills = [s for s in ("python", "sql", "machine learning", "web design")
                       if s in body]
             level = "beginner" if "beginner" in body or "basics" in body else None

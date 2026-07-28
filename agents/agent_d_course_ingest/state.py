@@ -21,6 +21,12 @@ class CourseIngestState(TypedDict, total=False):
     scraped: Annotated[list[dict[str, Any]], operator.add]
 
     ingest_summary: dict[str, Any]
+    # Per-source batch failures (one bad course no longer costs a source's
+    # batch, and a lost batch is reported rather than silently absent).
+    ingest_errors: list[str]
+    # {"aged": [...], "not_aged": [...]} — which sources were trustworthy enough
+    # a census to age their unseen inventory this cycle, and which were not.
+    ageing: dict[str, Any]
     staleness_summary: dict[str, Any]
     aggregation_summary: dict[str, Any]
     source_health: list[dict[str, Any]]

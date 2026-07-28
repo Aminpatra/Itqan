@@ -50,6 +50,11 @@ class PersistedCourse:
     price_amount: Optional[float] = None
     price_currency: Optional[str] = None
     price_is_free: Optional[bool] = None
+    # False = this cycle did not successfully read the provider's quality/price
+    # signals, so the store must keep whatever it already holds instead of
+    # writing these Nones over it. Not a column: it governs the write, it is not
+    # part of the record.
+    volatile_observed: bool = False
 
     extraction_model: Optional[str] = None
     embedding: Optional[list[float]] = None

@@ -7,6 +7,7 @@ and, at runtime, the shared ESCO taxonomy synced by ``agent-b --esco-sync``.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 
 from shared.config import Config
@@ -35,6 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     ops.add_argument("--migrate", action="store_true", help="Apply pending migrations and exit")
     ops.add_argument("--check", action="store_true", help="Report DB/schema/row counts and exit")
     ops.add_argument("--purge-source", metavar="SOURCE", help="Delete a decommissioned source's courses")
+    ops.add_argument("--supply-report", action="store_true",
+                     help="In-demand skills and how much course supply exists for each "
+                          "(the demand-vs-supply payoff), then exit")
+    ops.add_argument("--backfill", type=int, metavar="N",
+                     help="Walk the catalog past the per-cycle page cap until N courses "
+                          "have been ingested. Quality-signal enrichment is skipped (it is "
+                          "the slow part) and fills in on later cycles")
     return p
 
 
@@ -174,6 +182,53 @@ def _run_loop(config: Config, args) -> int:
         print("\n  stopped.\n"); return 0
 
 
+def _supply_report(config: Config, args) -> int:
+    """The demand-vs-supply payoff, as a command rather than a README snippet.
+
+    The snippet joined skill_supply_stats USING (esco_code), which fans out
+    because several raw skill keys map to one concept. This reads the concept
+    grain, where a course is counted once per concept by construction.
+    """
+    from shared.display import arabize
+
+    from .db import CourseStore
+
+    try:
+        store = CourseStore.from_config(config)
+    except RuntimeError as exc:
+        print(f"  {exc}", file=sys.stderr); return 2
+    try:
+        with store:
+            rows = store.supply_vs_demand(limit=400)
+    except Exception as exc:
+        print(f"\n  could not read the tables: {exc}\n", file=sys.stderr); return 2
+    finally:
+        store.close()
+
+    if not rows:
+        print("  no overlap yet — run agent-b (demand) and agent-d (supply), and\n"
+              "  `agent-b --esco-sync` so both sides share a vocabulary.\n")
+        return 0
+
+    uncovered = [r for r in rows if r["uncovered"]]
+    print("  in-demand skills with NO course supply (the real market gap):")
+    for r in uncovered[:10]:
+        print(f"    demand {r['demand']:>4}   {arabize(str(r['skill'])[:48])}")
+    if not uncovered:
+        print("    (none — every in-demand concept has at least one course)")
+
+    covered = [r for r in rows if not r["uncovered"]]
+    if covered:
+        print("\n  taught, thinnest first:")
+        for r in sorted(covered, key=lambda x: x["supply"])[:10]:
+            print(f"    demand {r['demand']:>4}  supply {r['supply']:>3} course(s) "
+                  f"from {r['providers']} provider(s)   {arabize(str(r['skill'])[:40])}")
+    print("\n  Demand is a flow (vacancies in a window); supply is a stock (courses that\n"
+          "  exist). These are not a ratio — read it as coverage: is a needed skill\n"
+          "  taught at all, and by how few.\n")
+    return 0
+
+
 def _purge_source(config: Config, args) -> int:
     from .db import CourseStore
     try:
@@ -201,10 +256,21 @@ def main(argv: list[str] | None = None) -> int:
         return _check(config)
     if args.purge_source:
         return _purge_source(config, args)
+    if args.supply_report:
+        return _supply_report(config, args)
     if args.dry_run:
         return _dry_run(config, args)
     if args.loop:
         return _run_loop(config, args)
+    if args.backfill:
+        # Enough pages to reach the requested count, with headroom: the English
+        # filter drops a large share of each page, so pages != courses.
+        pages = max(1, (args.backfill // max(1, config.coursera_page_size)) * 3 + 2)
+        config = dataclasses.replace(config, course_backfill_pages=pages)
+        args.limit = args.backfill
+        print(f"  BACKFILL: walking up to {pages} catalog pages for ~{args.backfill} courses.")
+        print(f"  Quality signals (rating/reviews) are skipped here and fill in on")
+        print(f"  later normal cycles — the page fetch is the slow part.\n")
     return _run_once(config, args)
 
 

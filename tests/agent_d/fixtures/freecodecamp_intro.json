@@ -1,0 +1,46 @@
+{
+  "responsive-web-design": {
+    "title": "Responsive Web Design",
+    "intro": [
+      "In this Responsive Web Design Certification, you'll learn the languages that developers use to build webpages:",
+      "HTML for content, and CSS for design."
+    ],
+    "blocks": {
+      "basic-html-and-html5": {
+        "title": "Basic HTML and HTML5",
+        "intro": ["HTML is a markup language that describes the structure of a webpage."]
+      },
+      "basic-css": {
+        "title": "Basic CSS",
+        "intro": ["CSS tells the browser how to display the content you added with HTML."]
+      }
+    }
+  },
+  "2022/responsive-web-design": {
+    "title": "Legacy Responsive Web Design V8",
+    "intro": ["The previous version of the Responsive Web Design certification."],
+    "blocks": {
+      "build-a-tribute-page-project": {"title": "Tribute Page"}
+    }
+  },
+  "machine-learning-with-python": {
+    "title": "Machine Learning with Python",
+    "intro": ["In this course you'll learn about machine learning and neural networks."],
+    "blocks": {
+      "tensorflow": {"title": "TensorFlow"},
+      "how-neural-networks-work": {"title": "How Neural Networks Work"}
+    }
+  },
+  "css-flexbox": {
+    "title": "Learn CSS Flexbox",
+    "intro": ["Flexbox is a CSS layout model for arranging items in one dimension."],
+    "blocks": {
+      "flex-basics": {"title": "Flexbox Basics"},
+      "flex-alignment": {"title": "Flexbox Alignment"}
+    }
+  },
+  "misc-text": {
+    "title": null,
+    "blocks": {}
+  }
+}

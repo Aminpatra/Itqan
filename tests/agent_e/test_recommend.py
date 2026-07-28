@@ -283,3 +283,41 @@ def test_greedy_prefers_the_course_that_covers_more_weight():
                                         ("rating", "review_count", "last_updated", "price"))
     assert assigned == {"a": ["s1", "s2"], "b": ["s3"]}
     assert no_course == []
+
+
+# ---------------------------------------------------------------------------
+# thin supply — Agent D's aggregation, finally with a consumer
+# ---------------------------------------------------------------------------
+def test_a_recommendation_says_how_much_supply_stands_behind_it(tmp_path):
+    """'One obscure course exists' and 'forty courses teach this' are very
+    different situations behind the same single recommendation, and only one of
+    them is a safe plan. The depth costs nothing: retrieval already fetched every
+    eligible course per skill."""
+    plenty = [cc(f"c{i}", f"Course {i}", rating=4.0) for i in range(5)]
+    reader = FakeReader(by_esco={"uri:P": plenty, "uri:R": [cc("solo", "Only One")]})
+    _, out, _ = run_graph(tmp_path, [detail("python", "uri:P", 9.0),
+                                     detail("rare skill", "uri:R", 8.0)], reader=reader)
+
+    by_skill = {r["skill"]: r for r in out["recommendations"]}
+    assert by_skill["python"]["supply"] == {"courses_available": 5, "thin": False}
+    assert by_skill["rare skill"]["supply"] == {"courses_available": 1, "thin": True}
+
+
+def test_a_skill_nothing_teaches_reports_zero_supply_explicitly(tmp_path):
+    """`course: null` implies it, but a consumer should not have to infer a
+    zero."""
+    _, out, _ = run_graph(tmp_path, [detail("welding", "uri:W", 5.0)],
+                          reader=FakeReader(by_esco={}))
+    assert out["recommendations"][0]["supply"] == {"courses_available": 0, "thin": True}
+
+
+def test_the_rationale_is_told_the_field_is_thin_but_never_an_internal_number(tmp_path):
+    llm = FakePlainLLM()
+    _, out, llm = run_graph(tmp_path, [detail("rare skill", "uri:R", 8.0)],
+                            reader=FakeReader(by_esco={"uri:R": [cc("solo", "Only One")]}),
+                            llm=llm)
+    _system, human = llm.calls[0]
+    assert "few courses cover this skill" in human
+    # The standing fence still holds: no internal identifiers reach the model.
+    for forbidden in ("ESCO", "esco", "gap_score", "priority_score", "uri:R", "8.0"):
+        assert forbidden not in human, f"{forbidden!r} leaked into the rationale prompt"

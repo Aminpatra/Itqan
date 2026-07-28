@@ -146,10 +146,30 @@ class Config:
     course_cycle_hours: int = 72
     course_stale_after_cycles: int = 3
     course_prune_after_days: int = 60
-    course_window_days: int = 90         # supply moves slowly; a wider window than jobs
+    # The supply snapshot's nominal span. NOTE this does NOT filter which courses
+    # are counted: supply is a STOCK (a course from last year still teaches its
+    # skills), unlike demand, which is a flow of vacancies open in a window. It
+    # once did filter, which would have silently emptied the table as the corpus
+    # aged past it. See aggregate.py.
+    course_window_days: int = 90
     # A skill taught by fewer than this many courses is real but thin supply.
+    # Also what Agent E calls "thin" when flagging a recommendation.
     course_low_confidence_min_courses: int = 3
     course_neardup_recent_days: int = 30
+    # Below this many characters of name+description there is nothing to extract
+    # from, and the call is skipped rather than spent finding that out. Generous:
+    # freeCodeCamp's one-line descriptions are real courses and must pass.
+    course_min_text_chars: int = 30
+    # Safety valve on how many candidate courses one missing skill may pull back.
+    # Deliberately far above any realistic answer, so it never shapes a
+    # recommendation — it only stops a catalog-scale corpus from materializing
+    # tens of thousands of rows for a single gap.
+    agent_e_max_candidates_per_skill: int = 200
+    # Courses per committed transaction. A normal cycle is well under this and
+    # commits once; a backfill commits as it walks, so a failure at course 1,900
+    # costs one chunk instead of the whole run, and no connection sits 'idle in
+    # transaction' for twenty minutes of LLM calls.
+    course_ingest_chunk_size: int = 200
     # Coursera's public catalog page size; also the freeCodeCamp cert cap.
     coursera_max_pages: int = 8
     coursera_page_size: int = 100
@@ -159,6 +179,12 @@ class Config:
     # skip and leave those fields NULL for Coursera.
     coursera_enrich: bool = True
     coursera_enrich_interval_s: float = 1.0
+    # Set by `agent-d --backfill N` for one run: how many catalog pages to walk,
+    # overriding coursera_max_pages. None outside a backfill. When set, the
+    # per-course quality-signal page fetch is skipped — the API pass costs about
+    # $0.0001 per course, while the enrichment fetch is ~1MB at a polite interval
+    # each and would dominate a large walk. Those fields fill in on later cycles.
+    course_backfill_pages: Optional[int] = None
 
     # --- ESCO mapping ---
     # Minimum cosine similarity for an embedding-based skill->ESCO mapping.

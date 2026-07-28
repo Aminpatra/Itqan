@@ -56,12 +56,24 @@ class CourseraAdapter(BaseAdapter):
         is_known_unchanged=None,
         page_client: PoliteClient | None = None,
         robots: RobotsPolicy | None = None,
+        start_at: str | None = None,
+        max_pages: int | None = None,
+        enrich: bool | None = None,
     ) -> None:
         super().__init__(name=name, source_group=source_group)
         self.config = config or Config()
         self.base_url = base_url.rstrip("/")
         self._client = client
         self._is_known_unchanged = is_known_unchanged
+        # Backfill controls (see cli --backfill). `start_at` resumes from a saved
+        # cursor so a long catalog walk survives being interrupted; `max_pages`
+        # overrides the per-cycle cap; `enrich` can defer the ~1MB-per-course
+        # page fetch, which is the binding cost of a large walk. After a fetch,
+        # `next_cursor` holds where to resume.
+        self.start_at = start_at
+        self.max_pages = max_pages
+        self.next_cursor: str | None = None
+        self._enrich_enabled = enrich
         # A SECOND client on www.coursera.org for the enrichment page scrape.
         # The API is terms-governed (no robots check); the page scrape IS a
         # scrape, so it goes through robots — consistent with the consent split.
@@ -83,10 +95,11 @@ class CourseraAdapter(BaseAdapter):
 
     def _fetch(self, result: AdapterResult, *, limit: int | None) -> None:
         client = self._ensure_client()
-        start = "0"
+        start = str(self.start_at or "0")
         seen: set[str] = set()
+        max_pages = self.max_pages if self.max_pages is not None else self.config.coursera_max_pages
 
-        for _ in range(self.config.coursera_max_pages):
+        for _ in range(max_pages):
             params = {
                 "start": start,
                 "limit": str(self.config.coursera_page_size),
@@ -114,6 +127,10 @@ class CourseraAdapter(BaseAdapter):
             partners = _partner_names(data)
             elements = data.get("elements") or []
             if not elements:
+                # A catalog page that loaded but listed nothing is a shape change,
+                # not an empty catalog — 23,101 courses do not vanish. Failing
+                # loudly stops staleness treating it as "everything is gone".
+                result.anchor_missed("the catalog response (no elements)")
                 return
 
             for el in elements:
@@ -126,16 +143,25 @@ class CourseraAdapter(BaseAdapter):
                 seen.add(course.source_url)
                 if self._is_known_unchanged and self._is_known_unchanged(course):
                     continue
-                if self.config.coursera_enrich:
-                    course = self._enrich(course, el.get("slug"))
+                enrich = (self.config.coursera_enrich if self._enrich_enabled is None
+                          else self._enrich_enabled)
+                if enrich:
+                    course = self._enrich(course, el.get("slug"), result)
                 result.courses.append(course)
                 if limit is not None and len(result.courses) >= limit:
                     return
 
             nxt = (data.get("paging") or {}).get("next")
             if not nxt:
-                return
+                return          # the catalog genuinely ended: a complete pass
             start = str(nxt)
+            self.next_cursor = start
+
+        # The page loop was exhausted while the catalog still had a `next`
+        # cursor: OUR cap stopped us, not the source. Without this the fetch
+        # looked like a clean census of 23,101 courses in 800, and staleness
+        # aged every course we simply had not paged to yet.
+        result.truncated = True
 
     def _parse(self, el: dict, partners: dict[str, str]) -> RawCourse | None:
         slug = (el.get("slug") or "").strip()
@@ -186,13 +212,20 @@ class CourseraAdapter(BaseAdapter):
             self._robots = RobotsPolicy(self._page_client, user_agent=self.config.user_agent)
         return self._page_client
 
-    def _enrich(self, course: RawCourse, slug: str | None) -> RawCourse:
+    def _enrich(self, course: RawCourse, slug: str | None,
+                result: AdapterResult) -> RawCourse:
         """Fetch the course page and add rating / review_count / enrollment_count.
 
-        Best-effort and fully guarded: robots refusal, a fetch error, or a parse
-        miss all leave the field None and return the course unchanged rather than
-        dropping it. price / last_updated stay None — Coursera's page exposes
-        neither (subscription pricing; no last-updated field)."""
+        Best-effort and fully guarded — but the guard now records WHY it gave up,
+        because "this course has no rating" and "we could not read the page" were
+        previously the same output (all fields None), and the store then wrote
+        those Nones over good stored values. Only a fetch that actually parsed
+        something sets ``volatile_observed``; everything else leaves the stored
+        value alone.
+
+        price / last_updated stay None — Coursera's page exposes neither
+        (subscription pricing; no last-updated field).
+        """
         if not slug:
             return course
         page_url = COURSE_URL.format(slug=slug)
@@ -200,18 +233,33 @@ class CourseraAdapter(BaseAdapter):
         assert self._robots is not None
         try:
             if not self._robots.can_fetch(page_url):
+                result.enrich_failed += 1
                 return course
             html = client.get_text(page_url)
         except (Blocked, ResponseTooLarge):
+            result.enrich_failed += 1
             return course
         except Exception:  # noqa: BLE001 - enrichment must never sink a course
+            result.enrich_failed += 1
             return course
 
+        rating = _parse_rating(html)
+        reviews = _parse_int(_REVIEWS, html)
+        enrolled = _parse_int(_ENROLL, html)
+        if rating is None and reviews is None and enrolled is None:
+            # The page loaded and NOTHING matched. A live Coursera course page
+            # carries a JSON-LD rating, so this is far more likely a layout
+            # change than three genuinely absent facts. Treated as "did not
+            # observe" so it cannot erase stored values, and counted so a spike
+            # reads as "Coursera changed" instead of "no course has a rating".
+            result.enrich_unparsed += 1
+            return course
+
+        result.enriched += 1
         return dataclasses.replace(
             course,
-            rating=_parse_rating(html),
-            review_count=_parse_int(_REVIEWS, html),
-            enrollment_count=_parse_int(_ENROLL, html),
+            rating=rating, review_count=reviews, enrollment_count=enrolled,
+            volatile_observed=True,
         )
 
 
