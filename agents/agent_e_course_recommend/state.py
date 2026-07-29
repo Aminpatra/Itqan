@@ -34,11 +34,18 @@ class RecommendState(TypedDict, total=False):
     # course_id -> the skills it was assigned to cover (>=1); deterministic
     assigned: dict[str, list[str]]
     no_course_found_skills: list[str]
+    # course_id -> {"basis": "quality"|"arbitrary", "equivalent_candidates": int,
+    # "candidates_considered": int}. "arbitrary" means nothing about the courses
+    # separated them and the winner is the lowest course_id — a hash.
+    selection_basis: dict[str, dict[str, Any]]
 
     # ---- attach_flags ----------------------------------------------------
     recommendations: list[dict[str, Any]]    # persist shape; rationale filled later
 
     # ---- persist ---------------------------------------------------------
     output_path: str
+    # The written envelope's calibration block, echoed back so the CLI can
+    # report the honesty counters without re-reading the file it just wrote.
+    run_calibration: dict[str, Any]
 
     warnings: Annotated[list[str], operator.add]

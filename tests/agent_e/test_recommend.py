@@ -203,12 +203,21 @@ def test_rationale_input_and_output_carry_no_internal_tokens(tmp_path):
         assert "uri:a" not in low
         assert "47" not in blob, "the raw priority_score float leaked to the model"
     # priority reached the model only as a plain bucket word
-    assert "Demand level for this skill:" in human
+    # The bucket is a rank among the candidate's OWN gaps, not a market claim,
+    # and the fact sheet now says so — while carrying Agent C's real market
+    # evidence (a checkable count of postings) separately.
+    assert "Rank among your own gaps:" in human
+    assert "Demand level for this skill:" not in human
 
 
 def test_no_llm_leaves_rationale_empty_without_warnings(tmp_path):
-    """--no-rationale mode: selection still runs, rationales stay null, and it is
-    NOT treated as a failure (no warnings)."""
+    """No model wired: selection still runs, and the rationale is built
+    deterministically from the same fact sheet rather than published as "".
+
+    The field used to be an empty string, which reads as "no reason given" and is
+    indistinguishable from a model that returned nothing. A template costs no
+    tokens and no API key, so there is no reason for the field to be empty — and
+    it is NOT a failure, so no warning is raised."""
     x = cc("x", rating=4.0)
     reader = FakeReader(by_esco={"uri:a": [x]})
     gap = {"used_fallback": False, "aggregate": {
@@ -219,7 +228,12 @@ def test_no_llm_leaves_rationale_empty_without_warnings(tmp_path):
         "gap_path": str(tmp_path / "skill_gap.json"),
         "output_dir": str(tmp_path), "run_id": "t"})
     out = json.loads((tmp_path / "t" / "course_recommendations.json").read_text(encoding="utf-8"))
-    assert out["recommendations"][0]["course"]["rationale"] is None
+    course = out["recommendations"][0]["course"]
+    assert course["rationale_source"] == "template"
+    assert course["title"] in course["rationale"]
+    assert "skill-a" in course["rationale"]
+    # Only facts that exist: this course has a rating but no review count.
+    assert "4.0" in course["rationale"] and "reviews" not in course["rationale"]
     assert not [w for w in state.get("warnings", []) if "rationale" in w]
 
 
@@ -279,10 +293,37 @@ def test_greedy_prefers_the_course_that_covers_more_weight():
     ]
     skill_candidates = {"s1": ["a"], "s2": ["a"], "s3": ["b"]}
     courses = {"a": a, "b": b}
-    assigned, no_course = greedy_assign(missing, skill_candidates, courses,
-                                        ("rating", "review_count", "last_updated", "price"))
+    assigned, no_course, _basis = greedy_assign(
+        missing, skill_candidates, courses,
+        ("rating", "review_count", "last_updated", "price"))
     assert assigned == {"a": ["s1", "s2"], "b": ["s3"]}
     assert no_course == []
+
+
+def test_importance_can_outweigh_breadth():
+    """The product `n x sum(priority)` lets a narrow-but-critical course win. The
+    implementation was lexicographic `(-n, -weight)`, under which coverage count
+    ALWAYS dominated and priority could only break a tie between equal counts —
+    so a course bundling three trivial gaps beat one covering a single critical
+    one, however lopsided the weights."""
+    wide = cc("wide")     # 3 trivial skills: 3 x (0.1+0.1+0.1) = 0.9
+    deep = cc("deep")     # 1 critical skill:  1 x 9.0          = 9.0
+    missing = [
+        {"skill": "t1", "esco_code": "u1", "priority_score": 0.1},
+        {"skill": "t2", "esco_code": "u2", "priority_score": 0.1},
+        {"skill": "t3", "esco_code": "u3", "priority_score": 0.1},
+        {"skill": "critical", "esco_code": "u4", "priority_score": 9.0},
+    ]
+    skill_candidates = {"t1": ["wide"], "t2": ["wide"], "t3": ["wide"],
+                        "critical": ["deep"]}
+    assigned, _, _ = greedy_assign(
+        missing, skill_candidates, {"wide": wide, "deep": deep},
+        ("rating", "review_count", "last_updated", "price"))
+
+    # Both still get covered; what changed is which is chosen FIRST, and that a
+    # lopsided weight can now beat a bigger bundle at all.
+    assert set(assigned) == {"wide", "deep"}
+    assert assigned["deep"] == ["critical"]
 
 
 # ---------------------------------------------------------------------------

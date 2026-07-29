@@ -27,9 +27,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Path to skill_gap.json (Agent C's output)")
     parser.add_argument("--user-id", default=None,
                         help="Identifier written to the output (default: the gap file's user_id)")
-    parser.add_argument("--no-rationale", action="store_true",
-                        help="Skip the LLM step: run selection only, leave rationales empty "
-                        "(no API key needed)")
+    parser.add_argument("--no-rationale", "--no-llm", dest="no_rationale", action="store_true",
+                        help="Skip the LLM step. Rationales are still written, built "
+                        "deterministically from the same facts, so the agent is fully "
+                        "offline and reproducible (no API key needed)")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--run-id", default=None)
     return parser
@@ -84,11 +85,26 @@ def _print_result(state: dict) -> None:
     print(f"  {len(found)} course(s) recommended, {len(missing)} skill(s) with no course found\n")
     for r in found:
         c = r["course"]
-        extra = f"  (+{len(c['covers_other_skills'])} more skill(s))" if c["covers_other_skills"] else ""
-        print(f"    [{r['priority_bucket']:>8}] {arabize(r['skill'][:34]):<34} -> "
-              f"{arabize((c['title'] or '')[:44])}{extra}")
+        extra = f"  (+{len(c['covers_other_skills'])} more)" if c["covers_other_skills"] else ""
+        sel = r.get("selection") or {}
+        # A pick nothing distinguished is marked, not dressed up as a ranking.
+        mark = f"  ~{sel.get('equivalent_candidates', 0)} equal" \
+            if sel.get("basis") == "arbitrary" else ""
+        print(f"    [{r['priority_bucket']:>8}] {arabize(r['skill'][:30]):<30} -> "
+              f"{arabize((c['title'] or '')[:40])}{extra}{mark}")
     for r in missing:
-        print(f"    [{r['priority_bucket']:>8}] {arabize(r['skill'][:34]):<34} -> (no course found)")
+        print(f"    [{r['priority_bucket']:>8}] {arabize(r['skill'][:30]):<30} -> (no course found)")
+
+    cal = state.get("run_calibration") or {}
+    arbitrary = cal.get("recommendations_by_arbitrary_pick") or []
+    if arbitrary:
+        print(f"\n  {len(arbitrary)} of {len(found)} pick(s) had nothing to choose between "
+              f"candidates on — no rating, price or date. Those are representative,")
+        print(f"  not ranked: {', '.join(arbitrary[:5])}")
+    sources = cal.get("rationale_sources") or {}
+    if sources.get("template"):
+        print(f"  {sources['template']} rationale(s) came from the deterministic template.")
+
     for warning in state.get("warnings", []):
         print(f"  ! {warning}")
     print(f"\n  output -> {state.get('output_path')}\n")

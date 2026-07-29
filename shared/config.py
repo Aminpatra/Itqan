@@ -11,6 +11,7 @@ import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -150,7 +151,7 @@ class Config:
     # are counted: supply is a STOCK (a course from last year still teaches its
     # skills), unlike demand, which is a flow of vacancies open in a window. It
     # once did filter, which would have silently emptied the table as the corpus
-    # aged past it. See aggregate.py.
+    # aged past it. See agents/agent_d_course_ingest/aggregate.py.
     course_window_days: int = 90
     # A skill taught by fewer than this many courses is real but thin supply.
     # Also what Agent E calls "thin" when flagging a recommendation.
@@ -160,11 +161,6 @@ class Config:
     # from, and the call is skipped rather than spent finding that out. Generous:
     # freeCodeCamp's one-line descriptions are real courses and must pass.
     course_min_text_chars: int = 30
-    # Safety valve on how many candidate courses one missing skill may pull back.
-    # Deliberately far above any realistic answer, so it never shapes a
-    # recommendation — it only stops a catalog-scale corpus from materializing
-    # tens of thousands of rows for a single gap.
-    agent_e_max_candidates_per_skill: int = 200
     # Courses per committed transaction. A normal cycle is well under this and
     # commits once; a backfill commits as it walks, so a failure at course 1,900
     # costs one chunk instead of the whole run, and no connection sits 'idle in
@@ -173,18 +169,18 @@ class Config:
     # Coursera's public catalog page size; also the freeCodeCamp cert cap.
     coursera_max_pages: int = 8
     coursera_page_size: int = 100
-    # Enrich each kept Coursera course by fetching its public course page
-    # (robots-allowed) for rating/review_count/enrollment — the API exposes none
-    # of these. One extra ~0.5-1MB fetch per course every cycle; set False to
-    # skip and leave those fields NULL for Coursera.
-    coursera_enrich: bool = True
-    coursera_enrich_interval_s: float = 1.0
     # Set by `agent-d --backfill N` for one run: how many catalog pages to walk,
     # overriding coursera_max_pages. None outside a backfill. When set, the
     # per-course quality-signal page fetch is skipped — the API pass costs about
     # $0.0001 per course, while the enrichment fetch is ~1MB at a polite interval
     # each and would dominate a large walk. Those fields fill in on later cycles.
     course_backfill_pages: Optional[int] = None
+    # Enrich each kept Coursera course by fetching its public course page
+    # (robots-allowed) for rating/review_count/enrollment — the API exposes none
+    # of these. One extra ~0.5-1MB fetch per course every cycle; set False to
+    # skip and leave those fields NULL for Coursera.
+    coursera_enrich: bool = True
+    coursera_enrich_interval_s: float = 1.0
 
     # --- ESCO mapping ---
     # Minimum cosine similarity for an embedding-based skill->ESCO mapping.
@@ -245,8 +241,36 @@ class Config:
     # sort LAST in every field (a missing rating never beats a real one, and is
     # never coerced to 0); a final tie breaks on the lowest course_id, so the
     # selection is always total and reproducible. Valid fields: rating,
-    # review_count, last_updated, price.
-    agent_e_tiebreak: tuple[str, ...] = ("rating", "review_count", "last_updated", "price")
+    # review_count, enrollment_count, level, last_updated, price.
+    #
+    # Order changed 2026-07-28 on live evidence. `rating` was first and RAW, so a
+    # 5.0 from 10 reviews outranked a 4.9 from 30,000 — review_count only ever
+    # broke an exact rating tie. It is now a confidence-shrunk score (see
+    # agent_e_rating_prior_reviews), which folds volume into the rating itself,
+    # and `enrollment_count` — collected by Agent D for 252 courses and
+    # previously read by nothing — sits above the two fields that are almost
+    # always null on this corpus (last_updated: 0 of 2,097; price: ~0).
+    agent_e_tiebreak: tuple[str, ...] = (
+        "rating", "enrollment_count", "review_count", "level", "last_updated", "price",
+    )
+    # Prior weight for the shrunk rating: the number of reviews at which a
+    # course's own average carries as much weight as the corpus mean. Higher =
+    # more sceptical of thin review counts. 50 is a conventional starting point
+    # and, unlike the raw ordering it replaces, it cannot indict a well-reviewed
+    # 4.9 in favour of a 5.0 nobody has taken.
+    agent_e_rating_prior_reviews: int = 50
+    # Rating differences below this do not decide anything. Measured on the real
+    # gap file, two `project management` candidates scored 4.8070 and 4.8031 and
+    # that 0.004 was choosing which course a person is told to take. Courses that
+    # close are indistinguishable; below this resolution they tie and a real
+    # signal (enrolments) decides, or the pick is reported as `arbitrary`.
+    agent_e_rating_resolution: float = 0.1
+    # Safety valve on how many candidate courses one missing skill may pull back.
+    # Deliberately far above any realistic answer, so it never shapes a
+    # recommendation — it only stops a catalog-scale corpus from materializing
+    # tens of thousands of rows for a single gap. NOTE: if it ever does bind,
+    # `supply.courses_available` saturates here rather than being exact.
+    agent_e_max_candidates_per_skill: int = 200
 
     # --- scraping ---
     user_agent: str = field(

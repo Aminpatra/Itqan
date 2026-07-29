@@ -15,6 +15,7 @@ decision but cannot alter it or invent beyond it.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +26,10 @@ from shared.course_market import courses_for_skills
 
 from .state import RecommendState
 
-SCHEMA_VERSION = "itqan.course_reco/1.0"
+# 1.1 adds, all additively: `supply` (how many courses back each pick),
+# `selection` (whether anything about the course decided it), `calibration`, and
+# `course.rationale_source`. Nothing was removed or re-typed.
+SCHEMA_VERSION = "itqan.course_reco/1.1"
 
 _INF = float("inf")
 
@@ -43,17 +47,31 @@ RATIONALE_SYSTEM_PROMPT = (
     "mention that.\n"
     "- If rating, review_count, or price are null/not available, omit them — "
     "never substitute a plausible-sounding guess.\n"
-    "- If used_fallback is true, use softer confidence language (\"a solid option "
-    "based on general demand in your field\") rather than confident job-specific "
-    "claims, since this came from aggregate demand stats, not matched postings.\n"
-    "- If 'Courses available' is low, say plainly that few courses cover this "
-    "skill, so this is one of a small number of options — do not dress a thin "
-    "field up as a strong endorsement of the single course found.\n"
+    "- ONLY if 'Recommendation basis' says general demand, use softer language "
+    "(\"a solid option based on general demand in your field\"). If it names "
+    "specific postings, do NOT use that hedge — it would understate real "
+    "evidence.\n"
+    "- The 'Courses available' line is a COUNT, and it tells you whether the "
+    "field is thin. Call it small ONLY when the line itself says few courses "
+    "cover the skill. Nine, twelve, twenty-two or thirty-eight courses are NOT "
+    "'a small number of options' — claiming otherwise is false and is checked in "
+    "code. If the line does not flag it, say nothing about how many exist.\n"
+    "- If 'Recommendation basis' reports that several courses matched equally "
+    "well, you MUST say so: the choice between them was not based on anything "
+    "about the courses, and presenting it as a ranked best is the one thing this "
+    "message must never do.\n"
     "- 2-3 sentences, plain and direct, no marketing language.\n"
+    "- Never state a NUMBER that is not in the input above — no durations, module "
+    "counts, instructor counts, completion times, or ratings beyond what is "
+    "given. An invented figure is the most authoritative-sounding thing you can "
+    "write; every number is checked against the input in code, and a rationale "
+    "that adds one is discarded.\n"
     "- Never mention priority_score as a number, ESCO codes, gap_score, or "
-    "internal pipeline terms — translate priority_bucket into plain language if "
-    "referenced at all (e.g. \"a skill that came up often in roles you'd be a "
-    "good fit for\").\n"
+    "internal pipeline terms. 'Demand level' ranks this gap against THE "
+    "CANDIDATE'S OTHER GAPS — it is not a measurement of the job market. Say "
+    "\"one of the bigger gaps in your profile\"; do NOT say \"a skill that came up "
+    "often in roles you'd be a good fit for\", which is a claim about the labour "
+    "market that this ranking does not support.\n"
     "- Output plain text only — this is the message itself, not JSON or markdown."
 )
 
@@ -94,6 +112,15 @@ def make_load_missing_skills(deps: Deps) -> Callable[[RecommendState], dict]:
                     "skill": key,
                     "esco_code": d.get("esco_code"),
                     "priority_score": float(d.get("priority_score") or 0.0),
+                    # Agent C's actual market evidence, previously dropped on the
+                    # floor here. `jobs_missing_in` is a plain, checkable count of
+                    # retrieved postings that asked for this skill — the true
+                    # version of the claim `priority_bucket` was being asked to
+                    # imply. `demand_rate`/`low_confidence` say how much the
+                    # demand side trusts its own numbers.
+                    "jobs_missing_in": d.get("jobs_missing_in"),
+                    "demand_rate": d.get("demand_rate"),
+                    "demand_low_confidence": bool(d.get("low_confidence")),
                 })
         else:
             # Older gap file, before missing_skill_details existed: fall back to
@@ -103,7 +130,9 @@ def make_load_missing_skills(deps: Deps) -> Callable[[RecommendState], dict]:
                 if not key or key in seen:
                     continue
                 seen.add(key)
-                missing.append({"skill": key, "esco_code": None, "priority_score": 1.0})
+                missing.append({"skill": key, "esco_code": None, "priority_score": 1.0,
+                                "jobs_missing_in": None, "demand_rate": None,
+                                "demand_low_confidence": False})
             if missing:
                 warnings.append(
                     "gap file has no missing_skill_details; using "
@@ -174,14 +203,62 @@ def _epoch(iso: Optional[str]) -> Optional[float]:
         return None
 
 
-def _field_key(cc: Any, field_name: str) -> float:
+# Courses are labelled by their own provider; a missing label is unknown, not
+# "advanced". A MISSING skill is by definition one the candidate has shown no
+# evidence in, so an introductory course is the better default — this is the one
+# place Agent E can reason about fit without needing the candidate's profile.
+_LEVEL_ORDER = {"beginner": 0, "intermediate": 1, "advanced": 2}
+
+
+def shrunk_rating(cc: Any, prior_mean: float, prior_reviews: int) -> Optional[float]:
+    """A rating weighted by how much evidence stands behind it.
+
+    ``(v/(v+m))·R + (m/(v+m))·C`` — the course's own average R pulled toward the
+    corpus mean C, with the pull decided by its review count v against a prior
+    weight m.
+
+    Raw rating ordering put a **5.0 from 10 reviews above a 4.9 from 30,000**,
+    because review_count only ever broke an *exact* rating tie. On this corpus
+    that is not hypothetical: every top-rated row is a 5.0 with 10-14 reviews.
+    Shrinkage folds volume into the number itself, so confidence and score stop
+    being separate lexicographic stages.
+
+    A course with a rating but no review count is treated as v=0 — all prior, no
+    evidence — rather than being trusted at face value.
+    """
+    if cc.rating is None:
+        return None
+    v = cc.review_count or 0
+    return (v * cc.rating + prior_reviews * prior_mean) / (v + prior_reviews)
+
+
+def _field_key(cc: Any, field_name: str, ctx: dict[str, Any] | None = None) -> float:
     """One tie-break field as an ascending, smaller-is-better number. A null
     always yields +inf, so it sorts LAST in every field and is NEVER treated as
     0 (a 0 rating is a real, distinct value that would sometimes win)."""
+    ctx = ctx or {}
     if field_name == "rating":
-        return -cc.rating if cc.rating is not None else _INF
+        s = shrunk_rating(cc, ctx.get("prior_mean", 0.0), ctx.get("prior_reviews", 50))
+        if s is None:
+            return _INF
+        # Rounded to a resolution a learner could act on. Measured on the real
+        # gap file, the top two `project management` candidates scored 4.8070 and
+        # 4.8031 — a gap of 0.004 that was silently deciding which course a
+        # person is told to take. Two courses that close are not distinguishable,
+        # and letting noise pick between them is the same false precision as a
+        # gap_score of 0.0 meaning "we parsed nothing". Below the resolution they
+        # tie and the next real signal (enrolments) decides — or, if nothing
+        # does, the pick is reported as `arbitrary` rather than dressed up.
+        step = ctx.get("resolution") or 0.1
+        return -round(s / step)
     if field_name == "review_count":
         return -cc.review_count if cc.review_count is not None else _INF
+    if field_name == "enrollment_count":
+        # Collected by Agent D for 252 courses and, until now, read by nothing.
+        return -cc.enrollment_count if cc.enrollment_count is not None else _INF
+    if field_name == "level":
+        rank = _LEVEL_ORDER.get((getattr(cc, "level", None) or "").strip().lower())
+        return rank if rank is not None else _INF      # beginner first; unknown last
     if field_name == "last_updated":
         e = _epoch(cc.last_updated)
         return -e if e is not None else _INF          # more recent = smaller = better
@@ -191,16 +268,40 @@ def _field_key(cc: Any, field_name: str) -> float:
     raise ValueError(f"unknown agent_e_tiebreak field {field_name!r}")
 
 
+def rating_prior_mean(courses: list[Any]) -> float:
+    """The corpus mean the shrunk rating pulls toward, over the rated candidates
+    in THIS run — self-contained and deterministic, no extra query. With nothing
+    rated it is unused (every shrunk rating is None and the field is skipped)."""
+    rated = [c.rating for c in courses if c.rating is not None]
+    return sum(rated) / len(rated) if rated else 0.0
+
+
 def greedy_assign(
     missing: list[dict[str, Any]],
     skill_candidates: dict[str, list[str]],
     courses_by_id: dict[str, Any],
     tiebreak: tuple[str, ...],
-) -> tuple[dict[str, list[str]], list[str]]:
-    """Weighted greedy set-cover. Returns ``(assigned, no_course_found)`` where
-    ``assigned`` maps a course_id to the skills it was chosen to cover (each skill
-    covered exactly once, each course appearing once)."""
+    *,
+    prior_reviews: int = 50,
+    resolution: float = 0.1,
+) -> tuple[dict[str, list[str]], list[str], dict[str, dict[str, Any]]]:
+    """Weighted greedy set-cover.
+
+    Returns ``(assigned, no_course_found, basis)``. ``assigned`` maps a course_id
+    to the skills it was chosen to cover (each skill covered exactly once, each
+    course appearing once); ``basis`` records HOW each course won.
+
+    The objective is ``n × Σpriority`` — the **product** the design specified.
+    It was implemented as lexicographic ``(-n, -weight)``, which is a different
+    rule: under it a course covering three trivial gaps always beat one covering
+    two critical gaps, because priority could only ever break a tie between equal
+    coverage counts. The product lets breadth and importance trade off, which is
+    what "weighted" was supposed to mean.
+    """
     priority = {m["skill"]: m["priority_score"] for m in missing}
+    prior_mean = rating_prior_mean(list(courses_by_id.values()))
+    ctx = {"prior_mean": prior_mean, "prior_reviews": prior_reviews,
+           "resolution": resolution}
 
     course_can_cover: dict[str, set[str]] = {}
     for skill, ids in skill_candidates.items():
@@ -211,36 +312,56 @@ def greedy_assign(
     no_course_found = sorted(s for s, ids in skill_candidates.items() if not ids)
 
     assigned: dict[str, list[str]] = {}
+    basis: dict[str, dict[str, Any]] = {}
     while uncovered:
         candidate_ids = {cid for s in uncovered for cid in skill_candidates[s]}
 
         def objective(cid: str) -> tuple:
             covers = course_can_cover[cid] & uncovered
-            n = len(covers)
-            weight = sum(priority[s] for s in covers)
-            # min() picks the smallest key: most skills first (-n), then most
-            # summed priority (-weight), then the configured tie-break fields,
-            # then the lowest course_id for total determinism.
+            # min() picks the smallest key, so the value is negated: highest
+            # coverage-value first, then the configured tie-break fields, then
+            # the lowest course_id for total determinism.
+            value = len(covers) * sum(priority[s] for s in covers)
             cc = courses_by_id[cid]
-            return (-n, -weight, *(_field_key(cc, f) for f in tiebreak), cid)
+            return (-value, *(_field_key(cc, f, ctx) for f in tiebreak), cid)
 
-        best = min(candidate_ids, key=objective)
+        scored = {cid: objective(cid) for cid in candidate_ids}
+        best = min(candidate_ids, key=lambda c: scored[c])
+
+        # Everything except the final course_id element. If more than one
+        # candidate matches the winner here, NOTHING distinguished them and the
+        # pick came down to a SHA-256 hash. Measured on the live corpus:
+        # `communication skills` had 13 candidates, none with a rating, price or
+        # date — so the "recommendation" was hash order. Saying so is the same
+        # instinct as Agent C's `insufficient_data`; presenting it as a
+        # considered choice is the dishonesty.
+        winning = scored[best][:-1]
+        equivalent = sum(1 for key in scored.values() if key[:-1] == winning)
+
         newly = sorted(course_can_cover[best] & uncovered)
         assigned[best] = newly
+        basis[best] = {
+            "basis": "arbitrary" if equivalent > 1 else "quality",
+            "equivalent_candidates": equivalent,
+            "candidates_considered": len(candidate_ids),
+        }
         uncovered.difference_update(newly)
 
-    return assigned, no_course_found
+    return assigned, no_course_found, basis
 
 
 def make_greedy_cover_assign(deps: Deps) -> Callable[[RecommendState], dict]:
     def greedy_cover_assign(state: RecommendState) -> dict:
-        assigned, no_course = greedy_assign(
+        assigned, no_course, basis = greedy_assign(
             state.get("missing", []),
             state.get("skill_candidates", {}),
             state.get("courses_by_id", {}),
             tuple(deps.config.agent_e_tiebreak),
+            prior_reviews=deps.config.agent_e_rating_prior_reviews,
+            resolution=deps.config.agent_e_rating_resolution,
         )
-        return {"assigned": assigned, "no_course_found_skills": no_course}
+        return {"assigned": assigned, "no_course_found_skills": no_course,
+                "selection_basis": basis}
 
     return greedy_cover_assign
 
@@ -249,14 +370,32 @@ def make_greedy_cover_assign(deps: Deps) -> Callable[[RecommendState], dict]:
 # 4. attach_flags  (pure)
 # ===========================================================================
 def _compute_buckets(missing: list[dict[str, Any]]) -> dict[str, str]:
-    """priority_bucket by splitting THIS candidate's priority_scores into thirds
-    of their own [min, max] range — high/moderate/some. Computed in code so a raw
-    priority float never reaches the LLM."""
+    """Rank each gap against THIS candidate's other gaps — high/moderate/some.
+
+    Computed in code so a raw priority float never reaches the LLM.
+
+    **This is a relative rank, not a market claim.** It says "your biggest gap",
+    not "in demand": a candidate whose gaps are all marginal still gets a "high".
+    The prompt used to render it as *"a skill that came up often in roles you'd be
+    a good fit for"*, which is a statement about the labour market that this
+    number cannot support — see RATIONALE_SYSTEM_PROMPT.
+
+    Two degenerate cases the thirds-of-the-range arithmetic got wrong, both live:
+    with a single missing skill `lo == hi`, so every threshold collapses and the
+    one gap is ALWAYS "high"; and when every gap carries the same weight, all of
+    them came out "high" while being, by definition, indistinguishable.
+    """
     scores = [m["priority_score"] for m in missing]
     if not scores:
         return {}
     lo, hi = min(scores), max(scores)
     span = hi - lo
+
+    # Nothing separates them (one skill, or all equal). Ranking is meaningless
+    # here, so every gap gets the same middle label rather than a fabricated top.
+    if span <= 0:
+        return {m["skill"]: "moderate" for m in missing}
+
     t_high = lo + 2 * span / 3
     t_mod = lo + span / 3
 
@@ -275,9 +414,17 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
         missing = state.get("missing", [])
         priority = {m["skill"]: m["priority_score"] for m in missing}
         esco_of = {m["skill"]: m["esco_code"] for m in missing}
+        demand_of = {m["skill"]: {
+            "jobs_missing_in": m.get("jobs_missing_in"),
+            "rate": m.get("demand_rate"),
+            "low_confidence": m.get("demand_low_confidence", False),
+        } for m in missing}
         buckets = _compute_buckets(missing)
         courses_by_id = state.get("courses_by_id", {})
         candidates = state.get("skill_candidates", {})
+        selection = state.get("selection_basis", {})
+        prior_reviews = deps.config.agent_e_rating_prior_reviews
+        prior_mean = rating_prior_mean(list(courses_by_id.values()))
 
         # How much supply exists for each gap. This is Agent D's whole reason for
         # aggregating a supply side, and it costs nothing here: retrieval already
@@ -304,8 +451,14 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
                 "skill": primary,
                 "esco_code": esco_of.get(primary),
                 "priority_score": priority[primary],
+                # A rank among THIS candidate's gaps, not a market claim.
                 "priority_bucket": buckets.get(primary, "some"),
+                # The real market evidence, straight from Agent C.
+                "demand": demand_of.get(primary, {}),
                 "supply": supply_for(primary),
+                # Did anything about the course decide this, or did it come down
+                # to a hash? Published so a reader can tell.
+                "selection": selection.get(cid, {"basis": "quality"}),
                 "course": {
                     "course_id": cc.course_id,
                     "title": cc.title,
@@ -314,7 +467,14 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
                     "covers_other_skills": others,
                     "quality": {
                         "rating": cc.rating,
+                        # What the ranking actually used: raw rating alone put a
+                        # 5.0 from 10 reviews above a 4.9 from 30,000.
+                        "rating_shrunk": (round(s, 4)
+                                          if (s := shrunk_rating(cc, prior_mean, prior_reviews))
+                                          is not None else None),
                         "review_count": cc.review_count,
+                        "enrollment_count": cc.enrollment_count,
+                        "level": getattr(cc, "level", None),
                         "price": cc.price.model_dump() if cc.price else None,
                         "last_updated": cc.last_updated,
                     },
@@ -329,6 +489,7 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
                 "esco_code": esco_of.get(skill),
                 "priority_score": priority.get(skill, 0.0),
                 "priority_bucket": buckets.get(skill, "some"),
+                "demand": demand_of.get(skill, {}),
                 # Explicit rather than implied by `course: null` — a consumer
                 # should not have to infer a zero.
                 "supply": {"courses_available": 0, "thin": True},
@@ -378,9 +539,33 @@ def _render_user_message(rec: dict[str, Any], used_fallback: bool) -> str:
     # whether this recommendation is a pick from many or the only thing there is.
     supply = rec.get("supply") or {}
     available = supply.get("courses_available")
-    supply_line = "not available" if available is None else str(available)
-    if supply.get("thin"):
-        supply_line += " (few courses cover this skill)"
+    if available is None:
+        supply_line = "not available"
+    elif supply.get("thin"):
+        supply_line = f"{available} (few courses cover this skill — say so)"
+    else:
+        # Stated explicitly, because the model otherwise read any count as small
+        # and called a field of 38 courses "one of a small number of options".
+        supply_line = f"{available} (a normal range — do NOT call this scarce)"
+
+    selection = rec.get("selection") or {}
+    if selection.get("basis") == "arbitrary":
+        basis = (f"{selection.get('equivalent_candidates', 0)} courses matched this skill "
+                 f"equally well and nothing distinguished them, so this is a representative "
+                 f"pick, NOT a ranked best — you must say so")
+
+    # The REAL market evidence, which Agent C measures and Agent E used to drop.
+    # A plain count of retrieved postings that asked for this skill is something
+    # the model can state truthfully; `priority_bucket` is only a rank among the
+    # candidate's own gaps and cannot support a claim about the market.
+    demand = rec.get("demand") or {}
+    jobs = demand.get("jobs_missing_in")
+    if jobs:
+        jobs_line = f"{jobs} of the roles you matched asked for it"
+        if demand.get("low_confidence"):
+            jobs_line += " (thin data — say so)"
+    else:
+        jobs_line = "not available"
 
     return "\n".join([
         f"Skill: {rec['skill']}",
@@ -390,10 +575,145 @@ def _render_user_message(rec: dict[str, Any], used_fallback: bool) -> str:
         f"Reviews: {reviews}",
         f"Price: {price_line}",
         f"Last updated: {last_updated}",
-        f"Demand level for this skill: {rec['priority_bucket']}",
+        f"How often this skill was asked for: {jobs_line}",
+        f"Rank among your own gaps: {rec['priority_bucket']}",
         f"Courses available for this skill: {supply_line}",
         f"Recommendation basis: {basis}",
     ])
+
+
+def deterministic_rationale(rec: dict[str, Any], used_fallback: bool) -> str:
+    """The rationale built in code from the finalized record.
+
+    Used when the model is absent, fails, or says something the fact sheet does
+    not support. Every clause is conditional on the value actually existing, so a
+    null is silently omitted rather than rendered as a guess — the same rule the
+    prompt gives the model, enforced instead of requested.
+    """
+    course, q = rec["course"], rec["course"]["quality"]
+    others = course["covers_other_skills"]
+    provider = f" from {course['provider']}" if course.get("provider") else ""
+
+    lead = f"{course['title']}{provider} covers {rec['skill']}"
+    if others:
+        lead += f", and also {', '.join(others)}"
+    parts = [lead + "."]
+
+    demand = rec.get("demand") or {}
+    if demand.get("jobs_missing_in"):
+        n = demand["jobs_missing_in"]
+        hedge = " though that is from thin data" if demand.get("low_confidence") else ""
+        parts.append(f"{n} of the roles you matched asked for it{hedge}.")
+
+    if q.get("rating") is not None and q.get("review_count"):
+        parts.append(f"It is rated {q['rating']} from {q['review_count']} reviews.")
+    elif q.get("rating") is not None:
+        parts.append(f"It is rated {q['rating']}.")
+    elif q.get("enrollment_count"):
+        parts.append(f"It has {q['enrollment_count']} enrolments.")
+
+    price = q.get("price") or {}
+    if price.get("is_free"):
+        parts.append("It is free.")
+
+    if (rec.get("supply") or {}).get("thin"):
+        parts.append("Few courses cover this skill, so there is little to choose from.")
+    elif (rec.get("selection") or {}).get("basis") == "arbitrary":
+        n = rec["selection"].get("equivalent_candidates", 0)
+        parts.append(
+            f"{n} courses matched this skill equally well and none carries ratings or "
+            f"pricing, so this one is a representative pick rather than a ranked best.")
+
+    if used_fallback:
+        parts.append("This is based on general demand in your field rather than "
+                     "specific postings you matched.")
+    return " ".join(parts)
+
+
+_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_FORBIDDEN = ("esco", "gap_score", "priority_score", "skill_key", "duplicate_of")
+
+
+def _numbers(text: str) -> set[str]:
+    """Numeric tokens, comma-stripped and trailing-zero-normalized, so '1,919'
+    and '1919' — and '4.70' and '4.7' — compare equal."""
+    out: set[str] = set()
+    for raw in _NUMBER.findall(text or ""):
+        token = raw.replace(",", "")
+        if "." in token:
+            token = token.rstrip("0").rstrip(".")
+        out.add(token or "0")
+    return out
+
+
+# Claims the RECORD can adjudicate, as opposed to prose it cannot. Each of these
+# was written by the real model on the real gap file while passing a
+# numbers-only check — which is how they were found.
+_SCARCITY = re.compile(
+    r"\b(few|small number|limited (number|options|selection)|only a (few|handful)|"
+    r"scarce|not many)\b", re.I)
+_FALLBACK_HEDGE = re.compile(r"\bgeneral demand\b", re.I)
+
+
+def verify_claims(text: str, rec: dict[str, Any], used_fallback: bool) -> Optional[str]:
+    """Check the qualitative claims the finalized record can actually settle.
+
+    A numbers-only check passes all of these, and on the first real-model run it
+    did — 6 of 8 rationales called a field of 9-38 courses "one of a small number
+    of options", and 3 offered the "general demand" hedge on a run where
+    ``used_fallback`` was False. Neither is a hallucinated *figure*; both are
+    false statements to someone choosing what to study.
+
+    Only claims with a deterministic answer in the record are checked. Vague
+    praise ("a solid course") still passes — that remains the honest limit.
+    """
+    supply = rec.get("supply") or {}
+    if _SCARCITY.search(text or "") and not supply.get("thin"):
+        return (f"calls the field scarce when {supply.get('courses_available')} courses "
+                f"cover the skill")
+
+    if _FALLBACK_HEDGE.search(text or "") and not used_fallback:
+        return "offers the general-demand hedge on a run matched to specific postings"
+
+    # An arbitrary pick that reads as a considered one is the exact dishonesty
+    # `selection_basis` exists to prevent, so the caveat is mandatory rather than
+    # merely offered. The template always states it.
+    if (rec.get("selection") or {}).get("basis") == "arbitrary":
+        if not re.search(r"\b(equal|equally|representative|nothing to choose|"
+                         r"arbitrar|any of|interchangeab)", text or "", re.I):
+            return "presents an arbitrary pick as a ranked recommendation"
+    return None
+
+
+def verify_rationale(text: str, fact_sheet: str) -> Optional[str]:
+    """Return a reason the rationale must not be published, or None if it holds.
+
+    Agent A verifies every extracted value against the document, Agent B verifies
+    the adjudicator's quote, Agent C verifies the skill the model cites. This was
+    the one model output in the pipeline published on trust — with a prompt that
+    says "never invent course content" and nothing checking whether it did.
+
+    What this catches: **invented specifics**. A model writing "40 hours of video"
+    or "taught by 3 industry experts" or "rated 4.9" introduces numbers the fact
+    sheet never contained, and those are the fabrications that read as most
+    authoritative. Every number in the text must appear in the input.
+
+    What it does NOT catch, stated plainly: unquantified invention ("hands-on
+    projects", "beginner friendly"). Numbers are the tractable, high-value half.
+    A stricter check would need the course syllabus, which Agent D does not store.
+    """
+    if not (text or "").strip():
+        return "empty"
+    invented = _numbers(text) - _numbers(fact_sheet)
+    if invented:
+        return f"asserts figures absent from the source: {sorted(invented)}"
+    lowered = text.lower()
+    for token in _FORBIDDEN:
+        if token in lowered:
+            return f"leaks the internal term {token!r}"
+    if len(text) > 700:
+        return "far longer than the 2-3 sentences asked for"
+    return None
 
 
 def make_generate_rationale(deps: Deps) -> Callable[[RecommendState], dict]:
@@ -401,11 +721,6 @@ def make_generate_rationale(deps: Deps) -> Callable[[RecommendState], dict]:
         from langchain_core.messages import HumanMessage, SystemMessage
 
         recs = state.get("recommendations", [])
-        # No model wired (--no-rationale): run selection only, leave rationales
-        # empty. This is a deliberate mode, not a failure — no warnings.
-        if deps.llm is None:
-            return {}
-
         used_fallback = bool(state.get("used_fallback"))
         warnings: list[str] = []
 
@@ -413,17 +728,40 @@ def make_generate_rationale(deps: Deps) -> Callable[[RecommendState], dict]:
             # Skipped entirely for no_course_found — there is nothing to explain.
             if rec.get("no_course_found") or not rec.get("course"):
                 continue
+
             human = _render_user_message(rec, used_fallback)
-            try:
-                result = deps.llm.invoke([
-                    SystemMessage(content=RATIONALE_SYSTEM_PROMPT),
-                    HumanMessage(content=human),
-                ])
-                text = (getattr(result, "content", None) or str(result)).strip()
-            except Exception as exc:  # noqa: BLE001 - a failed rationale must not sink the run
-                text = ""
-                warnings.append(f"rationale generation failed for '{rec['skill']}': {exc}")
+            # The deterministic sentence is the FLOOR, not an error path. Every
+            # recommendation gets a real rationale even with no model wired
+            # (--no-rationale), where the field used to be published as "" — an
+            # empty string that reads as "no reason given".
+            text = deterministic_rationale(rec, used_fallback)
+            source = "template"
+
+            if deps.llm is not None:
+                try:
+                    result = deps.llm.invoke([
+                        SystemMessage(content=RATIONALE_SYSTEM_PROMPT),
+                        HumanMessage(content=human),
+                    ])
+                    generated = (getattr(result, "content", None) or str(result)).strip()
+                except Exception as exc:  # noqa: BLE001 - must not sink the run
+                    generated, reason = "", f"{type(exc).__name__}: {exc}"
+                else:
+                    reason = (verify_rationale(generated, human)
+                              or verify_claims(generated, rec, used_fallback))
+
+                if generated and reason is None:
+                    text, source = generated, "model"
+                else:
+                    # The model may phrase; it may never assert. A rationale that
+                    # states something its fact sheet does not is discarded whole
+                    # and the deterministic sentence stands — the same discipline
+                    # as Agent A's dropped fields and Agent C's voided verdicts.
+                    warnings.append(
+                        f"rationale for '{rec['skill']}' fell back to the template: {reason}")
+
             rec["course"]["rationale"] = text
+            rec["course"]["rationale_source"] = source
 
         return {"recommendations": recs, "warnings": warnings}
 
@@ -433,21 +771,52 @@ def make_generate_rationale(deps: Deps) -> Callable[[RecommendState], dict]:
 # ===========================================================================
 # 6. persist
 # ===========================================================================
+def _count_sources(recs: list[dict[str, Any]]) -> dict[str, int]:
+    """How many rationales the model wrote vs how many fell back to the template.
+    A sudden shift toward `template` means the model started asserting things its
+    fact sheet did not contain — worth seeing without reading every entry."""
+    counts: dict[str, int] = {}
+    for r in recs:
+        course = r.get("course")
+        if not course:
+            continue
+        key = course.get("rationale_source") or "none"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def make_persist(deps: Deps) -> Callable[[RecommendState], dict]:
     def persist(state: RecommendState) -> dict:
+        recs = state.get("recommendations", [])
+        candidates = state.get("skill_candidates", {})
+        arbitrary = [r["skill"] for r in recs
+                     if (r.get("selection") or {}).get("basis") == "arbitrary"]
         out = {
             "user_id": state.get("user_id") or "",
             "used_fallback": bool(state.get("used_fallback")),
-            "recommendations": state.get("recommendations", []),
+            "recommendations": recs,
             # additive envelope, per repo convention
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            # An output that cannot be reproduced or re-interpreted from itself is
+            # not auditable. Agent C's `calibration` block is the precedent.
+            "calibration": {
+                "tiebreak": list(deps.config.agent_e_tiebreak),
+                "rating_prior_reviews": deps.config.agent_e_rating_prior_reviews,
+                "max_candidates_per_skill": deps.config.agent_e_max_candidates_per_skill,
+                "thin_supply_below": deps.config.course_low_confidence_min_courses,
+                "candidates_per_skill": {s: len(ids) for s, ids in sorted(candidates.items())},
+                # The headline honesty number: how many picks nothing about the
+                # courses actually decided.
+                "recommendations_by_arbitrary_pick": arbitrary,
+                "rationale_sources": _count_sources(recs),
+            },
         }
         run_id = state.get("run_id") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         base = Path(state.get("output_dir") or deps.config.output_dir) / run_id
         base.mkdir(parents=True, exist_ok=True)
         path = base / "course_recommendations.json"
         path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-        return {"output_path": str(path)}
+        return {"output_path": str(path), "run_calibration": out["calibration"]}
 
     return persist
