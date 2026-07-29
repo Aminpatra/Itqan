@@ -194,7 +194,12 @@ def make_staleness(deps: GraphDeps) -> Callable[[IngestState], dict]:
         with store.transaction():
             marked = store.mark_stale(threshold=cfg.stale_after_cycles)
             pruned = store.prune(older_than_days=cfg.prune_after_days)
-        return {"staleness_summary": {"marked_stale": marked, "pruned": pruned}}
+            # Superseded aggregation snapshots. Here rather than in a new stage
+            # because it is the same kind of work — bounding what the tables
+            # keep — and it inherits this stage's transaction.
+            stats_pruned = store.prune_stats_windows(keep=cfg.stats_windows_to_keep())
+        return {"staleness_summary": {"marked_stale": marked, "pruned": pruned,
+                                      "stats_windows_pruned": stats_pruned}}
 
     return staleness
 

@@ -295,5 +295,88 @@ class CourseCandidate(BaseModel):
     rating: Optional[float] = None
     review_count: Optional[int] = None
     enrollment_count: Optional[int] = None
+    # beginner / intermediate / advanced as the provider labels it, or None when
+    # it does not. Agent E prefers introductory courses for a MISSING skill — by
+    # definition one the candidate has shown no evidence in.
+    level: Optional[str] = None
     last_updated: Optional[str] = None           # ISO8601, or None
     price: Optional[CoursePrice] = None
+
+
+# ---------------------------------------------------------------------------
+# Agent C -> Agent E, and Agent E -> whoever reads it.
+#
+# These two envelopes went unmodelled for a long time while A->C had
+# `CandidateProfile` from the start, and the asymmetry cost something concrete:
+# Agent E read the gap file by `data.get("aggregate").get("missing_skill_details")`
+# and, when that key was absent, fell back to the far lossier
+# `most_common_missing_skills` with a warning nobody was watching. A renamed
+# field on the producing side would therefore not fail — it would quietly
+# produce worse recommendations.
+#
+# ADDITIVE-TOLERANT ON PURPOSE. Pydantic ignores unknown fields by default, so a
+# producer adding a key never breaks a consumer; that is what makes it safe to
+# introduce these models over envelopes already in the wild. Every field a
+# consumer does not strictly require is Optional for the same reason. What these
+# models catch is the opposite case: a field that VANISHES or changes type.
+# ---------------------------------------------------------------------------
+
+class MissingSkillDetail(BaseModel):
+    """One gap, as Agent C measures it and Agent E consumes it."""
+
+    skill: str
+    esco_code: Optional[str] = None
+    # Demand weight, counted once per concept and log1p-damped. An opaque
+    # ordering weight to Agent E — deliberately not interpreted downstream.
+    priority_score: float = 0.0
+
+    # The market evidence proper. `jobs_missing_in` is a plain count of retrieved
+    # postings that asked for this skill, which is the only claim about the
+    # labour market either agent can actually support.
+    jobs_missing_in: Optional[int] = None
+    demand_rate: Optional[float] = None
+    low_confidence: bool = False
+
+    # How close the candidate came, for telling a near miss from a real gap.
+    best_similarity: Optional[float] = None
+    nearest_candidate_skill: Optional[str] = None
+    also_phrased_as: list[str] = Field(default_factory=list)
+
+
+class SkillGapAggregate(BaseModel):
+    missing_skill_details: list[MissingSkillDetail] = Field(default_factory=list)
+    most_common_missing_skills: list[str] = Field(default_factory=list)
+    unresolved_skills: list[str] = Field(default_factory=list)
+    # None when no job had parsable requirements — never 0.0, which on this
+    # scale is the BEST possible value and would read as a perfect fit.
+    average_gap_score: Optional[float] = None
+    jobs_scored: int = 0
+    jobs_without_parsable_requirements: int = 0
+
+
+class SkillGap(BaseModel):
+    """The envelope Agent C writes and Agent E consumes."""
+
+    schema_version: str = "itqan.skill_gap/1.0"
+    user_id: str = ""
+    generated_at: Optional[str] = None
+    # True when retrieval was thin enough that the SECTOR aggregate was also
+    # computed. Since the delivered Agent C change it SUPPLEMENTS the per-job
+    # results rather than replacing them, so it no longer means "these numbers
+    # came from aggregate stats" — a consumer softening every claim on this flag
+    # alone now overstates its case.
+    used_fallback: bool = False
+    aggregate: SkillGapAggregate = Field(default_factory=SkillGapAggregate)
+    matched_jobs: list[dict[str, Any]] = Field(default_factory=list)
+    fallback_sector_gap: Optional[dict[str, Any]] = None
+    calibration: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def load_gap(path: str) -> SkillGap:
+    """Read a gap envelope from disk. This is Agent E's entry point, and the
+    mirror of ``load_profile``."""
+    import json
+    from pathlib import Path
+
+    return SkillGap.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))

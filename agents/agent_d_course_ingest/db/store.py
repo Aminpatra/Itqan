@@ -175,28 +175,11 @@ class CourseStore:
             )
             return {r["source_url"]: r["course_id"] for r in cur.fetchall()}
 
-    def touch_seen(self, course_ids: list[str]) -> int:
-        if not course_ids:
-            return 0
-        conn = self.connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE courses
-                   SET last_seen_at = now(), missed_cycles = 0,
-                       status = CASE WHEN status = 'stale' THEN 'active' ELSE status END,
-                       stale_since = CASE WHEN status = 'stale' THEN NULL ELSE stale_since END
-                 WHERE course_id = ANY(%s)
-                """,
-                (course_ids,),
-            )
-            return cur.rowcount
-
     def refresh_volatile(self, rows: list[dict[str, Any]]) -> int:
         """The lightweight every-cycle path for UNCHANGED courses.
 
         Updates the volatile quality/price columns (which drift while the
-        content_hash does not) and does the same touch as ``touch_seen`` — but
+        content_hash does not) and touches the seen/staleness columns — but
         NO re-extraction and NO re-embedding. This is what keeps a course's price
         fresh between the expensive content-gated cycles. ``price_observed_at`` is
         stamped now(), because the honest record of a fluctuating price is "this
@@ -416,6 +399,84 @@ class CourseStore:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def courses_needing_enrichment(self, *, source: str, limit: int) -> list[dict[str, Any]]:
+        """Stored courses whose quality signals have never been observed.
+
+        Chosen from the DATABASE, not from whatever this cycle's fetch happened
+        to return, and that independence is the whole point. A backfill walks far
+        past the per-cycle page cap while the adapter restarts at page 0 every
+        cycle, so the ~1,300 courses beyond the cap were never revisited: the
+        "enrichment fills in on later cycles" promise was not something the code
+        could keep. Measured 1,749 unrated active Coursera courses.
+
+        The marker is **no quality signal at all**, not `price_observed_at IS
+        NULL`. `quality_signals` returns None unless at least one of
+        rating/reviews/enrolments parsed, so for Coursera "all three null" is
+        exactly "never successfully observed" — and unlike the timestamp it is
+        true of rows written before the timestamp was made conditional.
+
+        Ordered never-attempted first, then least-recently-attempted, so a course
+        whose page genuinely carries no rating is retried occasionally without
+        starving one that has never been looked at.
+        """
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT course_id, source_url
+                  FROM courses
+                 WHERE source = %(source)s
+                   AND status = 'active'
+                   AND duplicate_of IS NULL
+                   AND rating IS NULL
+                   AND review_count IS NULL
+                   AND enrollment_count IS NULL
+                 ORDER BY price_observed_at ASC NULLS FIRST, first_seen_at, course_id
+                 LIMIT %(k)s
+                """,
+                {"source": source, "k": limit},
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def count_needing_enrichment(self, *, source: str) -> int:
+        return self.scalar(
+            "SELECT count(*) FROM courses WHERE source = %(source)s AND status = 'active' "
+            "AND duplicate_of IS NULL AND rating IS NULL AND review_count IS NULL "
+            "AND enrollment_count IS NULL",
+            {"source": source},
+        ) or 0
+
+    def prune_stats_windows(self, *, keep: int) -> int:
+        """Drop supply snapshots older than the newest ``keep`` windows.
+
+        Both grains, since they are written together and a consumer joining them
+        across mismatched retention would silently compare a current concept
+        count against a stale skill count. Measured before this existed: 3
+        windows / 18,334 rows serving 10,202 current.
+        """
+        if keep < 2:
+            raise ValueError(
+                f"stats retention of {keep} is below the floor of 2 "
+                "(see Config.stats_windows_to_keep)")
+        conn = self.connect()
+        removed = 0
+        with conn.cursor() as cur:
+            for table in ("skill_supply_stats", "concept_supply_stats"):
+                cur.execute(
+                    f"""
+                    DELETE FROM {table}
+                     WHERE window_end < (
+                        SELECT min(window_end) FROM (
+                            SELECT DISTINCT window_end FROM {table}
+                             ORDER BY window_end DESC LIMIT %(keep)s
+                        ) recent
+                     )
+                    """,
+                    {"keep": keep},
+                )
+                removed += cur.rowcount
+        return removed
+
     def scalar(self, sql: str, params: dict[str, Any] | None = None) -> Any:
         conn = self.connect()
         with conn.cursor() as cur:
@@ -514,7 +575,12 @@ INSERT INTO courses (
     %(review_reason)s, %(duplicate_of)s, %(attribution)s, %(license)s, %(extraction_model)s,
     %(embedding)s,
     %(rating)s, %(review_count)s, %(enrollment_count)s, %(last_updated)s,
-    %(price_amount)s, %(price_currency)s, %(price_is_free)s, now(),
+    %(price_amount)s, %(price_currency)s, %(price_is_free)s,
+    -- Only stamp the observation time when something was actually observed.
+    -- This was an unconditional now(), so a backfilled course that deferred its
+    -- quality lookup still looked like it had been measured — which made
+    -- "never enriched" unqueryable and quietly hid a 1,749-course backlog.
+    CASE WHEN %(volatile_observed)s THEN now() ELSE NULL END,
     now(), now(), 0, NULL
 )
 ON CONFLICT (course_id) DO UPDATE SET

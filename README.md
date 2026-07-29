@@ -88,7 +88,7 @@ python main.py agent-a --cv tests/fixtures/sample_cv.txt --fake-llm --no-hitl
 | `--transcript PATH...` | Optional transcript; supplies courses, grades and CGPA. Also accepts several files |
 | `--no-hitl` | Never prompt. Gaps are recorded in the output instead. For scripted runs |
 | `--fake-llm` | Canned offline LLM — no API key, no network |
-| `--model NAME` | OpenAI chat model (default `gpt-4o-mini`) |
+| `--model NAME` | OpenAI chat model (default `gpt-5.4-mini` — chosen on measurement, see `shared/config.py`) |
 | `--ocr-lang CODE` | PaddleOCR language, default `en`. Use `ar`, `fr`, `es`, `ch`, `japan`, … for CVs in another script — the English models will misread them rather than fail |
 | `--output-dir DIR` | Where artifacts go (default `./output`) |
 | `--run-id ID` | Reuse a specific run id. Advanced; see the note on `thread_id` below |
@@ -697,6 +697,21 @@ you have used before resumes that run's checkpoint instead of starting clean.
 imported; without it every import makes a network round-trip that makes the CLI feel hung. Models are read
 from `~/.paddlex/official_models`.
 
-**`.env` is inside a git repo.** `git rev-parse --show-toplevel` here resolves to `C:\Users\Aminpatra` — your
-whole home directory is an uncommitted repo. `.gitignore` covers `.env` and `output/`; check it is in effect
-before committing anything from this tree.
+**Check `.gitignore` is in effect before committing.** `.env` and `output/` are both ignored — verify with
+`git check-ignore -v .env output/`. This note used to warn that the repo root resolved to your whole home
+directory; it now resolves to the project directory, so the hazard is smaller. `.env` still holds a real API
+key, so the check is still worth running.
+
+---
+
+## System status
+
+One read-only view across all five agents — corpus sizes, how fresh each aggregation window is, how much of
+each side reached the shared ESCO vocabulary, the course-enrichment backlog, and per-source health:
+
+```bash
+python main.py status
+```
+
+Reach for it before asking "why did the recommendations change?": a stale aggregation window, a degraded
+source, or a drop in ESCO coverage all show up here, and each of them moves the output.

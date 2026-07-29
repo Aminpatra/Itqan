@@ -152,13 +152,75 @@ def make_ingest(deps: GraphDeps) -> Callable[[CourseIngestState], dict]:
     return ingest
 
 
+def make_enrich_backlog(deps: GraphDeps) -> Callable[[CourseIngestState], dict]:
+    """Fill in quality signals for stored courses the fetch never revisits.
+
+    A bounded number per cycle, chosen from the database rather than from this
+    cycle's fetch. Without it the deferred-enrichment promise a backfill makes is
+    simply false: the Coursera adapter restarts at page 0 and reads 800, so
+    anything a backfill pulled from beyond that cap is never fetched again.
+
+    Writes through the same `volatile_observed` gate as every other path, so a
+    failed lookup here cannot null a value that is already stored.
+    """
+    def enrich_backlog(state: CourseIngestState) -> dict:
+        cfg, store = deps.config, deps.store
+        budget = int(getattr(cfg, "coursera_enrich_budget_per_cycle", 0) or 0)
+        if budget <= 0 or state.get("dry_run") or not cfg.coursera_enrich:
+            return {}
+
+        try:
+            targets = store.courses_needing_enrichment(source="coursera", limit=budget)
+            remaining = store.count_needing_enrichment(source="coursera")
+        except Exception as exc:  # noqa: BLE001 - a backlog drain must not sink a cycle
+            return {"warnings": [f"enrichment backlog query failed: {exc}"]}
+        if not targets:
+            return {}
+
+        adapter = deps.build_adapter(deps.config_by_name("coursera"))
+        signals = getattr(adapter, "quality_signals", None)
+        if signals is None:
+            return {}
+
+        result = AdapterResult(source="coursera")
+        rows: list[dict[str, Any]] = []
+        for target in targets:
+            observed = signals(target["source_url"], result)
+            rows.append({
+                "course_id": target["course_id"],
+                "volatile_observed": observed is not None,
+                "rating": (observed or {}).get("rating"),
+                "review_count": (observed or {}).get("review_count"),
+                "enrollment_count": (observed or {}).get("enrollment_count"),
+                "last_updated": None,
+                "price_amount": None, "price_currency": None, "price_is_free": None,
+            })
+
+        try:
+            with store.transaction():
+                store.refresh_volatile(rows)
+        except Exception as exc:  # noqa: BLE001
+            return {"warnings": [f"enrichment backlog write failed: {exc}"]}
+
+        return {"enrichment_backlog": {
+            "attempted": len(targets),
+            "observed": result.enriched,
+            "failed": result.enrich_failed,
+            "unparsed": result.enrich_unparsed,
+            "remaining_before": remaining,
+        }}
+    return enrich_backlog
+
+
 def make_staleness(deps: GraphDeps) -> Callable[[CourseIngestState], dict]:
     def staleness(state: CourseIngestState) -> dict:
         store, cfg = deps.store, deps.config
         with store.transaction():
             marked = store.mark_stale(threshold=cfg.course_stale_after_cycles)
             pruned = store.prune(older_than_days=cfg.course_prune_after_days)
-        return {"staleness_summary": {"marked_stale": marked, "pruned": pruned}}
+            stats_pruned = store.prune_stats_windows(keep=cfg.stats_windows_to_keep())
+        return {"staleness_summary": {"marked_stale": marked, "pruned": pruned,
+                                      "stats_windows_pruned": stats_pruned}}
     return staleness
 
 
@@ -243,6 +305,7 @@ def _assemble(state, outcomes, health_rows) -> dict[str, Any]:
         "ingest": ingest,
         "ingest_errors": state.get("ingest_errors", []),
         "ageing": state.get("ageing", {}),
+        "enrichment_backlog": state.get("enrichment_backlog", {}),
         "staleness": state.get("staleness_summary", {}),
         "aggregation": agg,
         "signals": {

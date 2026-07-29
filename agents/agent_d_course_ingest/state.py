@@ -27,6 +27,9 @@ class CourseIngestState(TypedDict, total=False):
     # {"aged": [...], "not_aged": [...]} — which sources were trustworthy enough
     # a census to age their unseen inventory this cycle, and which were not.
     ageing: dict[str, Any]
+    # {attempted, observed, failed, unparsed, remaining_before} — the
+    # backlog a backfill leaves behind, draining a budget at a time.
+    enrichment_backlog: dict[str, Any]
     staleness_summary: dict[str, Any]
     aggregation_summary: dict[str, Any]
     source_health: list[dict[str, Any]]

@@ -34,13 +34,6 @@ class FakeCourseStore:
         r = self.rows.get(cid)
         return r.status if r else None
 
-    def touch_seen(self, ids: list[str]) -> int:
-        self.touched.extend(ids)
-        for i in ids:
-            if i in self.rows and self.rows[i].status == "stale":
-                self.rows[i].status = "active"
-        return len(ids)
-
     _VOLATILE = ("rating", "review_count", "enrollment_count", "last_updated",
                  "price_amount", "price_currency", "price_is_free")
 

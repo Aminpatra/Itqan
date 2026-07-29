@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Transcript file(s), PDF or image. Several are joined in the order given.",
     )
     parser.add_argument("--output-dir", help="Where run artifacts go (default: ./output)")
-    parser.add_argument("--model", help="OpenAI chat model (default: gpt-4o-mini)")
+    parser.add_argument("--model", help="OpenAI chat model (default: gpt-5.4-mini)")
     parser.add_argument(
         "--ocr-lang",
         help=(

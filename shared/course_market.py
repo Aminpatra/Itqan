@@ -56,7 +56,7 @@ def _connection(config: Config) -> Iterator[Any]:
 # the join/filter differ (esco concept vs exact normalized skill_key).
 _COURSE_COLUMNS = """
     c.course_id, c.name, c.provider, c.source_url, c.taught_skills,
-    c.rating, c.review_count, c.enrollment_count, c.last_updated,
+    c.rating, c.review_count, c.enrollment_count, c.level, c.last_updated,
     c.price_amount, c.price_currency, c.price_is_free
 """
 
@@ -184,6 +184,7 @@ def _candidate(row: dict[str, Any]) -> CourseCandidate:
         rating=float(row["rating"]) if row.get("rating") is not None else None,
         review_count=row.get("review_count"),
         enrollment_count=row.get("enrollment_count"),
+        level=row.get("level"),
         last_updated=row["last_updated"].isoformat() if row.get("last_updated") else None,
         price=_price(row),
     )

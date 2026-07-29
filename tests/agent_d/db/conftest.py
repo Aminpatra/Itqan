@@ -46,7 +46,11 @@ def store(migrated_dsn: str):
         conn = s.connect()
         with conn.cursor() as cur:
             cur.execute(
-                "TRUNCATE courses, skill_supply_stats, course_esco_map, course_source_health, "
+                # concept_supply_stats was added later (migration 0008) and missing it
+                # here let rows leak between cases — a test failed on a primary-key
+                # collision with a row an EARLIER test had written.
+                "TRUNCATE courses, skill_supply_stats, concept_supply_stats, "
+                "course_esco_map, course_source_health, "
                 "esco_skills, esco_labels, skill_demand_stats RESTART IDENTITY CASCADE"
             )
         conn.commit()

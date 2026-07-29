@@ -355,3 +355,45 @@ def test_demand_and_supply_join_on_esco_code(store):
         )
         row = cur.fetchone()
     assert row["demand"] == 9 and row["supply"] == 2
+
+
+# ---------------------------------------------------------------------------
+# retention — the supply side of the same unbounded-growth problem
+# ---------------------------------------------------------------------------
+def test_supply_snapshots_are_pruned_across_both_grains(store):
+    """Both grains together: a consumer joining a current concept count against
+    a stale skill count would be comparing two different days."""
+    from datetime import timedelta
+
+    conn = store.connect()
+    with conn.cursor() as cur:
+        for i in range(10):
+            w_end = AS_OF - timedelta(days=i)
+            cur.execute(
+                "INSERT INTO skill_supply_stats (skill, skill_key, window_start, "
+                "window_end, course_count) VALUES ('A','a',%s,%s,1)",
+                (w_end - timedelta(days=90), w_end))
+            cur.execute(
+                "INSERT INTO concept_supply_stats (esco_code, window_start, "
+                "window_end, course_count) VALUES ('uri:a',%s,%s,1)",
+                (w_end - timedelta(days=90), w_end))
+    conn.commit()
+
+    removed = store.prune_stats_windows(keep=8)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(DISTINCT window_end) AS n FROM skill_supply_stats")
+        skill_windows = cur.fetchone()["n"]
+        cur.execute("SELECT count(DISTINCT window_end) AS n FROM concept_supply_stats")
+        concept_windows = cur.fetchone()["n"]
+
+    assert skill_windows == 8 and concept_windows == 8
+    assert removed == 4, "both grains should have lost two windows each"
+
+
+def test_supply_retention_refuses_to_go_below_the_floor(store):
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="floor"):
+        store.prune_stats_windows(keep=1)

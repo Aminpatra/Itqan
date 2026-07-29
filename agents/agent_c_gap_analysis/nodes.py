@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from shared.config import Config
-from shared.contracts import load_profile
+from shared.contracts import SkillGap, load_profile
 from shared.job_market import export_for_agent_c, map_skills_to_esco
 
 from .skill_resolver import resolve_skills
@@ -739,6 +739,13 @@ def make_persist(deps: Deps) -> Callable[[GapState], dict]:
             ],
             "warnings": state.get("warnings", []),
         }
+
+        # Validate against the PUBLISHED contract before writing. Agent E reads
+        # this file through the same model, so a field that silently stopped
+        # being emitted here would previously surface downstream as quietly worse
+        # recommendations rather than as an error. Failing at the producer is the
+        # only place the problem is cheap to see.
+        SkillGap.model_validate(out)
 
         run_id = state.get("run_id") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         base = Path(state.get("output_dir") or deps.config.output_dir) / run_id

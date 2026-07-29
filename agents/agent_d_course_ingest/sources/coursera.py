@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+from typing import Any
 
 from shared.config import Config
 from shared.scraping.http import Blocked, PoliteClient, ResponseTooLarge, SourcePolicy
@@ -40,6 +41,11 @@ PAGE_BASE = "https://www.coursera.org"
 _RATING = re.compile(r'"ratingValue"\s*:\s*([0-9.]+)')
 _REVIEWS = re.compile(r'"ratingCount"\s*:\s*"?([0-9,]+)')
 _ENROLL = re.compile(r'([0-9][0-9,]{2,})[^0-9]{0,40}already enrolled')
+# Does the page CLAIM to have ratings at all? A course with no ratings yet ships
+# no AggregateRating block, so its absence means "genuinely unrated" while its
+# presence alongside a parse failure means the markup moved. Measured on two live
+# pages 2026-07-29 — see quality_signals.
+_RATING_MARKUP = re.compile(r'AggregateRating|"ratingValue"|"ratingCount"')
 
 
 class CourseraAdapter(BaseAdapter):
@@ -228,39 +234,69 @@ class CourseraAdapter(BaseAdapter):
         """
         if not slug:
             return course
-        page_url = COURSE_URL.format(slug=slug)
+        signals = self.quality_signals(COURSE_URL.format(slug=slug), result)
+        if signals is None:
+            return course
+        return dataclasses.replace(course, volatile_observed=True, **signals)
+
+    # ------------------------------------------------------------------
+    def quality_signals(self, page_url: str,
+                        result: AdapterResult) -> dict[str, Any] | None:
+        """Read rating / reviews / enrolments from one course page.
+
+        Returns None when nothing was OBSERVED — a robots refusal, a fetch
+        error, or a page that loaded and matched nothing — so a caller can tell
+        that from "the provider publishes none" and leave stored values alone.
+
+        Separated from the fetch loop so a stored course can be enriched without
+        re-fetching the catalog. That is not a refactor for tidiness: a backfill
+        walks far past the per-cycle page cap, and the adapter restarts at page 0
+        every cycle, so courses beyond the cap would otherwise never be revisited
+        and never get quality signals at all.
+        """
         client = self._ensure_page_client()
         assert self._robots is not None
         try:
             if not self._robots.can_fetch(page_url):
                 result.enrich_failed += 1
-                return course
+                return None
             html = client.get_text(page_url)
         except (Blocked, ResponseTooLarge):
             result.enrich_failed += 1
-            return course
+            return None
         except Exception:  # noqa: BLE001 - enrichment must never sink a course
             result.enrich_failed += 1
-            return course
+            return None
 
         rating = _parse_rating(html)
         reviews = _parse_int(_REVIEWS, html)
         enrolled = _parse_int(_ENROLL, html)
         if rating is None and reviews is None and enrolled is None:
-            # The page loaded and NOTHING matched. A live Coursera course page
-            # carries a JSON-LD rating, so this is far more likely a layout
-            # change than three genuinely absent facts. Treated as "did not
-            # observe" so it cannot erase stored values, and counted so a spike
-            # reads as "Coursera changed" instead of "no course has a rating".
+            # Nothing matched — but there are two very different reasons for
+            # that, and treating them alike was wrong.
+            #
+            # This originally assumed "a live Coursera page carries a JSON-LD
+            # rating, so nothing matching means the layout changed". Measured
+            # 2026-07-29, that is false: `machine-learning` carries the full
+            # AggregateRating block while `overcoming-challenges-in-self-and-
+            # society` carries NO rating markup at all — it simply has no
+            # ratings yet. Most of the enrichment backlog is courses like the
+            # second, so the old reading would have fired the layout-change
+            # warning constantly and re-fetched those pages forever.
+            if not _RATING_MARKUP.search(html):
+                # The page never claimed to have ratings. That IS an
+                # observation — "we looked, there are none" — so it counts, and
+                # stamping it stops the course being retried every cycle. It
+                # also correctly clears a rating that has since been withdrawn.
+                result.enriched += 1
+                return {"rating": None, "review_count": None, "enrollment_count": None}
+            # The markup is there and we could not read it: that is the layout
+            # change. Not observed, so nothing stored can be overwritten.
             result.enrich_unparsed += 1
-            return course
+            return None
 
         result.enriched += 1
-        return dataclasses.replace(
-            course,
-            rating=rating, review_count=reviews, enrollment_count=enrolled,
-            volatile_observed=True,
-        )
+        return {"rating": rating, "review_count": reviews, "enrollment_count": enrolled}
 
 
 def _parse_rating(html: str) -> float | None:

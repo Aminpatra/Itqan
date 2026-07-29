@@ -196,3 +196,51 @@ def test_a_verbose_syllabus_cannot_manufacture_unlimited_supply():
 
     padded = CourseExtraction(taught_skills=[f"skill {i}" for i in range(200)])
     assert len(padded.taught_skills) == MAX_TAUGHT_SKILLS
+
+
+# ---------------------------------------------------------------------------
+# "no rating" vs "we could not read the rating"
+# ---------------------------------------------------------------------------
+def _coursera_with_page(page_html):
+    return CourseraAdapter(
+        client=FakeClient({"/api/courses.v1": json.dumps({"elements": []})}),
+        page_client=FakeClient({"/learn/": page_html}),
+        robots=AllowAllRobots(), config=Config())
+
+
+def test_a_course_with_no_rating_markup_is_an_observation_not_a_failure():
+    """Measured 2026-07-29 on two live pages: `machine-learning` carries the
+    full AggregateRating block, `overcoming-challenges-in-self-and-society`
+    carries none at all — it simply has no ratings yet.
+
+    Treating that as "we could not read the page" (the original reading) would
+    fire the layout-change warning on most of the enrichment backlog and re-fetch
+    those pages every cycle forever. It IS an observation: we looked, there are
+    none."""
+    adapter = _coursera_with_page("<html><body>A course with no ratings yet.</body></html>")
+    result = AdapterResult(source="coursera")
+
+    observed = adapter.quality_signals("https://www.coursera.org/learn/x", result)
+    assert observed == {"rating": None, "review_count": None, "enrollment_count": None}
+    assert result.enriched == 1 and result.enrich_unparsed == 0
+
+
+def test_rating_markup_we_cannot_parse_is_a_layout_change():
+    """The other half: the block is there and we failed to read it. Not observed,
+    so nothing stored can be overwritten, and it is counted so a spike reads as
+    'Coursera changed'."""
+    adapter = _coursera_with_page('<html><script>{"@type":"AggregateRating",'
+                                  '"somethingElse":4.9}</script></html>')
+    result = AdapterResult(source="coursera")
+
+    assert adapter.quality_signals("https://www.coursera.org/learn/x", result) is None
+    assert result.enrich_unparsed == 1 and result.enriched == 0
+
+
+def test_a_readable_rating_is_parsed():
+    adapter = _coursera_with_page(fixture("coursera_course_page.html"))
+    result = AdapterResult(source="coursera")
+
+    observed = adapter.quality_signals("https://www.coursera.org/learn/x", result)
+    assert observed and observed["rating"] is not None
+    assert result.enriched == 1

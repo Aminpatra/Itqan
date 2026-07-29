@@ -477,24 +477,54 @@ class JobStore:
         the corpus as it stands now, so recomputing it has to be able to say
         "that skill is no longer in evidence", and only a delete can say that.
 
-        Stamped by ``computed_at`` rather than by diffing keys: every row this run
-        wrote (inserted or updated) carries the run's timestamp, so anything still
-        holding an older one is precisely what the recompute did not reproduce.
+        Clear-then-insert, rather than stamping rows and deleting the ones with
+        an older ``computed_at``. The stamped version was correct, but only just:
+        inside a transaction Postgres' ``now()`` is the TRANSACTION START time, so
+        the rows this run writes carry the same timestamp it compares against and
+        the whole thing rests on the comparison being a strict ``<``. Agent D
+        made exactly that mistake and deleted the rows it had just written. There
+        is no version of the ordering below with a subtlety to get wrong.
         """
         conn = self.connect()
         with conn.cursor() as cur:
-            cur.execute("SELECT now() AS t")
-            started = (cur.fetchone() or {})["t"]
-
-            cur.execute(sql, params)
-            written = cur.rowcount
-
             cur.execute(
-                "DELETE FROM skill_demand_stats "
-                " WHERE window_end = %(w_end)s AND computed_at < %(started)s",
-                {"w_end": params["w_end"], "started": started},
+                "DELETE FROM skill_demand_stats WHERE window_end = %(w_end)s",
+                {"w_end": params["w_end"]},
             )
-        return written
+            cur.execute(sql, params)
+            return cur.rowcount
+
+    def prune_stats_windows(self, *, keep: int) -> int:
+        """Drop aggregation snapshots older than the newest ``keep`` windows.
+
+        Replacement within a window was already handled; nothing pruned ACROSS
+        them, so every `window_end = (SELECT max(window_end) …)` a consumer runs
+        scanned an ever-growing pile of superseded history — measured at 4
+        windows / 4,120 rows serving 1,139 current.
+
+        The caller passes ``Config.stats_windows_to_keep()``, which floors this
+        at 2; dropping to 1 would leave `prior_frequency_count` with no prior
+        window to read and silently restore the fabricated-trend bug.
+        """
+        if keep < 2:
+            raise ValueError(
+                f"stats retention of {keep} would leave no prior window for the trend "
+                "calculation; the floor is 2 (see Config.stats_windows_to_keep)")
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM skill_demand_stats
+                 WHERE window_end < (
+                    SELECT min(window_end) FROM (
+                        SELECT DISTINCT window_end FROM skill_demand_stats
+                         ORDER BY window_end DESC LIMIT %(keep)s
+                    ) recent
+                 )
+                """,
+                {"keep": keep},
+            )
+            return cur.rowcount
 
     def scalar(self, sql: str, params: dict[str, Any] | None = None) -> Any:
         conn = self.connect()

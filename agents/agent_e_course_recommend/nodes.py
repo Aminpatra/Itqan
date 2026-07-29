@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from shared.config import Config
+from shared.contracts import load_gap
 from shared.course_market import courses_for_skills
 
 from .state import RecommendState
@@ -91,12 +92,18 @@ class Deps:
 # ===========================================================================
 def make_load_missing_skills(deps: Deps) -> Callable[[RecommendState], dict]:
     def load_missing_skills(state: RecommendState) -> dict:
-        data = json.loads(Path(state["gap_path"]).read_text(encoding="utf-8"))
-        aggregate = data.get("aggregate") or {}
-        used_fallback = bool(data.get("used_fallback"))
+        # Validated through the published contract rather than duck-typed. This
+        # used to be raw `.get()` chains, so a renamed field on Agent C's side
+        # would not fail — it would silently fall through to the far lossier
+        # `most_common_missing_skills` path and quietly produce worse
+        # recommendations. Unknown fields are still ignored, so Agent C can add
+        # to the envelope freely; what fails now is a field that VANISHES.
+        gap = load_gap(state["gap_path"])
+        aggregate = gap.aggregate
+        used_fallback = gap.used_fallback
         warnings: list[str] = []
 
-        details = aggregate.get("missing_skill_details")
+        details = aggregate.missing_skill_details
         missing: list[dict[str, Any]] = []
         seen: set[str] = set()
         if details:
@@ -104,28 +111,28 @@ def make_load_missing_skills(deps: Deps) -> Callable[[RecommendState], dict]:
             # inherited priority_score. Already deduped upstream; dedup again
             # defensively (a skill triggers exactly one course search).
             for d in details:
-                key = (d.get("skill") or "").strip().lower()
+                key = (d.skill or "").strip().lower()
                 if not key or key in seen:
                     continue
                 seen.add(key)
                 missing.append({
                     "skill": key,
-                    "esco_code": d.get("esco_code"),
-                    "priority_score": float(d.get("priority_score") or 0.0),
+                    "esco_code": d.esco_code,
+                    "priority_score": float(d.priority_score or 0.0),
                     # Agent C's actual market evidence, previously dropped on the
                     # floor here. `jobs_missing_in` is a plain, checkable count of
                     # retrieved postings that asked for this skill — the true
                     # version of the claim `priority_bucket` was being asked to
                     # imply. `demand_rate`/`low_confidence` say how much the
                     # demand side trusts its own numbers.
-                    "jobs_missing_in": d.get("jobs_missing_in"),
-                    "demand_rate": d.get("demand_rate"),
-                    "demand_low_confidence": bool(d.get("low_confidence")),
+                    "jobs_missing_in": d.jobs_missing_in,
+                    "demand_rate": d.demand_rate,
+                    "demand_low_confidence": bool(d.low_confidence),
                 })
         else:
             # Older gap file, before missing_skill_details existed: fall back to
             # the bare skill list — no ESCO codes, no weights — and say so.
-            for s in aggregate.get("most_common_missing_skills") or []:
+            for s in aggregate.most_common_missing_skills:
                 key = (s or "").strip().lower()
                 if not key or key in seen:
                     continue
@@ -146,7 +153,7 @@ def make_load_missing_skills(deps: Deps) -> Callable[[RecommendState], dict]:
         return {
             "missing": missing,
             "used_fallback": used_fallback,
-            "user_id": state.get("user_id") or data.get("user_id") or "",
+            "user_id": state.get("user_id") or gap.user_id or "",
             "warnings": warnings,
         }
 

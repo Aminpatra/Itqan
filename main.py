@@ -47,6 +47,11 @@ AGENTS = {
         "agents.agent_e_course_recommend.cli",
         "Recommend one course per missing skill from a candidate's skill gap",
     ),
+    "status": (
+        "agents.status",
+        "One read-only view of the whole system: corpus, aggregation freshness, "
+        "ESCO coverage, source health",
+    ),
     "pipeline": (
         "agents.pipeline",
         "CV in, course recommendations out: Agent A -> C -> E in one run "

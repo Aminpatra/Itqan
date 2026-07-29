@@ -43,7 +43,35 @@ class Config:
     threaded through every factory.
     """
 
-    model: str = field(default_factory=lambda: os.getenv("ITQAN_MODEL", "gpt-4o-mini"))
+    # Chosen on measurement, 2026-07-29, by running THIS system's real prompts and
+    # schemas (n=5) rather than on reputation. Two probes, both places where a
+    # silent failure is expensive: Agent C's subsumption boundary (TensorFlow
+    # satisfies "machine learning", JavaScript does NOT satisfy Java) and Agent
+    # D's canonical-naming fold ("MS Excel" -> excel, which is what stops the
+    # demand<->supply join fragmenting).
+    #
+    #   model           canonical  subsumption  median   est. $/month
+    #   gpt-4o-mini       5/5         5/5        1.50s      1.41     (previous)
+    #   gpt-5.4-mini      5/5         5/5        0.93s      8.32     <- chosen
+    #   gpt-5.4           5/5         5/5        1.38s     27.74
+    #   gpt-5.4-nano      0/5         5/5        0.97s      2.26     disqualified
+    #   gpt-5-nano         -          5/5      12-19s        -       disqualified
+    #
+    # gpt-5.4-mini strictly dominates the previous default on both measurable
+    # axes — 1.6x faster, identical on every quality probe — for a price
+    # difference that is immaterial: the WHOLE system costs single-digit dollars
+    # a month, so speed and quality are the real axes, not price.
+    #
+    # Two traps worth recording. `gpt-5.4-nano` is cheap and fast and fails the
+    # canonical rule 0/5, which would quietly undo an Agent D fix. And the
+    # GPT-5.0 generation's list price lies: `gpt-5-nano` is priced BELOW
+    # gpt-4o-mini yet cost 9.4x more per call, because it emitted 4,480 reasoning
+    # tokens across two trivial calls — billed at the output rate — and took
+    # 12-19s, which would turn a 1,335-course backfill into 4-7 hours.
+    #
+    # NOT tiered per agent: every candidate scored 5/5 on both probes, so there
+    # is no measured evidence a stronger model improves any output here.
+    model: str = field(default_factory=lambda: os.getenv("ITQAN_MODEL", "gpt-5.4-mini"))
     temperature: float = 0.0
 
     # --- grounding thresholds (see shared/grounding.py) ---
@@ -133,6 +161,20 @@ class Config:
     neardup_recent_days: int = 14
     neardup_candidates: int = 5
 
+    # How many aggregation snapshots to keep, for BOTH agents' stats tables.
+    #
+    # Every consumer filters with `window_end = (SELECT max(window_end) …)`, and
+    # nothing was pruning across windows: measured 2026-07-28, skill_demand_stats
+    # held 4 windows / 4,120 rows to serve 1,139 current ones, and
+    # skill_supply_stats 3 windows / 18,334 to serve 10,202. At a 12h cycle that
+    # is ~730 windows a year of dead history under every query.
+    #
+    # HARD FLOOR OF 2, asserted in code rather than trusted here: Agent B's trend
+    # calculation reads `prior_frequency_count` from the STORED prior window, so
+    # a retention of 1 would silently resurrect the fabricated-trend bug its own
+    # audit fixed — every row labelled from a prior of zero.
+    stats_retention_windows: int = 8
+
     # --- legitimacy filter (score is 1.0 clean .. 0.0 certainly scam) ---
     legitimacy_reject_at: float = 0.30
     legitimacy_adjudicate_low: float = 0.30
@@ -181,6 +223,13 @@ class Config:
     # skip and leave those fields NULL for Coursera.
     coursera_enrich: bool = True
     coursera_enrich_interval_s: float = 1.0
+    # Stored courses to enrich per cycle, chosen from the DATABASE rather than
+    # from this cycle's fetch. A backfill walks past the per-cycle page cap while
+    # the adapter restarts at page 0 every cycle, so without this the ~1,300
+    # courses beyond the cap are never revisited and never get a rating — the
+    # deferred-enrichment promise the backfill makes would simply be false.
+    # Measured backlog after the 2026-07-28 backfill: 1,749 courses.
+    coursera_enrich_budget_per_cycle: int = 150
 
     # --- ESCO mapping ---
     # Minimum cosine similarity for an embedding-based skill->ESCO mapping.
@@ -326,6 +375,17 @@ class Config:
                 f"window_days ({self.window_days}): postings in the gap would be counted "
                 f"as demand but never re-seen, so they would go stale while still counted."
             )
+
+    def stats_windows_to_keep(self) -> int:
+        """Retention, with the floor that protects the trend calculation.
+
+        Enforced here rather than left to whoever edits the config, because the
+        failure it prevents is silent: with one window retained, Agent B's
+        `prior_frequency_count` lookup finds no prior, every skill is labelled
+        from a prior of zero, and the fabricated-trend bug its audit fixed comes
+        straight back — with no error and plausible-looking numbers.
+        """
+        return max(2, int(self.stats_retention_windows))
 
     def require_api_key(self) -> str:
         key = os.getenv("OPENAI_API_KEY")
