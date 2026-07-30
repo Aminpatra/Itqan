@@ -270,6 +270,7 @@ class IngestPipeline:
         row.legitimacy_score = assessment.score
         row.sector = job.sector
         row.required_skills = job.required_skills
+        row.company = job.company
         row.seniority_level = job.seniority_level
         row.location = job.location
         row.country = job.country
@@ -408,6 +409,7 @@ class IngestPipeline:
         one, else the aggregator's value is kept."""
         row.required_skills = job.required_skills
         row.sector = job.sector or row.sector
+        row.company = job.company or row.company
         row.seniority_level = job.seniority_level or row.seniority_level
         row.location = job.location or row.location
         row.country = job.country or row.country

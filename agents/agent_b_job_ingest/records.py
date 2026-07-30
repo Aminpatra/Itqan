@@ -42,6 +42,10 @@ class PersistedPosting:
     # never a placeholder.
     sector: Optional[str] = None
     required_skills: list[str] = field(default_factory=list)
+    # The employer, as the posting names it. Extracted and grounded since the
+    # first version and then dropped for want of a column — see migration 0010.
+    # None means the posting named none, which is a real answer.
+    company: Optional[str] = None
     seniority_level: Optional[str] = None
     location: Optional[str] = None
     country: Optional[str] = None

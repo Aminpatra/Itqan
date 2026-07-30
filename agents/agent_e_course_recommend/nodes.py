@@ -272,6 +272,22 @@ def _field_key(cc: Any, field_name: str, ctx: dict[str, Any] | None = None) -> f
     if field_name == "price":
         amt = cc.price.amount if (cc.price and cc.price.amount is not None) else None
         return amt if amt is not None else _INF        # cheaper = smaller = better; free(0) wins
+    if field_name == "price_is_free":
+        # The candidate asked for free courses. This is a RANKING field, not a
+        # filter (user decision 2026-07-30): a gap whose only course is paid still
+        # needs an answer, and on the measured corpus a filter would cut 2,099
+        # courses to the 98 freeCodeCamp ones.
+        #
+        # Three-valued on purpose, and the middle value is the point. 0 of 1,999
+        # Coursera courses publish a price, so "not free" and "we do not know"
+        # are overwhelmingly the common cases and they are NOT the same claim.
+        # An unknown price sorts between a known-free and a known-paid course:
+        # ahead of something we know costs money, behind something we know does
+        # not. Coercing unknown to "paid" would bury most of the catalogue on a
+        # fact nobody established.
+        if cc.price is None:
+            return 1.0                                 # unknown
+        return 0.0 if cc.price.is_free else 2.0
     raise ValueError(f"unknown agent_e_tiebreak field {field_name!r}")
 
 
@@ -357,13 +373,26 @@ def greedy_assign(
     return assigned, no_course_found, basis
 
 
+def effective_tiebreak(configured: tuple[str, ...], *, prefer_free: bool) -> tuple[str, ...]:
+    """The tiebreak chain for this run, with the candidate's answer applied.
+
+    Prepending rather than replacing is the whole design: "free" decides FIRST,
+    and every configured signal still decides among the courses that tie on it. A
+    preference reorders the ranking; it never throws the ranking away.
+    """
+    if not prefer_free:
+        return configured
+    return ("price_is_free", *(f for f in configured if f != "price_is_free"))
+
+
 def make_greedy_cover_assign(deps: Deps) -> Callable[[RecommendState], dict]:
     def greedy_cover_assign(state: RecommendState) -> dict:
         assigned, no_course, basis = greedy_assign(
             state.get("missing", []),
             state.get("skill_candidates", {}),
             state.get("courses_by_id", {}),
-            tuple(deps.config.agent_e_tiebreak),
+            effective_tiebreak(tuple(deps.config.agent_e_tiebreak),
+                               prefer_free=bool(state.get("prefer_free"))),
             prior_reviews=deps.config.agent_e_rating_prior_reviews,
             resolution=deps.config.agent_e_rating_resolution,
         )
@@ -514,7 +543,29 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
 # ===========================================================================
 # 5. generate_rationale  (the ONLY LLM call — one per recommended course)
 # ===========================================================================
-def _render_user_message(rec: dict[str, Any], used_fallback: bool) -> str:
+def _asked_for_line(rec: dict[str, Any], prefer_free: bool) -> str:
+    """What the candidate asked for, and whether THIS course satisfies it.
+
+    The second half is the part that matters. Telling a model "the learner wants
+    free courses" without also telling it what this course costs is an invitation
+    to congratulate itself: measured on this corpus, 0 of 1,999 Coursera courses
+    publish a price, so the most likely course in front of it has an unknown price
+    and "free, as you asked" would be a fabrication with a friendly tone.
+    """
+    if not prefer_free:
+        return "nothing stated"
+    price = (rec["course"]["quality"] or {}).get("price") or {}
+    if price.get("is_free"):
+        return "free courses — this one IS free, so you may say so"
+    if price.get("amount") is not None:
+        return ("free courses — this one is NOT free, and it was chosen because "
+                "nothing free covers the skill. Do NOT call it free")
+    return ("free courses — this course's price is NOT published, so it may or may "
+            "not be free. Do NOT call it free")
+
+
+def _render_user_message(rec: dict[str, Any], used_fallback: bool,
+                         prefer_free: bool = False) -> str:
     """The verbatim USER MESSAGE TEMPLATE, filled from the finalized record.
     Nulls become 'not available' (never a guess); priority_score and esco_code
     are deliberately absent — only priority_bucket's plain word appears."""
@@ -586,6 +637,7 @@ def _render_user_message(rec: dict[str, Any], used_fallback: bool) -> str:
         f"Rank among your own gaps: {rec['priority_bucket']}",
         f"Courses available for this skill: {supply_line}",
         f"Recommendation basis: {basis}",
+        f"What the learner asked for: {_asked_for_line(rec, prefer_free)}",
     ])
 
 
@@ -660,6 +712,11 @@ _SCARCITY = re.compile(
     r"\b(few|small number|limited (number|options|selection)|only a (few|handful)|"
     r"scarce|not many)\b", re.I)
 _FALLBACK_HEDGE = re.compile(r"\bgeneral demand\b", re.I)
+# A price claim, which the record settles exactly. `\bfree\b` deliberately does
+# NOT match "freeCodeCamp" (no word boundary between "free" and "C"), which is a
+# real provider name on this corpus and appears in the fact sheet.
+_FREE_CLAIM = re.compile(
+    r"\b(free|no cost|costs? nothing|free of charge|zero cost|at no charge)\b", re.I)
 
 
 def verify_claims(text: str, rec: dict[str, Any], used_fallback: bool) -> Optional[str]:
@@ -681,6 +738,21 @@ def verify_claims(text: str, rec: dict[str, Any], used_fallback: bool) -> Option
 
     if _FALLBACK_HEDGE.search(text or "") and not used_fallback:
         return "offers the general-demand hedge on a run matched to specific postings"
+
+    # "It's free" is the claim most likely to be acted on and the easiest to get
+    # wrong, because the fact sheet now tells the model the learner ASKED for free
+    # courses. Only `is_free` licenses it: an unpublished price is not evidence of
+    # a zero one, which is the same null-is-not-0.0 rule the price column itself
+    # follows. The course title is excised first so a course legitimately called
+    # "Free Fall Physics" cannot fail its own recommendation.
+    price = (rec.get("course", {}).get("quality") or {}).get("price") or {}
+    if not price.get("is_free"):
+        title = (rec.get("course", {}) or {}).get("title") or ""
+        body = re.sub(re.escape(title), " ", text or "", flags=re.I) if title else (text or "")
+        if _FREE_CLAIM.search(body):
+            stated = "no price is published for it" if price.get("amount") is None \
+                else f"it costs {price['amount']}"
+            return f"calls the course free when {stated}"
 
     # An arbitrary pick that reads as a considered one is the exact dishonesty
     # `selection_basis` exists to prevent, so the caveat is mandatory rather than
@@ -736,7 +808,8 @@ def make_generate_rationale(deps: Deps) -> Callable[[RecommendState], dict]:
             if rec.get("no_course_found") or not rec.get("course"):
                 continue
 
-            human = _render_user_message(rec, used_fallback)
+            human = _render_user_message(rec, used_fallback,
+                                        bool(state.get("prefer_free")))
             # The deterministic sentence is the FLOOR, not an error path. Every
             # recommendation gets a real rationale even with no model wired
             # (--no-rationale), where the field used to be published as "" — an
@@ -808,7 +881,13 @@ def make_persist(deps: Deps) -> Callable[[RecommendState], dict]:
             # An output that cannot be reproduced or re-interpreted from itself is
             # not auditable. Agent C's `calibration` block is the precedent.
             "calibration": {
-                "tiebreak": list(deps.config.agent_e_tiebreak),
+                # The chain THIS run used, not the configured default: with
+                # `prefer_free` the two differ, and the ranking is only
+                # reproducible from the one that was actually applied.
+                "tiebreak": list(effective_tiebreak(
+                    tuple(deps.config.agent_e_tiebreak),
+                    prefer_free=bool(state.get("prefer_free")))),
+                "prefer_free": bool(state.get("prefer_free")),
                 "rating_prior_reviews": deps.config.agent_e_rating_prior_reviews,
                 "max_candidates_per_skill": deps.config.agent_e_max_candidates_per_skill,
                 "thin_supply_below": deps.config.course_low_confidence_min_courses,

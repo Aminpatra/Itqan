@@ -94,9 +94,35 @@ def make_build_query_embedding(deps: Deps) -> Callable[[GapState], dict]:
         # inferring it would be a guess feeding a similarity score.
         headline = (profile.summary or {}).get("headline", "").strip()
         location = ((profile.candidate or {}).get("contact") or {}).get("location") or ""
-        parts = [headline]
+
+        # The candidate's own answers, from the onboarding questions. The role
+        # goes in the TITLE slot deliberately: that is the slot Agent B fills
+        # with a posting's job title, so this is the one place a stated
+        # preference can genuinely change which postings come back — rather
+        # than being recorded somewhere and ignored, which is what it was.
+        role = (state.get("preferred_role") or "").strip()
+        roles_only = bool(state.get("roles_only"))
+        arrangement = (state.get("preferred_arrangement") or "").strip()
+
+        if role and roles_only:
+            # "Not open to other roles": the CV headline is what the candidate
+            # HAS been; the role is what they want to be compared against, and
+            # they have said the two should not be pooled.
+            title = role
+        elif role:
+            title = f"{headline} / {role}" if headline else role
+        else:
+            title = headline
+
+        parts = [title]
         if location.strip():
             parts.append(location.strip())
+        if arrangement:
+            # A bias in the embedded text, and nothing more. `job_postings` has
+            # no work-arrangement column, so there is nothing to filter on;
+            # `calibration.preferences.arrangement_applied` records that this is
+            # retrieval bias so no consumer can read it as a guarantee.
+            parts.append(f"preferred work arrangement: {arrangement}")
         if skills:
             parts.append("skills: " + ", ".join(skills))
         essence = "\n".join(p for p in parts if p)
@@ -461,6 +487,12 @@ def make_gap_analysis(deps: Deps) -> Callable[[GapState], dict]:
                 # and discarded.
                 "source_url": job.source_url,
                 "posted_date": job.posted_date,
+                # The employer. Agent B extracted and grounded it from the start
+                # but had no column to keep it in, so every consumer saw None;
+                # persisted from Agent B's migration 0010. A job card without an
+                # employer is not something anyone acts on.
+                "company": job.company,
+                "source": job.source,
                 "seniority_level": job.seniority_level,
                 "location": job.location,
                 "similarity": round(job.similarity, 4),
@@ -731,6 +763,26 @@ def make_persist(deps: Deps) -> Callable[[GapState], dict]:
                 "agent_c_min_usable_postings": deps.config.agent_c_min_usable_postings,
                 "agent_c_llm_matching": deps.config.agent_c_llm_matching,
                 "top_k": state.get("top_k"),
+                # What the candidate asked for, and — just as important — how far
+                # each answer was actually acted on. `arrangement_applied` is
+                # "retrieval_bias" rather than "filter" because nothing in the
+                # corpus records a posting's work arrangement: the answer nudges
+                # the embedded query text and that is the whole of its effect.
+                # Recording the weakness is what stops a reader assuming the
+                # stronger claim.
+                "preferences": {
+                    "preferred_role": state.get("preferred_role") or None,
+                    "roles_only": bool(state.get("roles_only")),
+                    "preferred_arrangement": state.get("preferred_arrangement") or None,
+                    "role_applied": (
+                        "replaced_headline" if state.get("preferred_role")
+                        and state.get("roles_only")
+                        else "joined_headline" if state.get("preferred_role") else None
+                    ),
+                    "arrangement_applied": (
+                        "retrieval_bias" if state.get("preferred_arrangement") else None
+                    ),
+                },
             },
             # The user-decided home for candidate-side ESCO evidence,
             # including near-miss scores for unmapped skills.

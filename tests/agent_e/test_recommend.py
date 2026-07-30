@@ -69,7 +69,8 @@ def detail(skill, esco, priority):
     return {"skill": skill, "esco_code": esco, "priority_score": priority}
 
 
-def run_graph(tmp_path, missing_details, *, reader, llm=None, used_fallback=False, user_id="u1"):
+def run_graph(tmp_path, missing_details, *, reader, llm=None, used_fallback=False,
+              user_id="u1", **initial):
     llm = llm or FakePlainLLM()
     tmp_path.mkdir(parents=True, exist_ok=True)
     gap = {
@@ -84,7 +85,7 @@ def run_graph(tmp_path, missing_details, *, reader, llm=None, used_fallback=Fals
     deps = Deps(config=Config(), llm=llm, courses_reader=reader)
     state = build_recommend_graph(deps).invoke({
         "gap_path": str(tmp_path / "skill_gap.json"),
-        "output_dir": str(tmp_path), "run_id": "t",
+        "output_dir": str(tmp_path), "run_id": "t", **initial,
     })
     out = json.loads((tmp_path / "t" / "course_recommendations.json").read_text(encoding="utf-8"))
     return state, out, llm

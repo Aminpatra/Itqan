@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Callable, Optional
 
 from shared.config import Config
+from shared.graph_progress import run_reporting
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +40,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sector", default=None,
                         help="ISCO-08 major group '0'-'9' for the stats fallback; "
                         "overrides the modal-sector inference")
+    # What the candidate asked for. These shape RETRIEVAL — which postings the
+    # candidate is compared against — and never whether a requirement counts as
+    # satisfied: that is grounded evidence, not a preference.
+    parser.add_argument("--preferred-role", default=None,
+                        help="The role the candidate wants, e.g. 'Data Analyst'. Takes "
+                        "the title slot in the query essence, so it changes which "
+                        "postings are retrieved")
+    parser.add_argument("--roles-only", action="store_true",
+                        help="With --preferred-role, the role REPLACES the CV headline "
+                        "instead of joining it — for a candidate not open to other roles")
+    parser.add_argument("--preferred-arrangement", default=None,
+                        help="remote / hybrid / onsite. A retrieval-text bias only: no "
+                        "posting records its work arrangement, so this cannot filter, "
+                        "and the output says so")
     parser.add_argument("--user-id", default=None,
                         help="Identifier written to the output (default: the profile's run_id)")
     parser.add_argument("--output-dir", default=None)
@@ -45,7 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *,
+         on_node: Optional[Callable[[str], None]] = None) -> int:
+    """`on_node` reports each finished graph node; see Agent A's CLI."""
     args = build_parser().parse_args(argv)
     config = Config()
 
@@ -80,14 +98,17 @@ def main(argv: list[str] | None = None) -> int:
     graph = build_gap_graph(deps)
 
     def analyse(profile_path: str, *, run_id=None, output_dir=None) -> dict:
-        state = graph.invoke({
+        state = run_reporting(graph, {
             "profile_path": profile_path,
             "user_id": args.user_id,
             "top_k": args.top_k,
             "sector_override": args.sector,
+            "preferred_role": args.preferred_role,
+            "roles_only": args.roles_only,
+            "preferred_arrangement": args.preferred_arrangement,
             "output_dir": output_dir if output_dir is not None else args.output_dir,
             "run_id": run_id if run_id is not None else args.run_id,
-        })
+        }, on_node=on_node)
         _print_result(state, config)
         return state
 
@@ -134,6 +155,15 @@ def _print_result(state: dict, config: Config) -> None:
     sims = sorted(
         (round(p.similarity, 3) for p in state.get("postings", [])), reverse=True
     )
+    # Printed because a preference silently changing which postings were retrieved
+    # is exactly the kind of shift that is impossible to notice after the fact.
+    role = state.get("preferred_role")
+    if role:
+        how = "replacing the CV headline" if state.get("roles_only") else "alongside the CV headline"
+        print(f"  role       {arabize(role)}  ({how})")
+    if state.get("preferred_arrangement"):
+        print(f"  arrangement {state['preferred_arrangement']}  (retrieval bias only — "
+              f"no posting records this)")
     print(f"  retrieved  {len(sims)} postings; similarities: {sims}")
     print(f"  usable     {len(state.get('usable_postings', []))} at threshold "
           f"{config.agent_c_match_threshold} "

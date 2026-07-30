@@ -10,12 +10,14 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 from langgraph.types import Command
 
 from shared.artifacts import new_run_id
 from shared.config import PROJECT_ROOT, Config
+
+from shared.graph_progress import run_reporting
 
 from .graph import build_graph
 from .nodes.human_review import SKIP_SENTINEL
@@ -138,7 +140,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *,
+         on_node: Optional[Callable[[str], None]] = None) -> int:
+    """`on_node` is called with each graph node's name as it finishes.
+
+    It exists so a caller driving this agent for a user — the web app — can show
+    real progress instead of two checkpoints an OCR pass apart. Optional, and when
+    absent the graph is invoked exactly as before.
+    """
     args = build_parser().parse_args(argv)
 
     cv_paths = [Path(p).expanduser() for p in args.cv]
@@ -198,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     if transcript_paths:
         print(f"  transcript: {_describe(transcript_paths)}")
 
-    state = app.invoke(initial, config=graph_config)
+    state = run_reporting(app, initial, config=graph_config, on_node=on_node)
 
     while state.get("__interrupt__"):
         payload = state["__interrupt__"][0].value

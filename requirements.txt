@@ -25,3 +25,15 @@ selectolax>=0.3
 # cannot shape Arabic, so CLI prints pre-shape it. Never applied to stored data.
 arabic-reshaper>=3.0
 python-bidi>=0.4
+
+# --- api/ : the web app's backend -----------------------------------------
+# FastAPI serves the frontend at /api. Chosen over adding a Node service because
+# the pipeline, its contracts (shared/contracts.py) and its read surfaces are all
+# Python — a JS backend would have to restate the eligibility predicates and would
+# drift from them, which is the class of bug the shared read surfaces exist to
+# prevent.
+fastapi>=0.115
+uvicorn[standard]>=0.34
+# Required by FastAPI for multipart Form/File: the document upload and the site's
+# login form both post multipart, so without it those routes 500 at import time.
+python-multipart>=0.0.20

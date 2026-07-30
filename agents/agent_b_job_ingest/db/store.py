@@ -835,7 +835,7 @@ _UPSERT_SQL = """
 INSERT INTO job_postings (
     posting_id, source, source_group, source_type, source_url, source_post_url,
     title, raw_description, content_hash,
-    status, sector, required_skills, seniority_level, location, country, posted_date,
+    status, sector, required_skills, company, seniority_level, location, country, posted_date,
     legitimacy_score, review_reason, duplicate_of,
     listing_intent, poster_type, extraction_model, embedding,
     first_seen_at, last_seen_at, missed_cycles, stale_since
@@ -843,7 +843,7 @@ INSERT INTO job_postings (
     %(posting_id)s, %(source)s, %(source_group)s, %(source_type)s, %(source_url)s,
     %(source_post_url)s,
     %(title)s, %(raw_description)s, %(content_hash)s,
-    %(status)s, %(sector)s, %(required_skills)s, %(seniority_level)s, %(location)s,
+    %(status)s, %(sector)s, %(required_skills)s, %(company)s, %(seniority_level)s, %(location)s,
     %(country)s, %(posted_date)s,
     %(legitimacy_score)s, %(review_reason)s, %(duplicate_of)s,
     %(listing_intent)s, %(poster_type)s, %(extraction_model)s, %(embedding)s,
@@ -861,6 +861,7 @@ ON CONFLICT (posting_id) DO UPDATE SET
     status = EXCLUDED.status,
     sector = EXCLUDED.sector,
     required_skills = EXCLUDED.required_skills,
+    company = EXCLUDED.company,
     seniority_level = EXCLUDED.seniority_level,
     location = EXCLUDED.location,
     country = EXCLUDED.country,
@@ -894,6 +895,7 @@ def _row_params(row: Any) -> dict[str, Any]:
         "status": row.status,
         "sector": row.sector,
         "required_skills": row.required_skills,
+        "company": row.company,
         "seniority_level": row.seniority_level,
         "location": row.location,
         "country": row.country,

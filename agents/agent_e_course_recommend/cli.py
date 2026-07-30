@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Callable, Optional
 
 from shared.config import Config
+from shared.graph_progress import run_reporting
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,12 +33,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip the LLM step. Rationales are still written, built "
                         "deterministically from the same facts, so the agent is fully "
                         "offline and reproducible (no API key needed)")
+    parser.add_argument("--prefer-free", action="store_true",
+                        help="The candidate asked for free courses. Moves free-ness to "
+                        "the front of the tie-break; it never EXCLUDES a paid course, "
+                        "because a gap whose only course is paid still needs an answer")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--run-id", default=None)
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *,
+         on_node: Optional[Callable[[str], None]] = None) -> int:
+    """`on_node` reports each finished graph node; see Agent A's CLI."""
     args = build_parser().parse_args(argv)
     config = Config()
 
@@ -62,12 +70,13 @@ def main(argv: list[str] | None = None) -> int:
     graph = build_recommend_graph(deps)
 
     try:
-        state = graph.invoke({
+        state = run_reporting(graph, {
             "gap_path": args.gap,
             "user_id": args.user_id,
+            "prefer_free": args.prefer_free,
             "output_dir": args.output_dir,
             "run_id": args.run_id,
-        })
+        }, on_node=on_node)
     except (FileNotFoundError, ValueError) as exc:
         print(f"  {exc}\n", file=sys.stderr)
         return 2

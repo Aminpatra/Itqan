@@ -35,6 +35,9 @@ def test_real_migrations_are_discoverable_and_ordered():
         "esco",
         "source_post_url",
         "stat_denominators",
+        # 0010: persists `company`, which was extracted and grounded from the
+        # first version and then discarded for want of a column.
+        "posting_company",
     ]
 
 

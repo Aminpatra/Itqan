@@ -1,0 +1,15 @@
+-- Persist the employer name.
+--
+-- `JobExtraction.company` has existed since the first version: it is extracted,
+-- validated (schemas.py) and grounded — and then discarded, because
+-- PersistedPosting had no column for it. That was finding A5 of the Agent B
+-- audit, and it had two costs:
+--
+--   1. `no_employer_named`, the second-strongest legitimacy signal, was
+--      unreachable, since both production callers passed employer_extracted=False.
+--   2. The web app cannot render a job card without an employer. "Junior Data
+--      Analyst at —" is not a recommendation anyone acts on.
+--
+-- Nullable, because "the posting names no employer" is a real and common answer
+-- that must stay distinguishable from "we did not look".
+ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS company text;

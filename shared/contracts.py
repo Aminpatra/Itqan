@@ -188,6 +188,9 @@ class JobPostingExport(BaseModel):
 
     sector: Optional[str] = None            # ISCO-08 major group, '0'-'9'
     required_skills: list[str] = Field(default_factory=list)
+    # The employer as the posting names it; None when it names none. Persisted
+    # from migration 0010 onward — rows written before it carry None.
+    company: Optional[str] = None
     seniority_level: Optional[str] = None
     location: Optional[str] = None
     country: Optional[str] = None

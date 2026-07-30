@@ -23,6 +23,15 @@ class GapState(TypedDict, total=False):
     output_dir: str
     run_id: str
 
+    # ---- what the candidate asked for ------------------------------------
+    # Retrieval preferences, collected by the web app while Agent A was reading
+    # the documents. They shape WHICH postings this candidate is compared
+    # against — never whether a skill counts as satisfied, which is grounded
+    # evidence and not a matter of preference.
+    preferred_role: Optional[str]        # --preferred-role; takes the title slot
+    roles_only: bool                     # --roles-only; the role REPLACES the headline
+    preferred_arrangement: Optional[str]  # --preferred-arrangement; text bias only
+
     # ---- build_query_embedding -------------------------------------------
     profile: Any                       # CandidateProfile
     candidate_skills: list[str]        # accepted skill names, order preserved

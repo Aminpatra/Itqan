@@ -19,6 +19,11 @@ class RecommendState(TypedDict, total=False):
     user_id: str
     output_dir: str
     run_id: str
+    # The candidate answered "free courses" during onboarding. It moves
+    # `price_is_free` to the front of the tiebreak and lets the rationale say so
+    # — it never removes a paid course from consideration, because a gap whose
+    # only course is paid still needs an answer (user decision 2026-07-30).
+    prefer_free: bool
 
     # ---- load_missing_skills --------------------------------------------
     # Each: {"skill": str, "esco_code": str|None, "priority_score": float}

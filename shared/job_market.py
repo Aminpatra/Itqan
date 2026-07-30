@@ -114,7 +114,7 @@ def export_for_agent_c(
                     f"""
                     SELECT posting_id, source, source_group, source_type, source_url,
                            title, raw_description, sector, required_skills,
-                           seniority_level, location, country, posted_date,
+                           company, seniority_level, location, country, posted_date,
                            legitimacy_score, listing_intent, poster_type,
                            first_seen_at, last_seen_at,
                            1 - (embedding <=> %(emb)s::vector) AS similarity
