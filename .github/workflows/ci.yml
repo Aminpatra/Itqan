@@ -1,0 +1,52 @@
+# Tests on every push and pull request. `deploy.yml` waits on this.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A newer push makes the previous answer irrelevant; cancel it rather than pay
+  # for two verdicts on the same branch.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: pytest (offline + Postgres)
+    runs-on: ubuntu-latest
+
+    services:
+      # The DB suites are not extras: ownership scoping, ON CONFLICT upserts and
+      # the eligibility predicates are all SQL and cannot be checked against a
+      # dictionary. pgvector because the embedding columns need the type — the
+      # same image docker-compose.yml runs, so "green in CI" means something.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: itqan_ci
+          POSTGRES_DB: itqan_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install
+        # requirements-ocr.txt is skipped on purpose: it is 1.2 GB, and
+        # `tests/agent_a/test_detect_ocr_optional.py` forces BOTH the
+        # OCR-present and OCR-absent branches rather than inferring from what is
+        # installed. Skipping it keeps the run fast without losing coverage.
+        run: pip install -r requirements.txt
+
+      - name: Tests
+        env:
+          ITQAN_TEST_DATABASE_URL: postgresql://postgres:itqan_ci@localhost:5432/itqan_test
+        run: python -m pytest tests/ -q

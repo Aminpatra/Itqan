@@ -67,6 +67,10 @@ class FakeRunner(PipelineRunner):
     """
 
     def __init__(self, *, fail_at: str | None = None) -> None:
+        # A real Config, because the base class reaches for `self.config` — the
+        # profile-restore path resolves `output_dir` through it. A fake that skips
+        # the parent's __init__ diverges from the thing it stands in for.
+        super().__init__(Config())
         self.fail_at = fail_at
         self.stages: list[str] = []
         self.calls: list[str] = []

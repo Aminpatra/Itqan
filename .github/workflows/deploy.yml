@@ -1,0 +1,104 @@
+# Push to main -> image built here -> VPS pulls it.
+#
+# **Built on GitHub, not on the box, and that is the whole design.** The image
+# with OCR is ~2 GB and installing paddle unpacks wheels that need more memory
+# than the VPS has spare while it is also serving requests and running Postgres.
+# Building there would be slow at best and would OOM the live service at worst.
+# GitHub's runners build it; the VPS only pulls a finished layer set.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # a manual redeploy, for when the box was rebuilt
+
+concurrency:
+  # NEVER cancel a deploy in flight: interrupting `docker compose up -d` can
+  # leave the stack half-swapped. Queue instead.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # Nothing ships until the suite is green. This is the only gate.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # to push to GHCR
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # provided, no setup needed
+
+      - id: meta
+        run: echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}-api" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            WITH_OCR=1
+          # Two tags: `latest` is what compose pulls, the SHA is what lets you say
+          # "roll back to the one before" without guessing.
+          tags: |
+            ${{ steps.meta.outputs.tag }}:latest
+            ${{ steps.meta.outputs.tag }}:${{ github.sha }}
+          # Layer cache in the registry. Without it every deploy re-downloads and
+          # re-installs 1.2 GB of paddle, which is ~10 minutes of nothing.
+          cache-from: type=registry,ref=${{ steps.meta.outputs.tag }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.tag }}:buildcache,mode=max
+
+  release:
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull and restart on the VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true          # a failing line fails the deploy
+          script: |
+            set -euo pipefail
+            cd /opt/itqan
+            # The compose file and the cron schedule are versioned, so the box
+            # needs the new ones too — but the image comes from the registry, not
+            # from a build here.
+            git pull --ff-only
+            docker compose pull api
+            docker compose up -d
+            # Wait for the healthcheck rather than declaring success on exit 0
+            # from `up -d`, which only means the container was created.
+            for i in $(seq 1 30); do
+              if [ "$(docker inspect -f '{{.State.Health.Status}}' itqan-api-1 2>/dev/null)" = "healthy" ]; then
+                echo "healthy after ${i}0s"; exit 0
+              fi
+              sleep 10
+            done
+            echo "did not become healthy — rolling back"
+            docker compose logs --tail 50 api
+            exit 1
+
+      - name: Prune old images
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          # 40 GB of disk and a 2 GB image per deploy fills up faster than it
+          # sounds. Keeps the running one and the previous.
+          script: docker image prune -af --filter "until=168h"

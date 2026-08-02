@@ -26,6 +26,60 @@ def test_a_missing_price_stays_null_and_never_becomes_free():
     assert out[0]["price"] is None and out[0]["currency"] is None
 
 
+def _course(**quality):
+    return {"recommendations": [{
+        "skill": "power bi", "no_course_found": False,
+        "course": {"course_id": "c", "title": "T", "provider": "Rutgers",
+                   "source": quality.pop("source", None), "url": "u",
+                   "covers_other_skills": [], "quality": quality},
+    }]}
+
+
+# ---------------------------------------------------------------------------
+# what can be SAID about a price we never saw
+# ---------------------------------------------------------------------------
+def test_an_unpriced_coursera_course_is_labelled_paid():
+    """A card showing nothing where the price belongs is useless to someone
+    choosing what to study, and this is the normal case rather than an edge one:
+    measured, 0 of 1,999 Coursera courses publish a price anywhere.
+
+    The label is a claim about the PLATFORM's catalogue, which is true, and the
+    amount stays null because no amount was ever observed."""
+    out = courses(_course(price=None, source="coursera"))[0]
+    assert out["priceLabel"] == "paid"
+    assert out["price"] is None, "labelling it must not invent an amount"
+    assert out["currency"] is None
+
+
+def test_a_free_course_is_labelled_free_not_paid():
+    out = courses(_course(price={"amount": 0.0, "currency": None, "is_free": True},
+                          source="freecodecamp"))[0]
+    assert out["priceLabel"] == "free" and out["price"] == 0.0
+
+
+def test_an_unpriced_course_on_a_free_platform_is_not_called_paid():
+    """The label is per-platform, and freeCodeCamp's catalogue is not sold. An
+    unlabelled unknown is honest; 'Paid' there would be a plain falsehood."""
+    assert courses(_course(price=None, source="freecodecamp"))[0]["priceLabel"] is None
+
+
+def test_an_unknown_platform_gets_no_label():
+    """A source this mapping has not been told about must not inherit Coursera's
+    commercial model — exactly the assumption that ages badly as sources are
+    added."""
+    assert courses(_course(price=None, source="edraak"))[0]["priceLabel"] is None
+    assert courses(_course(price=None))[0]["priceLabel"] is None
+
+
+def test_a_real_amount_needs_no_label():
+    """With a number to show the label would be redundant — and it must not
+    override the amount."""
+    out = courses(_course(price={"amount": 18.0, "currency": "OMR", "is_free": False},
+                          source="coursera"))[0]
+    assert out["priceLabel"] is None
+    assert out["price"] == 18.0 and out["currency"] == "OMR"
+
+
 def test_hours_stays_null_because_agent_d_stores_no_duration():
     """Coursera's `workload` is free text and multilingual — '2 heures',
     '4 weeks of study, 2-4 hours a week'. Reducing that to one number means

@@ -292,6 +292,11 @@ class CourseCandidate(BaseModel):
     course_id: str
     title: str                                  # the course's `name` column
     provider: Optional[str] = None
+    # The platform the course is hosted on ('coursera', 'freecodecamp'), which is
+    # NOT `provider` — that is the authoring partner, so a Coursera course names a
+    # university. Consumers need the platform to say anything about how a course
+    # is sold.
+    source: Optional[str] = None
     url: str                                     # the course's `source_url` column
     taught_skills: list[str] = Field(default_factory=list)
 

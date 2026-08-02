@@ -499,6 +499,7 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
                     "course_id": cc.course_id,
                     "title": cc.title,
                     "provider": cc.provider,
+                    "source": getattr(cc, "source", None),
                     "url": cc.url,
                     "covers_other_skills": others,
                     "quality": {

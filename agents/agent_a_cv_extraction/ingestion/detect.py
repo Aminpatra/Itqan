@@ -25,6 +25,26 @@ def sniff_mime(path: Path) -> str | None:
     return kind.mime if kind else None
 
 
+# What the user is told when the document needs OCR and this build has none.
+# Written for them, not for the log: it names what the file is, says plainly that
+# this deployment cannot read it, and points at the way out — the manual-entry
+# screen the frontend already has for `agent_a_unreadable_document`.
+_NO_OCR = (
+    "this looks like a scanned or photographed document, and this deployment "
+    "cannot read those — upload a PDF with selectable text, or enter your "
+    "details by hand"
+)
+
+
+def _can_ocr() -> bool:
+    # Imported here rather than at module scope: `ocr.py` pulls in shared.config
+    # for paddle's env-var side effects, and detect_kind is on the hot path for
+    # every file including the text-layer ones that never touch OCR.
+    from .ocr import ocr_available
+
+    return ocr_available()
+
+
 def detect_kind(
     path: Path,
     *,
@@ -57,11 +77,15 @@ def detect_kind(
             return "unsupported", "PDF has no pages"
         if total >= min_chars and (total / page_count) >= min_chars_per_page:
             return "pdf_text", f"{total} chars across {page_count} page(s)"
+        if not _can_ocr():
+            return "unsupported", _NO_OCR
         return "pdf_scanned", (
             f"only {total} chars across {page_count} page(s) — treating as scanned"
         )
 
     if (mime and mime.startswith("image/")) or path.suffix.lower() in IMAGE_EXTENSIONS:
+        if not _can_ocr():
+            return "unsupported", _NO_OCR
         return "image", mime or path.suffix.lower()
 
     return "unsupported", f"unrecognised type: {mime or path.suffix or 'unknown'}"

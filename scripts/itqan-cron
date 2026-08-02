@@ -1,0 +1,33 @@
+# Ingestion schedule. Install with:
+#
+#     sudo cp scripts/itqan-cron /etc/cron.d/itqan
+#     sudo chmod 644 /etc/cron.d/itqan
+#
+# The corpus is a live thing: job postings expire, courses appear. The free-tier
+# deployment could not run these at all (scheduled jobs are a paid feature there),
+# so it would have shown a frozen snapshot of whatever was seeded — for a product
+# about current vacancies, that ages badly and visibly.
+#
+# Host cron rather than a scheduler container: it is one file, `journalctl -u cron`
+# already explains what happened, and there is no extra image to keep patched.
+#
+# Cycle lengths come from the agents themselves (`cycle_hours=12`,
+# `course_cycle_hours=72`) — they hold an advisory lock and no-op if a previous
+# run is still going, so an overlap is safe rather than a corruption.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# Agent B — job postings, every 12 hours. Offset off the hour so it does not
+# start in the same second as a snapshot or a log rotation.
+17 */12 * * * itqan cd /opt/itqan && docker compose exec -T api python main.py agent-b --once >> /var/log/itqan-agent-b.log 2>&1
+
+# Agent D — courses, every 3 days at 03:40 local. Deliberately at night: it walks
+# thousands of courses, and its enrichment budget makes real HTTP requests.
+40 3 */3 * * itqan cd /opt/itqan && docker compose exec -T api python main.py agent-d --once >> /var/log/itqan-agent-d.log 2>&1
+
+# Weekly: report runs that a restart abandoned mid-flight. `stale_runs`
+# deliberately EXCLUDES awaiting_confirmation — a user taking their time over the
+# confirm form is not a crashed process — so anything this prints is real.
+5 4 * * 1 itqan cd /opt/itqan && docker compose exec -T api python main.py status >> /var/log/itqan-status.log 2>&1

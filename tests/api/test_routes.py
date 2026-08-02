@@ -13,6 +13,8 @@ import time
 from statistics import median
 from typing import Any
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 
@@ -114,6 +116,56 @@ def test_the_session_cookie_is_not_readable_by_script(signed_in: TestClient):
                                   "password": "Str0ng!pass"}).headers["set-cookie"]
     assert "httponly" in header.lower()
     assert "samesite=lax" in header.lower()
+
+
+def test_production_refuses_to_boot_without_a_session_secret(monkeypatch):
+    """The cookie is `user_id.HMAC(secret, user_id)` and the development fallback
+    is a literal string in a public repository — so with it in place, anyone who
+    has read this file can mint a session for any account.
+
+    Refusing to start is the point. A warning in a log nobody reads would leave a
+    deployment that works perfectly right up until someone tries it.
+    """
+    from api.main import assert_deployable
+
+    monkeypatch.setenv("ITQAN_ENV", "production")
+    monkeypatch.delenv("ITQAN_SESSION_SECRET", raising=False)
+    with pytest.raises(RuntimeError, match="ITQAN_SESSION_SECRET"):
+        assert_deployable()
+
+    monkeypatch.setenv("ITQAN_SESSION_SECRET", "0" * 64)
+    assert_deployable()
+
+    # Development is unaffected — every local run and this whole suite rely on it.
+    monkeypatch.setenv("ITQAN_ENV", "development")
+    monkeypatch.delenv("ITQAN_SESSION_SECRET", raising=False)
+    assert_deployable()
+
+
+def test_phase_two_rebuilds_the_profile_when_the_disk_lost_it(tmp_path):
+    """The gap between the phases ends only when a PERSON confirms, so a restart
+    or a redeploy in between can easily take the file Agent C is handed.
+
+    Postgres kept the same envelope (`attach_profile`), so this restores it rather
+    than re-running Agent A: the bytes Agent C reads are the bytes Agent A wrote.
+    """
+    import json
+
+    from api.jobs import PipelineRunner
+    from shared.config import Config
+
+    runner = PipelineRunner(Config(output_dir=tmp_path))
+    envelope = {"candidate": {"full_name": "Maryam Al Balushi"}, "skills": {"accepted": []}}
+
+    runner.restore_profile(run_id="r1", profile=envelope)
+    written = tmp_path / "r1" / "candidate_profile.json"
+    assert json.loads(written.read_text(encoding="utf-8")) == envelope
+
+    # An existing file is never overwritten — what phase one wrote is the truth,
+    # and the stored copy is only a fallback for when it is missing.
+    written.write_text('{"candidate": {"full_name": "edited on disk"}}', encoding="utf-8")
+    runner.restore_profile(run_id="r1", profile=envelope)
+    assert "edited on disk" in written.read_text(encoding="utf-8")
 
 
 def test_a_forged_cookie_is_rejected(client: TestClient):

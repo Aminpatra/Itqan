@@ -21,6 +21,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # feel hung on a slow connection. Our models are already cached locally.
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
+# Paddle's oneDNN kernels, OFF.
+#
+# Measured 2026-08-01 in the deployment container (python:3.13-slim, paddlepaddle
+# 3.3.0): every inference raises
+#
+#     NotImplementedError: (Unimplemented) ConvertPirAttribute2RuntimeAttribute
+#     not support [pir::ArrayAttribute<pir::DoubleAttribute>]
+#         at .../new_executor/instruction/onednn/onednn_instruction.cc:116
+#
+# The models load and the engine constructs fine; only `predict()` explodes, so
+# nothing catches it until a real scanned page arrives. `FLAGS_use_mkldnn` and
+# `FLAGS_enable_pir_api` are both ignored — PaddleX chooses the backend itself,
+# and this is the switch it reads.
+#
+# `setdefault`, so a machine where oneDNN works can opt back into it for the
+# speed. A crash is worse than a slower page.
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
+
 # This env emits a RequestsDependencyWarning on every invocation (urllib3/chardet
 # version skew). Harmless, but it corrupts the gap-collection prompts.
 warnings.filterwarnings("ignore", message=".*urllib3.*chardet.*")
@@ -98,6 +116,13 @@ class Config:
     max_coursework_derived_skills: int = 15
 
     ocr_lang: str = "en"
+    # The text DETECTION model. PaddleOCR defaults to `PP-OCRv5_server_det`,
+    # which needed more than 3 GB to run one CV page and was OOM-killed in a 2 GB
+    # container; the mobile variant reads the same page correctly at a measured
+    # 1,228 MB peak. That difference is what makes OCR fit on a 4 GB box beside
+    # Postgres. Set to "PP-OCRv5_server_det" if you have the memory and want the
+    # accuracy on hard scans.
+    ocr_detection_model: str = "PP-OCRv5_mobile_det"
     pdf_raster_dpi: int = 200
 
     # A PDF needs at least this much extractable text to count as having a real
@@ -105,7 +130,13 @@ class Config:
     pdf_text_min_chars: int = 200
     pdf_text_min_chars_per_page: int = 50
 
-    output_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "output")
+    # Where uploads and per-run artifacts land. Env-settable because a deployment
+    # mounts a volume wherever it likes, and the default — inside the source tree
+    # — is exactly the wrong place when the source tree is a read-only image
+    # layer. Unset, the behaviour is unchanged.
+    output_dir: Path = field(
+        default_factory=lambda: Path(os.getenv("ITQAN_OUTPUT_DIR") or (PROJECT_ROOT / "output"))
+    )
 
     # ------------------------------------------------------------------
     # Agent B — job ingestion

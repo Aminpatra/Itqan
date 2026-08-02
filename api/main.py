@@ -60,6 +60,8 @@ def create_app(config: Optional[Config] = None, *,
     """Dependencies are injected, like every agent's `Deps` — so the tests drive
     the real routes with a fake pipeline and never touch OpenAI or OCR."""
     config = config or Config()
+    # Before anything else, and before a single request can be served.
+    assert_deployable()
     app = FastAPI(title="Itqan API", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
     if migrate:
@@ -100,7 +102,13 @@ def create_app(config: Optional[Config] = None, *,
         # app are same-site. Secure is omitted on http://localhost, where the
         # browser would otherwise drop the cookie and every local login would
         # silently fail to establish a session.
-        secure = not str(config.database_url).startswith("postgresql://postgres:itqan_dev")
+        # Keyed off ITQAN_ENV, not off a substring of the database URL. The old
+        # heuristic inferred "am I local?" from the dev password appearing in the
+        # DSN — correct by luck, and wrong the moment the DSN changes (which
+        # deploying it does). Secure is omitted locally because the browser drops
+        # a Secure cookie on http://localhost and every local login would then
+        # silently fail to establish a session.
+        secure = in_production()
         response.set_cookie(SESSION_COOKIE, _token_for(user_id), httponly=True,
                             samesite="lax", secure=secure, path="/")
         response.set_cookie(LOCALE_COOKIE, locale, httponly=False,
@@ -280,7 +288,11 @@ def create_app(config: Optional[Config] = None, *,
         app.state.store.save_run_preferences(awaiting["job_id"], preferences)
         jobs_module.spawn_phase_two(
             app.state.store, app.state.runner, job_id=awaiting["job_id"],
-            run_id=awaiting["run_id"], preferences=preferences)
+            run_id=awaiting["run_id"], preferences=preferences,
+            # Agent A's envelope, so phase two can rebuild the file Agent C reads
+            # if a restart lost it. The wait between the phases ends when a PERSON
+            # acts, so it is unbounded.
+            profile=awaiting.get("profile"))
         # The job id goes back so the UI can keep watching: the agents are still
         # working when the user lands on the dashboard, and a progress bar they can
         # see is the difference between "still going" and "broken".
@@ -327,9 +339,50 @@ def create_app(config: Optional[Config] = None, *,
 # then go stale (the frontend's own note that `onboarded` must live on the row,
 # not in a cookie, is exactly that failure).
 # ---------------------------------------------------------------------------
+_DEV_SECRET = "dev-only-not-for-production"
+
+
+def in_production() -> bool:
+    """One switch for every "is this a real deployment?" decision.
+
+    Previously each site guessed for itself — the Secure cookie flag was inferred
+    from whether the database URL began with the local dev password, which worked
+    by accident and would break the moment the DSN changed.
+    """
+    import os
+
+    return os.getenv("ITQAN_ENV", "development").lower() == "production"
+
+
 def _secret() -> bytes:
     import os
-    return (os.getenv("ITQAN_SESSION_SECRET") or "dev-only-not-for-production").encode()
+    return (os.getenv("ITQAN_SESSION_SECRET") or _DEV_SECRET).encode()
+
+
+def assert_deployable() -> None:
+    """Refuse to serve with a session secret anyone can read.
+
+    The fallback above is a literal string in a **public** repository, and the
+    cookie is just `user_id.HMAC(secret, user_id)` — so with the default in place,
+    anyone who has seen this file can mint a valid session for any account. That
+    is total authentication bypass, and it is silent: everything works perfectly
+    right up until someone tries it.
+
+    A deployment that will not boot beats one that boots insecure, so this raises
+    rather than warns. Development is untouched.
+    """
+    if not in_production():
+        return
+    import os
+
+    if (os.getenv("ITQAN_SESSION_SECRET") or _DEV_SECRET) == _DEV_SECRET:
+        raise RuntimeError(
+            "ITQAN_SESSION_SECRET is unset in production. Session cookies are "
+            "signed with it, and the development fallback is public in this "
+            "repository — every account would be forgeable. Set it to a long "
+            "random value (`python -c \"import secrets;print(secrets.token_hex(32))\"`) "
+            "and redeploy."
+        )
 
 
 def _token_for(user_id: str) -> str:

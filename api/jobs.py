@@ -146,6 +146,26 @@ class PipelineRunner:
             raise RuntimeError(ERROR_AGENT_A)
         return load_profile(str(profile_path)).model_dump()
 
+    def restore_profile(self, *, run_id: str, profile: Any) -> None:
+        """Write Agent A's envelope back to disk if it is not there.
+
+        Phase two hands Agent C a FILE PATH, and phase one wrote that file — but
+        the two are separated by however long the user takes over the form, and a
+        container restart or a redeploy in between is enough to lose it.
+
+        Postgres already has the answer: `attach_profile` stored the same envelope
+        in `app_runs.profile`. So this re-materialises something we kept — it is
+        not a re-run and not a guess, and the bytes Agent C reads are the bytes
+        Agent A produced.
+        """
+        import json
+
+        path = Path(self.config.output_dir) / run_id / "candidate_profile.json"
+        if path.exists() or not profile:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+
     def run_agent_c(self, *, run_id: str, flags: Optional[list[str]] = None,
                     on_node: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
         import json
@@ -240,7 +260,8 @@ def execute_phase_one(store: Any, runner: PipelineRunner, *, job_id: str, run_id
 
 
 def execute_phase_two(store: Any, runner: PipelineRunner, *, job_id: str, run_id: str,
-                      preferences: Optional[dict[str, Any]] = None) -> None:
+                      preferences: Optional[dict[str, Any]] = None,
+                      profile: Optional[dict[str, Any]] = None) -> None:
     """Agent C then Agent E, shaped by what the user answered.
 
     Called when the profile is confirmed, so the gap is computed against the role
@@ -259,6 +280,12 @@ def execute_phase_two(store: Any, runner: PipelineRunner, *, job_id: str, run_id
 
     try:
         store.set_stage(job_id, "matching", progress_policy.AGENT_C_SPAN[0])
+        # INSIDE the try. Anything raising above the first `except` would leave
+        # the run parked at `awaiting_confirmation` for ever with no error code —
+        # a job that dies silently is worse than one that fails by name, which is
+        # why every phase here is wrapped.
+        if profile:
+            runner.restore_profile(run_id=run_id, profile=profile)
         gap = runner.run_agent_c(run_id=run_id, flags=agent_c_flags(preferences),
                                  on_node=report(c_marks))
     except Exception as exc:                # noqa: BLE001

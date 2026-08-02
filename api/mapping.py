@@ -198,6 +198,36 @@ def job_matches(gap: dict[str, Any], *, limit: Optional[int] = None) -> list[dic
     return out[:limit] if limit else out
 
 
+# Platforms whose catalogue is sold rather than given away. Used ONLY to label a
+# course whose price we never observed — never to invent an amount.
+_PAID_PLATFORMS = {"coursera"}
+
+
+def _price_label(source: Optional[str], price: dict[str, Any]) -> Optional[str]:
+    """`free` / `paid` / None — what to SAY about the price, not what it is.
+
+    The amount stays exactly as measured: `price` is still null when no price was
+    observed, because 0 would mean free and any other number would be invented.
+    This is a separate, weaker claim about the platform rather than the course.
+
+    Measured 2026-07-30: 0 of 1,999 Coursera courses publish a price through the
+    API or the course page, so "not listed" is the state of essentially the whole
+    Coursera catalogue — and rendering that as a blank on a course card is worse
+    than useless to someone choosing what to study. Coursera's catalogue is paid,
+    so `paid` is true of the platform.
+
+    What it does NOT say: not the amount, and not that the course cannot be
+    audited — Coursera lets many courses be audited free without the certificate.
+    It means "this is not a free course", which is the distinction a learner is
+    actually making here.
+    """
+    if price.get("is_free"):
+        return "free"
+    if price.get("amount") is not None:
+        return None                      # a real number is shown; no label needed
+    return "paid" if (source or "").strip().lower() in _PAID_PLATFORMS else None
+
+
 def courses(recommendations: dict[str, Any]) -> list[dict[str, Any]]:
     """`Course[]` from Agent E. Nulls preserved; see the module docstring."""
     out: list[dict[str, Any]] = []
@@ -216,9 +246,12 @@ def courses(recommendations: dict[str, Any]) -> list[dict[str, Any]]:
             # not 0, which would render as "0 hours".
             "hours": course.get("hours"),
             # Measured: 0 of 1,999 Coursera courses publish a price. null means
-            # "not listed"; 0 would mean FREE, which is a different claim.
+            # "not listed"; 0 would mean FREE, which is a different claim. The
+            # amount is left exactly as measured and `priceLabel` carries what can
+            # honestly be SAID about it — see `_price_label`.
             "price": price.get("amount"),
             "currency": price.get("currency"),
+            "priceLabel": _price_label(course.get("source"), price),
             "unlocks": [rec.get("skill")] + list(course.get("covers_other_skills") or []),
             # Agent E picks one course per gap, so everything it returns is a
             # recommendation. `thin`/`arbitrary` supply is the interesting nuance

@@ -1,0 +1,112 @@
+# The whole product on one box: TLS, the static frontend, the API, and Postgres.
+#
+#   caddy ──▶ api ──▶ db
+#     └──▶ ./web  (the marketing site at /, the app at /app/)
+#
+# Everything the free-tier plan gave up is back here — OCR runs, the full 1.7 GB
+# corpus fits, the disk persists, nothing sleeps, and the ingestion agents can be
+# scheduled. See DEPLOY.md.
+#
+#   docker compose up -d           bring it up
+#   docker compose logs -f api     watch a run
+#   docker compose pull && docker compose up -d    what the deploy workflow runs
+
+name: itqan
+
+services:
+  db:
+    # pgvector's own image rather than postgres+extension: the vector type and
+    # the HNSW indexes are load-bearing (course/posting embeddings, ESCO labels),
+    # and this is the same image CI runs against, so "works in CI" means
+    # something.
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-itqan}
+      POSTGRES_USER: ${POSTGRES_USER:-itqan}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command:
+      # Pinned rather than left to grow. The box has 4 GB and OCR peaks at ~2 GB
+      # of it, so Postgres taking whatever it likes is how a scanned upload gets
+      # OOM-killed. 256 MB of shared buffers is comfortable for a 1.7 GB database
+      # whose hot set is small; work_mem is raised because HNSW searches sort.
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - effective_cache_size=1GB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-itqan} -d ${POSTGRES_DB:-itqan}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Not published to the host. Only `api` needs it, and an exposed 5432 on a
+    # public IP is found by scanners within hours.
+    expose:
+      - "5432"
+
+  api:
+    # In production this is the image the deploy workflow built and pushed; the
+    # `build` block is the local-development path. `docker compose build` uses it,
+    # `docker compose pull` ignores it.
+    image: ${ITQAN_IMAGE:-ghcr.io/aminpatra/itqan-api:latest}
+    build:
+      context: .
+      args:
+        WITH_OCR: "1"
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ITQAN_ENV: production
+      ITQAN_DATABASE_URL: postgresql://${POSTGRES_USER:-itqan}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-itqan}
+      ITQAN_SESSION_SECRET: ${ITQAN_SESSION_SECRET:?generate with python -c "import secrets;print(secrets.token_hex(32))"}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      ITQAN_OUTPUT_DIR: /data/output
+    volumes:
+      # Uploads and per-run artifacts. A named volume rather than an anonymous
+      # one so `up -d --build` keeps them: phase two reads a file phase one wrote,
+      # and the wait between the two ends when a PERSON acts.
+      - uploads:/data/output
+    expose:
+      - "8000"
+
+  caddy:
+    # The only thing on the public interface. Terminates TLS, obtains and renews
+    # the Let's Encrypt certificate on its own, and proxies to `api`.
+    #
+    # Vercel rewrites /api/* here, so this MUST be HTTPS: the session cookie is
+    # set Secure in production and a browser will not send it over http.
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      # The hostname Caddy requests a certificate for — OVH's default
+      # (vps-xxxx.vps.ovh.net) until there is a real domain.
+      ITQAN_DOMAIN: ${ITQAN_DOMAIN:?set ITQAN_DOMAIN in .env}
+    ports:
+      - "80:80"     # required: Let's Encrypt HTTP-01 validation lands here
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The built frontend: the Astro site at the root, the React app under
+      # /app/. Written by the frontend repo's deploy job (rsync over SSH), read
+      # only here — 7.5 MB of static files, so there is no image or registry in
+      # the loop for it.
+      - ./web:/srv/web:ro
+      - caddydata:/data      # the certificates. Losing these means re-issuing,
+      - caddyconfig:/config  # and Let's Encrypt rate-limits that.
+
+volumes:
+  pgdata:
+  uploads:
+  caddydata:
+  caddyconfig:

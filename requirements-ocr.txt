@@ -1,0 +1,20 @@
+# Scanned-document support. Split out of requirements.txt so a build can leave it
+# out — NOT because it is optional to the product.
+#
+# Measured: paddlepaddle is **1.2 GB installed** and wants ~2 GB of RAM to run
+# inference. On the VPS deployment it is ON (`WITH_OCR=1` in docker-compose.yml)
+# and the model weights are baked into the image at build time. The flag exists
+# because it is also the difference between fitting a 512 MB free tier and not,
+# and that option is worth keeping open.
+#
+#     docker build --build-arg WITH_OCR=1 .   # ~2 GB image, scanned CVs work
+#     docker build .                          # ~670 MB, scanned CVs refused by name
+#
+# Local development should install it — `pip install -r requirements.txt -r
+# requirements-ocr.txt` — so scanned CVs keep working on your machine.
+#
+# When it is absent, `ocr_available()` returns False and `detect_kind` refuses a
+# scanned document by name, routing the user to manual entry. It does not crash,
+# and it does not pretend to read.
+paddleocr==3.4.0
+paddlepaddle==3.3.0

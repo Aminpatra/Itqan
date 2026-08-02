@@ -1,0 +1,41 @@
+# What must never reach the image.
+#
+# The first two entries are the ones that matter: `.env` holds the OpenAI key,
+# and `output/` holds real people's CVs and transcripts from local runs. A
+# `COPY . .` without this file bakes both into a layer that anyone who pulls the
+# image can read, and a layer cannot be un-published after the fact.
+.env
+.env.*
+!.env.example
+output/
+uploads/
+
+# Local state and tooling — none of it runs in the container, all of it is weight
+# and cache-busting churn.
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Tests ship deliberately: `docker compose exec api python -m pytest tests/ -q`
+# on the box is the fastest way to tell whether a deploy is sane, and they weigh
+# a few hundred KB.
+#   tests/  <- intentionally NOT ignored
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Real CVs kept beside the project for manual runs — not fixtures.
+*.pdf
+!tests/**/*.pdf

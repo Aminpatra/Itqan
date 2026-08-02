@@ -3,8 +3,12 @@ langchain-openai>=1.0,<2
 langgraph>=1.2.9,<2
 langgraph-checkpoint>=4.1.1
 pydantic>=2.10,<3
-paddleocr==3.4.0
-paddlepaddle==3.3.0
+# OCR (paddleocr + paddlepaddle) lives in requirements-ocr.txt, NOT here.
+# It is 1.2 GB installed and wants ~2 GB of RAM, so whether a given build carries
+# it is a deployment decision rather than a code one. Install both locally:
+#     pip install -r requirements.txt -r requirements-ocr.txt
+# Nothing in the code branches on it beyond `ocr_available()`; the import has
+# always been lazy.
 pymupdf>=1.26
 filetype>=1.2
 python-dotenv>=1.1

@@ -1,0 +1,104 @@
+# One host serves the whole product: the marketing site, the app, and the API.
+#
+#   /          the Astro marketing site   (static files)
+#   /app/*     the React onboarding app   (static files + SPA fallback)
+#   /api/*     FastAPI                    (reverse proxy)
+#
+# **One origin by construction, not by configuration.** `src/api/http.ts` sends
+# `credentials: 'same-origin'` and the session cookie is set by the marketing
+# site's own login form, so the site, the app and the API must share a hostname
+# or the browser silently withholds it and every authenticated call 401s. The
+# previous design achieved that with a proxy rewrite on another platform, which
+# worked but was one more thing that had to be right. Here it cannot be wrong.
+#
+# Caddy also obtains and renews the Let's Encrypt certificate for
+# {$ITQAN_DOMAIN} by itself, which is the other reason it is in front.
+
+# www -> apex, so exactly one hostname is ever canonical. Astro bakes absolute
+# canonical URLs and hreflang alternates at build time; two live hostnames would
+# make half of them wrong.
+www.{$ITQAN_DOMAIN} {
+	redir https://{$ITQAN_DOMAIN}{uri} permanent
+}
+
+{$ITQAN_DOMAIN} {
+	encode zstd gzip
+	root * /srv/web
+
+	# ---- the API ----------------------------------------------------------
+	handle /api/* {
+		reverse_proxy api:8000 {
+			# Agent A takes ~90 seconds on a scanned CV and the browser holds the
+			# POST open for all of it. Caddy's default write timeout would cut
+			# that off mid-OCR, and the user would see a network error on a run
+			# that actually succeeded.
+			transport http {
+				read_timeout 300s
+				write_timeout 300s
+			}
+		}
+	}
+
+	# ---- caching, which is what replaces the CDN ---------------------------
+	# Vite and Astro both content-hash these filenames, so a given URL's bytes
+	# can never change — only new URLs appear. Caching them for a year means a
+	# returning visitor fetches nothing but HTML, which is most of what an edge
+	# network was buying us.
+	@immutable path /_astro/* /app/assets/* /fonts/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# The mascot clips are large and stable but NOT hashed, so they get a day
+	# rather than a year — long enough to matter, short enough to replace.
+	@media path /app/mascot/* /logos/* /favicon.* /icon-*.png /apple-touch-icon.png
+	header @media Cache-Control "public, max-age=86400"
+
+	# Everything else — which is the HTML — must never be held, because it names
+	# the hashed assets above and a stale copy points at a build that is gone.
+	#
+	# Defined as "not the other two" rather than as a path pattern. `*.html` was
+	# the obvious way to write it and it is WRONG: every real URL here is a
+	# directory (`/en/`, `/ar/how-it-works/`) whose index.html the file server
+	# resolves internally, so the matcher never fired and those pages went out
+	# with no Cache-Control at all — leaving browsers to guess, which they do by
+	# caching.
+	@nocache {
+		not path /_astro/* /app/assets/* /fonts/* /app/mascot/* /logos/* /favicon.* /icon-*.png /apple-touch-icon.png
+	}
+	header @nocache Cache-Control "no-cache"
+
+	# ---- the app: a single-page app needs its own fallback -----------------
+	handle /app/* {
+		# A deep link like /app/confirm is a client-side route with no file
+		# behind it. Serve the real file when there is one (assets, the mascot)
+		# and hand everything else to the SPA, which reads the path itself.
+		try_files {path} {path}/ /app/index.html
+		file_server
+	}
+
+	# ---- everything else: the marketing site ------------------------------
+	handle {
+		# Astro emits a directory per route with an index.html inside, plus a
+		# root index.html that redirects to the locale — so plain file serving
+		# resolves /, /ar/…, /en/… with no special cases.
+		try_files {path} {path}/ {path}/index.html
+		file_server
+	}
+
+	# Astro builds its own 404 page, in both languages' styling. Serving Caddy's
+	# default instead would be the one page on the site that looks like a server.
+	handle_errors {
+		@404 expression {err.status_code} == 404
+		handle @404 {
+			rewrite * /404.html
+			file_server
+		}
+		respond "{err.status_code} {err.status_text}"
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

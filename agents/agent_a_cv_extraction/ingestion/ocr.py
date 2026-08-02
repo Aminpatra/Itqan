@@ -33,10 +33,31 @@ from shared.text_norm import is_rtl
 _ENGINES: dict[str, Any] = {}
 
 
+def ocr_available() -> bool:
+    """Is a scanned document readable in THIS build?
+
+    PaddleOCR is 1.2 GB installed, so whether it ships is a per-image decision
+    (`requirements-ocr.txt`, `--build-arg WITH_OCR`). The product is unchanged;
+    this only answers whether the running build can do the work.
+
+    Checked with `find_spec` rather than a try/import: importing paddle costs
+    seconds and hundreds of megabytes of RSS, and this is called on the ingest
+    path for every document, including the text-layer ones that never need it.
+    """
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("paddleocr") is not None and find_spec("paddle") is not None
+    except (ImportError, ValueError):      # a broken or partial install
+        return False
+
+
 def get_engine(lang: str = "en") -> Any:
     """Lazily build a PaddleOCR engine per language, reusing it thereafter."""
     if lang not in _ENGINES:
         from paddleocr import PaddleOCR
+
+        from shared.config import Config
 
         _ENGINES[lang] = PaddleOCR(
             lang=lang,
@@ -45,6 +66,9 @@ def get_engine(lang: str = "en") -> Any:
             # photographed/skewed documents. Turn on if you feed phone snaps.
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
+            # The mobile detector, not PaddleOCR's server default — the server
+            # one wanted >3 GB for a single CV page. See Config.ocr_detection_model.
+            text_detection_model_name=Config().ocr_detection_model,
         )
     return _ENGINES[lang]
 

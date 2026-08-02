@@ -55,7 +55,7 @@ def _connection(config: Config) -> Iterator[Any]:
 # The two selects share a column list and a row->CourseCandidate mapping; only
 # the join/filter differ (esco concept vs exact normalized skill_key).
 _COURSE_COLUMNS = """
-    c.course_id, c.name, c.provider, c.source_url, c.taught_skills,
+    c.course_id, c.name, c.provider, c.source, c.source_url, c.taught_skills,
     c.rating, c.review_count, c.enrollment_count, c.level, c.last_updated,
     c.price_amount, c.price_currency, c.price_is_free
 """
@@ -179,6 +179,11 @@ def _candidate(row: dict[str, Any]) -> CourseCandidate:
         course_id=row["course_id"],
         title=row["name"],
         provider=row.get("provider"),
+        # The PLATFORM ('coursera', 'freecodecamp'), which `provider` is not:
+        # provider is the partner that authored the course, so a Coursera course
+        # reads "Rutgers the State University of New Jersey" and nothing in the
+        # record said where it is hosted — or how it is sold.
+        source=row.get("source"),
         url=row["source_url"],
         taught_skills=list(row.get("taught_skills") or []),
         rating=float(row["rating"]) if row.get("rating") is not None else None,
