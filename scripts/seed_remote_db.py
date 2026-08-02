@@ -34,26 +34,42 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 _ESCO_LABELS = "esco_labels"
 
-
 def _pg_dump(source: str, out: Path, *, exclude_labels: bool) -> None:
     cmd = [
-        "pg_dump", source,
-        "--no-owner", "--no-privileges", "--no-acl",
-        # Clean + if-exists so a re-run replaces rather than colliding with
-        # everything that already exists.
-        "--clean", "--if-exists",
-        "-f", str(out),
+        "pg_dump",
+        f"--dbname={source}",
+        "--no-owner",
+        "--no-privileges",
+        "--clean",
+        "--if-exists",
+        "-f",
+        str(out),
     ]
+
     if exclude_labels:
         cmd.insert(2, f"--exclude-table-data={_ESCO_LABELS}")
-    print(f"  pg_dump -> {out.name}" + ("  (esco_labels data excluded)" if exclude_labels else ""))
-    subprocess.run(cmd, check=True)
 
+    print(
+        f"  pg_dump -> {out.name}"
+        + ("  (esco_labels data excluded)" if exclude_labels else "")
+    )
+
+    subprocess.run(cmd, check=True)
 
 def _psql(target: str, script: Path) -> None:
     print(f"  restoring {script.name}")
-    subprocess.run(["psql", target, "-v", "ON_ERROR_STOP=1", "-q", "-f", str(script)],
-                   check=True)
+
+    cmd = [
+        "psql",
+        f"--dbname={target}",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-q",
+        "-f",
+        str(script),
+    ]
+
+    subprocess.run(cmd, check=True)
 
 
 def _copy_labels_trimmed(source: str, target: str, *, batch: int = 5_000) -> None:
