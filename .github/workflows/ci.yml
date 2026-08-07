@@ -2,9 +2,13 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # Pull requests run this directly. Pushes to main do NOT — `deploy.yml` calls
+  # it as the first stage of the deploy, so listing `push` here as well would run
+  # the whole suite twice for every merge.
   pull_request:
+  # Callable from deploy.yml. Without this trigger GitHub rejects the `uses:`
+  # reference outright ("invalid workflow file"), and the deploy never starts.
+  workflow_call:
 
 concurrency:
   # A newer push makes the previous answer irrelevant; cancel it rather than pay

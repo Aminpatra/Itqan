@@ -135,6 +135,20 @@ On GitHub → repo → Settings → Secrets → Actions:
 | `VPS_USER` | `itqan` |
 | `VPS_SSH_KEY` | the private half of a key whose public half is in `/home/itqan/.ssh/authorized_keys` |
 
+**The box must be able to pull from GHCR.** Images published from a private repo
+are private, so `docker compose pull` fails with `denied` until the VPS has a
+read token. Once, as the `itqan` user:
+
+```bash
+# GitHub -> Settings -> Developer settings -> Personal access tokens (classic)
+# one scope: read:packages
+echo "<token>" | docker login ghcr.io -u <your-github-username> --password-stdin
+```
+
+(Or make the package public: GitHub -> the repo -> Packages -> the image ->
+Package settings -> Change visibility. Then no login is needed, but anyone can
+pull your image — which contains no secrets, but does contain your source.)
+
 Then push. `.github/workflows/deploy.yml` runs the 808 tests, builds the image on
 **GitHub's** runners, pushes it to GHCR, and SSHes in to pull and restart —
 waiting on the healthcheck rather than declaring victory when the container is
