@@ -108,8 +108,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="seed_remote_db",
         description="Copy the local corpus into the deployed database.")
     ap.add_argument("--target", required=True, help="Destination connection string")
-    ap.add_argument("--source", default=os.getenv("ITQAN_DATABASE_URL"),
-                    help="Source database (default: $ITQAN_DATABASE_URL)")
+    ap.add_argument("--source", default=None,
+                    help="Source database (default: the local one, from .env)")
     ap.add_argument("--trim", action="store_true",
                     help="Drop ALTERNATE-label embeddings: 1,706 MB -> 323 MB. Only for a "
                          "target that cannot hold the full corpus; costs the embedding "
@@ -118,9 +118,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="Leave the intermediate .sql file for inspection")
     args = ap.parse_args(argv)
 
+    # Resolved through Config, not os.getenv, because the database URL lives in
+    # .env and only Config loads it. Reading the environment directly meant this
+    # script alone could not find a database every other entry point resolves
+    # fine — reported as "--source or ITQAN_DATABASE_URL is required" on a
+    # machine where both the app and the test suite were connecting happily.
     if not args.source:
-        print("  --source or ITQAN_DATABASE_URL is required", file=sys.stderr)
-        return 2
+        try:
+            from shared.config import Config
+
+            args.source = Config().require_database_url()
+        except Exception as exc:      # noqa: BLE001
+            print(f"  no source database: {exc}\n"
+                  "  Set ITQAN_DATABASE_URL in .env, or pass --source explicitly.",
+                  file=sys.stderr)
+            return 2
 
     # Checked up front rather than discovered halfway through a 1.7 GB dump. On a
     # machine where Postgres only ever ran in Docker these are genuinely absent,

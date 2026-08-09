@@ -75,6 +75,19 @@ services:
       ITQAN_DATABASE_URL: postgresql://${POSTGRES_USER:-itqan}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-itqan}
       ITQAN_SESSION_SECRET: ${ITQAN_SESSION_SECRET:?generate with python -c "import secrets;print(secrets.token_hex(32))"}
       OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      # Who the crawler says it is. REQUIRED for any live ingestion: the config
+      # refuses to make a request while this still contains
+      # "contact-not-configured", so without it Agent B and Agent D fail closed
+      # on every cycle with "ITQAN_USER_AGENT has no contact address".
+      #
+      # It was in .env.example from the start and never passed through to the
+      # container, so the scheduled crawl could not run on the box at all — the
+      # guard worked exactly as designed and reported it, which is the only
+      # reason this was ever noticed rather than silently crawling anonymously.
+      #
+      # `:?` rather than a default: an unattended crawler that cannot be
+      # contacted by the sites it visits should stop the deploy, not start.
+      ITQAN_USER_AGENT: ${ITQAN_USER_AGENT:?set ITQAN_USER_AGENT in .env, e.g. "ItqanJobBot/1.0 (+you@example.com)"}
       ITQAN_OUTPUT_DIR: /data/output
     volumes:
       # Uploads and per-run artifacts. A named volume rather than an anonymous
