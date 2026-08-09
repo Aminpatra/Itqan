@@ -91,6 +91,12 @@ and the statistics are meaningless.
 ONLY if the posting says where the job is. Do NOT infer the country from the \
 language, the currency, or the source. Null if unstated.
 
+- work_arrangement: 'remote', 'hybrid' or 'onsite' — ONLY when the posting says so. An office address is NOT a statement that the role is onsite; plenty of remote roles list a head office. Null unless the text is explicit. This rule is CHECKED IN CODE (`stated_facts.py`): an answer the posting does not contain is discarded, so a guess costs the field rather than filling it.
+
+- employment_type: 'full_time', 'part_time', 'contract', 'internship' or 'temporary', ONLY when stated. Do NOT infer it from the seniority or the title.
+
+- salary_min / salary_max / salary_currency / salary_period: the pay AS QUOTED. A single figure goes in BOTH min and max. Give the period ('hour', 'day', 'week', 'month', 'year') only if the posting states it — "3000" means very different things monthly and annually, so guessing the period is worse than leaving it null. "Competitive salary", "attractive package" and "salary negotiable" are NOT figures: return null for all four. Never convert a currency and never estimate a market rate.
+
 - listing_intent: 'vacancy' if an employer is hiring; 'seeking' if a person is \
 advertising their OWN availability for work ("I am looking for a job"); 'service' \
 if it offers a service rather than a job; 'unknown' if unclear.
@@ -116,6 +122,15 @@ TEXT:
 --- END POSTING ---
 
 Return `jobs`: one entry per DISTINCT vacancy in this posting (a single entry if \
-it advertises one role). Return null for anything the posting does not state."""
+it advertises one role). Return null for anything the posting does not state.
+
+If — and ONLY if — this posting advertises SEVERAL vacancies, also set \
+`vacancy_text` on each entry: the text from TEXT above that describes THAT \
+vacancy, COPIED EXACTLY. Copy it character-for-character from the posting; do \
+not summarise it, translate it, tidy it or join separated fragments with words \
+of your own. It is checked against the posting, and an entry whose \
+`vacancy_text` cannot be found there is discarded — a roundup listing twenty \
+roles should give twenty different spans, not twenty copies of the whole \
+article. Leave it null when the posting is about one vacancy."""
 
 EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([("system", SYSTEM), ("human", HUMAN)])

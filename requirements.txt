@@ -25,6 +25,12 @@ pgvector>=0.3
 # t.me/s channel pages. The Atom envelope itself uses stdlib ElementTree.
 selectolax>=0.3
 
+# The browser transport (shared/scraping/browser.py), for sources that render
+# their content in JavaScript. The PACKAGE is small; the ~450 MB Chromium binary
+# is installed separately and only when WITH_BROWSER=1, mirroring the OCR split —
+# so a build that never crawls does not carry a browser.
+playwright>=1.48
+
 # Console display ONLY (shared/display.py): terminals like VS Code's (xterm.js)
 # cannot shape Arabic, so CLI prints pre-shape it. Never applied to stored data.
 arabic-reshaper>=3.0

@@ -113,8 +113,12 @@ def export_for_agent_c(
                 cur.execute(
                     f"""
                     SELECT posting_id, source, source_group, source_type, source_url,
+                           final_url,
                            title, raw_description, sector, required_skills,
                            company, seniority_level, location, country, posted_date,
+                           work_arrangement, employment_type,
+                           salary_min, salary_max, salary_currency, salary_period,
+                           attribution, terms_url, expires_at,
                            legitimacy_score, listing_intent, poster_type,
                            first_seen_at, last_seen_at,
                            1 - (embedding <=> %(emb)s::vector) AS similarity
@@ -167,7 +171,7 @@ def export_for_agent_c(
 
 
 def _posting_row(row: dict[str, Any]) -> JobPostingExport:
-    for key in ("posted_date", "first_seen_at", "last_seen_at"):
+    for key in ("posted_date", "first_seen_at", "last_seen_at", "expires_at"):
         if row.get(key) is not None:
             row[key] = row[key].isoformat()
     if row.get("legitimacy_score") is not None:

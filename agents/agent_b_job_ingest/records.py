@@ -12,7 +12,7 @@ is the only place that knows whether a row is new this cycle.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -46,10 +46,41 @@ class PersistedPosting:
     # first version and then dropped for want of a column — see migration 0010.
     # None means the posting named none, which is a real answer.
     company: Optional[str] = None
+
+    # Where the vacancy actually lives, when the posting linked out to an
+    # employer's own page. `source_url` stays where we FOUND it — it is the
+    # identity — and this is where a person should apply.
+    final_url: Optional[str] = None
+
+    # Stated by the destination page, almost never by an aggregator summary.
+    # All None unless the text said so; see migration 0011 for why that matters
+    # more here than it looks.
+    work_arrangement: Optional[str] = None
+    employment_type: Optional[str] = None
+    salary_min: Optional[float] = None
+    salary_max: Optional[float] = None
+    salary_currency: Optional[str] = None
+    salary_period: Optional[str] = None
     seniority_level: Optional[str] = None
     location: Optional[str] = None
     country: Optional[str] = None
     posted_date: Optional[date] = None
+
+    # How the publisher is to be NAMED to a user, and the terms this row was
+    # collected under. Carried per row rather than looked up from the source
+    # registry, because a row outlives the config entry that created it — the
+    # same reason `courses` carries freeCodeCamp's CC-BY-SA on every row.
+    attribution: Optional[str] = None
+    terms_url: Optional[str] = None
+    # Why this row has no `final_url` — see migration 0013. NULL means "never
+    # traced", which is deliberately distinct from every measured failure: a row
+    # nobody has looked at must not be mistaken for one we looked at and found
+    # wanting, because the prune deletes on measured failures only.
+    destination_status: Optional[str] = None
+    # The publisher's own statement of when the vacancy stops being real
+    # (schema.org `validThrough`). Better evidence than `missed_cycles`, which
+    # is only our own failure to find it again. Recorded; not yet acted on.
+    expires_at: Optional[datetime] = None
 
     legitimacy_score: Optional[float] = None
     review_reason: Optional[str] = None

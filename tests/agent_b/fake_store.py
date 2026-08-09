@@ -49,6 +49,13 @@ class FakeStore:
         by_url = {r.source_url: pid for pid, r in self.rows.items()}
         return {u: by_url[u] for u in urls if u in by_url}
 
+    def find_by_final_urls(self, urls: list[str]) -> dict[str, str]:
+        # Canonical rows only, matching the real store: a duplicate must never
+        # become another row's duplicate target.
+        by_url = {r.final_url: pid for pid, r in self.rows.items()
+                  if r.final_url and r.duplicate_of is None}
+        return {u: by_url[u] for u in urls if u in by_url}
+
     def find_neardup_candidates(self, embedding, *, recent_days, limit, exclude_id):
         scored = []
         for pid, row in self.rows.items():

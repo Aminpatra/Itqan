@@ -60,6 +60,12 @@ services:
       context: .
       args:
         WITH_OCR: "1"
+        # Chromium, for the employer pages the ingestion cron follows. Measured
+        # on live destinations: 3 of the 6 that robots permits are unreadable to
+        # httpx (an incomplete TLS chain, a 410 to non-browser clients) and
+        # readable rendered. Without it the crawl still runs — `root_fetch`
+        # falls back to httpx and says so — it just learns less.
+        WITH_BROWSER: "1"
     restart: unless-stopped
     depends_on:
       db:

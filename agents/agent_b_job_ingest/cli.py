@@ -97,6 +97,27 @@ def build_parser() -> argparse.ArgumentParser:
         "precision. Output is gitignored: the labelled set is real data, not fixtures",
     )
     ops.add_argument(
+        "--reslice-roundups",
+        action="store_true",
+        help="Give each vacancy split from a multi-job post its OWN text. Repairs rows that "
+        "stored the whole article on every child. Re-extracts from the stored body — no "
+        "network. Combine with --dry-run to report without writing",
+    )
+    ops.add_argument(
+        "--backfill-destinations",
+        action="store_true",
+        help="Follow stored postings' outbound links to the employer's own page and enrich "
+        "from it. For rows ingested before enrichment existed; re-fetches each article "
+        "because outbound links were never stored",
+    )
+    ops.add_argument(
+        "--prune-without-destination",
+        action="store_true",
+        help="Delete postings that reach no employer job page, for sources configured "
+        "require_destination. Trace first with --backfill-destinations; only rows actually "
+        "looked at are removed. ALWAYS run with --dry-run first",
+    )
+    ops.add_argument(
         "--purge-source",
         metavar="SOURCE",
         help="Delete all postings from a decommissioned source. Never automatic — a "
@@ -292,16 +313,32 @@ def _print_cycle(state: dict) -> None:
     print("  sources:")
     for s in state.get("run_log", {}).get("sources", []):
         flag = "ok" if s["ok"] else ("PARTIAL" if s["partial"] else "FAILED")
+        held = s.get("already_held") or 0
         print(f"    [{flag}] {s['source']:<14} {s['postings']} postings, "
-              f"{s['skipped']} skipped, {s['pages_fetched']} pages")
+              f"{s['skipped']} skipped, {s['pages_fetched']} pages"
+              + (f", {held} already held (not re-fetched)" if held else ""))
         if s["error"]:
             print(f"          error: {s['error']}")
     print(f"  ingest:    new={ingest.get('new', 0)} changed={ingest.get('changed', 0)} "
           f"unchanged={ingest.get('unchanged', 0)} rejected={ingest.get('rejected', 0)} "
           f"needs_review={ingest.get('needs_review', 0)}")
     print(f"             link_dups={ingest.get('link_duplicates', 0)} "
+          f"dest_dups={ingest.get('destination_duplicates', 0)} "
           f"embed_dups={ingest.get('embed_duplicates', 0)} "
-          f"extractions={ingest.get('extractions', 0)} embeddings={ingest.get('embeddings', 0)}")
+          f"extractions={ingest.get('extractions', 0)} embeddings={ingest.get('embeddings', 0)}"
+          + (f" ({ingest['extraction_failures']} failed)"
+             if ingest.get("extraction_failures") else ""))
+    if ingest.get("skipped_no_destination"):
+        print(f"             {ingest['skipped_no_destination']} posting(s) reached no employer "
+              f"page and were NOT stored (source requires a destination)")
+    # Printed every cycle, deliberately. This is the verifier working, not an
+    # error rate — measured on the first live cycle without it, the model
+    # asserted an arrangement on 19 of 19 postings that stated none. A run where
+    # this reads 0 across hundreds of postings means the check has stopped
+    # running, and that is the failure nobody would otherwise notice.
+    print(f"             destinations={ingest.get('root_fetches', 0)} fetched, "
+          f"{ingest.get('root_enrichments', 0)} enriched; "
+          f"unstated_dropped={ingest.get('unstated_fields_dropped', 0)}")
     print(f"  staleness: marked_stale={stale.get('marked_stale', 0)} pruned={stale.get('pruned', 0)}")
     print(f"  demand:    {agg.get('rows_written', 0)} skill rows over "
           f"{agg.get('sectors_with_current_demand', 0)} sectors "
@@ -445,6 +482,227 @@ def _label_sample(config: Config, args) -> int:
         return 2
 
 
+def _reslice_roundups(config: Config, args) -> int:
+    """Narrow each split vacancy to its own text.
+
+    No network: the stored description IS the article, which is precisely the
+    defect being repaired, so the source text is already in hand.
+    """
+    from .backfill import reslice_roundups
+    from .db import JobStore
+    from .prompts.extraction import EXTRACTION_PROMPT
+    from .schemas import JobExtractionBatch
+    from shared.llm import build_llm, structured
+
+    sources = [s.strip() for s in (args.sources or "").split(",") if s.strip()] or None
+    llm = build_llm(config)
+
+    if args.dry_run:
+        print("  DRY RUN - reporting only, nothing is written\n")
+
+    try:
+        with JobStore.from_config(config) as store:
+            with store.transaction():
+                report = reslice_roundups(
+                    store=store,
+                    extractor=EXTRACTION_PROMPT | structured(llm, JobExtractionBatch),
+                    sources=sources, limit=args.limit,
+                    dry_run=bool(args.dry_run), config=config,
+                )
+    except Exception as exc:
+        print(f"\n  backfill failed: {exc}\n", file=sys.stderr)
+        return 2
+
+    print(f"  posts considered : {report.posts_considered}")
+    print(f"  vacancies narrowed: {report.rows_updated}")
+    print(f"  left as they were : {report.rows_unchanged}")
+    # Not an error: the row keeps the full body, exactly what it had before. It
+    # is printed because a run where this is the whole population means the
+    # model stopped quoting and the rows would stay clustered silently.
+    print(f"  span unverified   : {report.unverified} (kept the full body)")
+    print(f"  employers recorded: {report.employers_recorded}")
+    for failure in report.failures[:5]:
+        print(f"  ! {failure}")
+    print()
+    return 0
+
+
+def _backfill_destinations(config: Config, args) -> int:
+    """Follow outbound links on rows that never had enrichment run."""
+    from .backfill import backfill_destinations
+    from .db import JobStore
+    from .prompts.extraction import EXTRACTION_PROMPT
+    from .root_fetch import RootFetcher
+    from .schemas import JobExtractionBatch
+    from shared.llm import build_llm, structured
+
+    try:
+        config.require_identified_user_agent()
+    except RuntimeError as exc:
+        print(f"  {exc}\n", file=sys.stderr)
+        return 2
+
+    sources = [s.strip() for s in (args.sources or "").split(",") if s.strip()] or None
+    llm = build_llm(config)
+    fetcher = RootFetcher(config, interval_s=config.root_fetch_interval_s)
+
+    if args.dry_run:
+        print("  DRY RUN - reporting only, nothing is written\n")
+
+    try:
+        with JobStore.from_config(config) as store:
+            with store.transaction():
+                report = backfill_destinations(
+                    store=store,
+                    extractor=EXTRACTION_PROMPT | structured(llm, JobExtractionBatch),
+                    root_fetcher=fetcher,
+                    article_fetch=_article_links(config),
+                    sources=sources, limit=args.limit,
+                    dry_run=bool(args.dry_run), config=config,
+                )
+    except Exception as exc:
+        print(f"\n  backfill failed: {exc}\n", file=sys.stderr)
+        return 2
+    finally:
+        fetcher.close()
+
+    print(f"  postings examined : {report.posts_considered}")
+    print(f"  destinations found: {report.rows_updated}")
+    print(f"  no link to follow : {report.rows_unchanged}")
+    for failure in report.failures[:5]:
+        print(f"  ! {failure}")
+    print()
+    return 0
+
+
+def _article_links(config: Config):
+    """Recover a posting's outbound links by re-fetching its article.
+
+    They were never persisted, so a backfill has to go and look. Robots-checked
+    through the same policy every adapter uses; a refusal yields no links rather
+    than an exception, because one unreachable article must not end the run.
+    """
+    from selectolax.parser import HTMLParser
+    from shared.scraping import build_client, build_robots
+    from shared.scraping.http import SourcePolicy
+
+    client = build_client(
+        source="backfill",
+        policy=SourcePolicy(min_interval_s=2.0, max_bytes=config.max_response_bytes),
+        config=config,
+    )
+    robots = build_robots(source="backfill", config=config)
+
+    seen: dict[str, tuple[str, ...]] = {}
+
+    def links(url: str) -> tuple[str, ...]:
+        # One fetch per ARTICLE, not per row. A roundup's 19 children all carry
+        # `post_url#role`, and the fragment never reaches the server — without
+        # this, 245 el7far children would re-request the same 40 pages.
+        article = url.split("#", 1)[0]
+        if article in seen:
+            return seen[article]
+        if not robots.can_fetch(article):
+            seen[article] = ()
+            return ()
+        html = client.get_text(article)
+        tree = HTMLParser(html)
+        body = (tree.css_first(".post-body") or tree.css_first(".entry-content")
+                or tree.css_first("article") or tree.body)
+        if body is None:
+            seen[article] = ()
+            return ()
+        found = [a.attributes.get("href") or "" for a in body.css("a[href]")]
+        result = tuple(dict.fromkeys(h for h in found if h.startswith("http")))
+        seen[article] = result
+        return result
+
+    return links
+
+
+def _prune_without_destination(config: Config, args) -> int:
+    """Delete postings that lead nowhere — the user's "only final destinations".
+
+    Two safeguards it will not run without, both because 481 rows is past the
+    point where a number alone is enough to approve a deletion:
+
+      * it reports the full breakdown by source and reason FIRST, every time,
+        dry run or not;
+      * it only deletes rows that were actually traced. A row nobody looked at
+        is not evidence of anything, and survives.
+
+    Sources come from the registry's `require_destination` flag, so a source
+    that never opted in — GulfTalent — cannot be caught by a widening mistake
+    here.
+    """
+    from .db import JobStore
+    from .sources.config import DEFAULT_SOURCES
+
+    named = [c.name for c in DEFAULT_SOURCES if c.require_destination]
+    if args.sources:
+        wanted = {s.strip() for s in args.sources.split(",") if s.strip()}
+        named = [n for n in named if n in wanted]
+    if not named:
+        print("  no source is configured require_destination; nothing to prune.\n")
+        return 0
+
+    print(f"  sources in scope: {', '.join(named)}")
+    print("  (a source without require_destination is untouchable here by construction)\n")
+
+    try:
+        with JobStore.from_config(config) as store:
+            survey = store.destination_survey(named)
+            if not survey:
+                print("  these sources have no rows.\n")
+                return 0
+
+            keep = doomed = untraced = 0
+            print(f"  {'source':<14} {'reason':<22} {'rows':>6}   verdict")
+            for row in survey:
+                if row["has_destination"]:
+                    verdict, n = "KEEP (reaches a job page)", 0
+                    keep += row["rows"]
+                elif row["status"] == "never traced":
+                    verdict, n = "KEEP (never traced — trace it first)", 0
+                    keep += row["rows"]
+                    untraced += row["rows"]
+                else:
+                    verdict = "DELETE"
+                    doomed += row["rows"]
+                print(f"  {row['source']:<14} {row['status']:<22} {row['rows']:>6}   {verdict}")
+
+            print(f"\n  keep {keep}, delete {doomed}")
+            if untraced:
+                print(f"  ! {untraced} row(s) were never traced and are being KEPT. Run "
+                      f"--backfill-destinations first, or they will survive a prune "
+                      f"that was meant to remove them.")
+
+            if args.dry_run:
+                print("\n  DRY RUN - nothing was deleted.\n")
+                return 0
+            if not doomed:
+                print()
+                return 0
+
+            with store.transaction():
+                removed = store.prune_without_destination(named)
+            print(f"  deleted {removed} posting(s).")
+
+            # `skill_demand_stats.sample_postings` carries posting ids. Leaving
+            # them would make every demand figure cite rows that no longer
+            # exist, which is a worse failure than the clutter just removed.
+            from .aggregate import recompute_stats
+
+            with store.transaction():
+                stats = recompute_stats(store, config=config)
+            print(f"  recomputed demand stats: {stats.get('rows_written', 0)} rows over "
+                  f"{stats.get('sectors_with_current_demand', 0)} sectors.\n")
+        return 0
+    except Exception as exc:
+        print(f"\n  prune failed: {exc}\n", file=sys.stderr)
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = Config()
@@ -459,6 +717,12 @@ def main(argv: list[str] | None = None) -> int:
         return _check(config)
     if args.purge_source:
         return _purge_source(config, args)
+    if args.reslice_roundups:
+        return _reslice_roundups(config, args)
+    if args.backfill_destinations:
+        return _backfill_destinations(config, args)
+    if args.prune_without_destination:
+        return _prune_without_destination(config, args)
     if args.esco_sync:
         return _esco_sync(config, args)
     if args.label_sample:

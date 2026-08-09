@@ -34,7 +34,8 @@ from shared.config import Config
 
 from .base import AdapterResult, BaseAdapter, RawPosting
 from .el7far import canonical_url
-from .http import Blocked, PoliteClient, ResponseTooLarge, SourcePolicy
+from .http import (Blocked, PoliteClient, ResponseTooLarge, SourcePolicy,
+                   build_client, build_robots)
 from .robots import RobotsPolicy
 
 MAX_DESCRIPTION_CHARS = 20_000
@@ -75,7 +76,7 @@ class DubizzleAdapter(BaseAdapter):
 
     def _ensure_client(self) -> PoliteClient:
         if self._client is None:
-            self._client = PoliteClient(
+            self._client = build_client(
                 source=self.name,
                 # Slower than the feed: this source needs one request per
                 # listing PLUS one per detail page, so the same page budget
@@ -84,7 +85,7 @@ class DubizzleAdapter(BaseAdapter):
                 config=self.config,
             )
         if self._robots is None:
-            self._robots = RobotsPolicy(self._client, user_agent=self.config.user_agent)
+            self._robots = build_robots(source=self.name, config=self.config)
         return self._client
 
     # ------------------------------------------------------------------

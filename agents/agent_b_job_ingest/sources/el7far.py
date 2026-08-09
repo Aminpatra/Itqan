@@ -31,7 +31,8 @@ from selectolax.parser import HTMLParser
 from shared.config import Config
 
 from .base import AdapterResult, BaseAdapter, RawPosting
-from .http import Blocked, PoliteClient, ResponseTooLarge, SourcePolicy
+from .http import (Blocked, PoliteClient, ResponseTooLarge, SourcePolicy,
+                   build_client, build_robots)
 from .robots import RobotsPolicy
 
 ATOM = "http://www.w3.org/2005/Atom"
@@ -85,13 +86,13 @@ class El7farAdapter(BaseAdapter):
 
     def _ensure_client(self) -> PoliteClient:
         if self._client is None:
-            self._client = PoliteClient(
+            self._client = build_client(
                 source=self.name,
                 policy=SourcePolicy(min_interval_s=2.0, max_bytes=self.config.max_response_bytes),
                 config=self.config,
             )
         if self._robots is None:
-            self._robots = RobotsPolicy(self._client, user_agent=self.config.user_agent)
+            self._robots = build_robots(source=self.name, config=self.config)
         return self._client
 
     def _fetch(self, result: AdapterResult, *, limit: int | None) -> None:

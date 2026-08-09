@@ -57,8 +57,13 @@ class FakeAdapter:
 
 
 # Two valid, unique source configs the planner will accept.
+#
+# `terms_reviewed=True` on both since 2026-08-08: the gate widened from telegram
+# to every source type, so a fixture must now state the same decision a real
+# entry does. That the widening broke these five graph tests is the gate
+# working — an enabled source with no recorded review does not run.
 BLOG = SourceConfig(name="blog", source_group="g1", source_type="blogger_feed",
-                    base_url="https://blog.test")
+                    base_url="https://blog.test", terms_reviewed=True)
 TG = SourceConfig(name="tg", source_group="g1", source_type="telegram",
                   handle="@testchannel", terms_reviewed=True)
 

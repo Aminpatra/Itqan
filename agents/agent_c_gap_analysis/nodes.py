@@ -486,13 +486,36 @@ def make_gap_analysis(deps: Deps) -> Callable[[GapState], dict]:
                 # without a way to open the job: all four of these were retrieved
                 # and discarded.
                 "source_url": job.source_url,
+                # The employer's own page, when Agent B could resolve it. Kept
+                # ALONGSIDE `source_url` rather than replacing it: the consumer
+                # decides which to link, and "where we found it" stays auditable.
+                # None on every posting ingested before Agent B's migration 0011.
+                "final_url": job.final_url,
                 "posted_date": job.posted_date,
+                # Stated by the employer or not stated at all. A consumer may
+                # show these; nothing may default them — an absent salary is
+                # unknown pay, not free labour, and an absent arrangement is not
+                # a claim that the role is onsite.
+                "work_arrangement": job.work_arrangement,
+                "employment_type": job.employment_type,
+                "salary": None if job.salary_min is None and job.salary_max is None else {
+                    "min": job.salary_min,
+                    "max": job.salary_max,
+                    "currency": job.salary_currency,
+                    "period": job.salary_period,
+                },
                 # The employer. Agent B extracted and grounded it from the start
                 # but had no column to keep it in, so every consumer saw None;
                 # persisted from Agent B's migration 0010. A job card without an
                 # employer is not something anyone acts on.
                 "company": job.company,
                 "source": job.source,
+                # How the publisher must be CREDITED, and the terms that require
+                # it. Carried rather than derived: a consumer showing a job card
+                # has to name GulfTalent because GulfTalent's terms make that a
+                # condition of our having the row at all.
+                "attribution": job.attribution,
+                "terms_url": job.terms_url,
                 "seniority_level": job.seniority_level,
                 "location": job.location,
                 "similarity": round(job.similarity, 4),

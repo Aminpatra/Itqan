@@ -89,9 +89,55 @@ class SourceConfig:
 
     # telegram
     handle: str = ""
-    # Set by a human who has read the channel's terms and content. Never set in
-    # code, never defaulted True, never inferred from the channel working.
+    # Set by a human who has read the source's terms and content. Never set in
+    # code, never defaulted True, never inferred from the source working.
+    #
+    # WIDENED beyond telegram (2026-08-08). It began as a Telegram-only gate
+    # because a channel is trivially easy to add. GulfTalent proved the gate is
+    # about terms, not transport: its robots.txt says `Allow: /` and its
+    # servers answer 200, and only a person reading the Terms of Use found the
+    # clause that governs whether we may crawl it at all. A machine cannot
+    # answer that question, so a machine must not be allowed to skip it.
     terms_reviewed: bool = False
+
+    # How this publisher is NAMED to a user. `name` is an internal key
+    # ('gulftalent'); this is what appears on a job card. Attribution should
+    # read like a citation. Falls back to `name` when unset.
+    display_name: str = ""
+
+    # The terms this source is crawled under. Stored on every row it produces,
+    # so an auditor can follow the row back to the document that permitted it.
+    terms_url: str = ""
+
+    # The apply link must point at THIS publisher's page, never at an employer
+    # page discovered from it.
+    #
+    # Set when a source's terms require linking back — GulfTalent's exception is
+    # conditional on "link each snippet back to the corresponding page on
+    # GulfTalent". Without this, `root_fetch` would follow the ad's outbound
+    # link, `api/mapping` would prefer the resulting `final_url`, and we would
+    # keep the publisher's data while sending their traffic to the employer.
+    # That is precisely what the condition forbids, and it would have happened
+    # silently as a side effect of an unrelated improvement.
+    link_back_required: bool = False
+
+    # Refuse to store a posting from this source unless it resolves to an
+    # employer's own vacancy page.
+    #
+    # User decision 2026-08-09: "I only want final destinations." An aggregator
+    # article that describes a job and says "send your CV to hr@..." is not one,
+    # and neither is a fragment of a roundup listing 38 roles.
+    #
+    # This is what makes the decision STICK. Deleting such rows buys twelve
+    # hours: the next cycle finds the posts absent, treats them as new, and
+    # writes every one of them back. The rule has to live where postings are
+    # written, not in a one-off command.
+    #
+    # NOT set for a source whose own URL is already the vacancy page — GulfTalent
+    # links each row to one job ad and its terms require us to link there rather
+    # than to an employer's site, so demanding a `final_url` would delete the one
+    # source that fully satisfies the rule.
+    require_destination: bool = False
 
     def __post_init__(self) -> None:
         if self.source_type not in SOURCE_TYPES:
@@ -111,6 +157,11 @@ class SourceConfig:
         return normalize_handle(self.handle) if self.handle else ""
 
     @property
+    def credit(self) -> str:
+        """What a user should see as the source's name."""
+        return self.display_name or self.name
+
+    @property
     def identity(self) -> str:
         """What two entries must not share.
 
@@ -125,6 +176,39 @@ class SourceConfig:
 
 
 # ---------------------------------------------------------------------------
+# SOURCES WE PROBED AND DID NOT TAKE — measured 2026-08-08.
+#
+# Written here because this is the file a person opens when adding a source, and
+# every one of these costs an afternoon to rediscover.
+#
+#   bayt.com          robots allows it; the server returns 403 (Cloudflare) to
+#                     our identified UA, and serves Chromium a bot challenge.
+#   om.indeed.com     same shape: robots allows, Cloudflare 403.
+#   tanqeeb.com       202 from an AWS ELB with a ZERO-LENGTH body — a WAF
+#                     challenge wearing a success code. Reads as "empty page"
+#                     unless you check the length, which is worth knowing.
+#   naukrigulf.com    robots.txt unreachable (read timeout) -> fail-closed.
+#   sha5r.com         robots.txt unreachable -> fail-closed.
+#   edarabia.com      allowed AND parseable, but publishes no individual job
+#                     pages at all — only category pages. Nothing to ingest.
+#
+# A challenge or a 403 is a refusal, and we leave. That decision is not
+# negotiable-by-convenience: see shared/scraping/browser.py, which deliberately
+# does not implement the evasion techniques that would get past them.
+#
+# RESEARCHED, VIABLE, AND WAITING ON A HUMAN TERMS REVIEW:
+#   jobs.tamol.om     paginated RSS at /feed/, robots-allowed, plain HTTP, and
+#                     government/judicial/university vacancies el7far barely
+#                     carries. NO TERMS PAGE EXISTS (/terms/ 525, /about/ 404),
+#                     and absence of a prohibition is not permission.
+#   dubizzle          already built below. Its ad pages publish Job type,
+#                     Experience and a salary range as structured fields, and
+#                     its poster_type objection has never actually been tested
+#                     (--dry-run skips the LLM that would resolve it). Terms sit
+#                     on an OLX Zendesk that 403s this crawler; needs a browser.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # The registry. Sequencing per the approved plan: the Atom feed and one verified
 # Telegram channel first; Dubizzle lands in phase 3.
 #
@@ -136,9 +220,28 @@ class SourceConfig:
 DEFAULT_SOURCES: tuple[SourceConfig, ...] = (
     SourceConfig(
         name="el7far",
+        display_name="El7far Oman Jobs",
         source_group="el7far_network",
         source_type="blogger_feed",
         base_url="https://oman.el7far.com",
+        # GRANDFATHERED when the gate widened past telegram on 2026-08-08, and
+        # said plainly rather than dressed up: this source has been the
+        # project's primary corpus in production since 2026-07-22 under the
+        # operator's standing decision, and it is robots-checked on every fetch.
+        # What it does NOT record is a documented reading of the site's terms,
+        # because el7far publishes none.
+        #
+        # It is True so that widening a safety gate does not take a working
+        # source offline — but if that reading is wrong, this is the line to
+        # change, and changing it stops el7far rather than hiding the problem.
+        terms_reviewed=True,
+        # Measured 2026-08-09, tracing 30 of its postings to the end: 16 carried
+        # no external link at all, 11 pointed at a hub or LinkedIn, 3 were
+        # refused or unreachable, and 0 reached a vacancy page. Across the full
+        # backfill, 5 destinations from 179 postings. So this source will
+        # contribute roughly 5 rows a cycle instead of ~180 — which is what
+        # "only final destinations" means here.
+        require_destination=True,
         enabled=True,
     ),
     SourceConfig(
@@ -150,6 +253,42 @@ DEFAULT_SOURCES: tuple[SourceConfig, ...] = (
         # judgement and nothing else — it is not evidence the channel works, and
         # it does not carry over to any other channel added later.
         terms_reviewed=True,
+        # It reposts el7far's articles, so it inherits el7far's problem: a link
+        # back to an aggregator page, not to a vacancy.
+        require_destination=True,
+        enabled=True,
+    ),
+    SourceConfig(
+        name="gulftalent",
+        display_name="GulfTalent",
+        # Its own group: an unrelated publisher, so a near-duplicate against
+        # el7far needs 0.97 AND human review, never the 0.93 auto-merge.
+        source_group="gulftalent",
+        source_type="html_scrape",
+        base_url="https://www.gulftalent.com",
+        # Reviewed and enabled by a human on 2026-08-08.
+        #
+        # GulfTalent's Terms of Use ("Acceptable Use of the Site") prohibit
+        # crawling with ONE exception, quoted verbatim because the whole basis
+        # for this source rests on it:
+        #
+        #   "...except as an internet search engine making the information
+        #    searchable by users, and provided you display only minimal snippets
+        #    of each GulfTalent page to your users, in each case mention the
+        #    source clearly as GulfTalent, and link each snippet back to the
+        #    corresponding page on GulfTalent."
+        #
+        # Itqan retrieves postings by semantic similarity and sends the user on
+        # to the posting, which is the behaviour the exception describes. Its
+        # three conditions are therefore BUILD REQUIREMENTS, not intentions:
+        #   1. minimal snippets  -> api/mapping never publishes raw_description
+        #   2. name the source   -> display_name above, rendered on every card
+        #   3. link back         -> link_back_required below
+        # Each is pinned by a test in tests/agent_b/test_attribution_compliance.py.
+        # If one is removed, this source must be disabled in the same change.
+        terms_reviewed=True,
+        terms_url="https://www.gulftalent.com/terms",
+        link_back_required=True,
         enabled=True,
     ),
     SourceConfig(
@@ -214,11 +353,18 @@ def validate_source_config(
     for source in sources:
         if not source.enabled:
             continue
-        if source.source_type == "telegram" and not source.terms_reviewed and not dry_run:
+        if not source.terms_reviewed and not dry_run:
+            # Widened past telegram on 2026-08-08. GulfTalent is why: robots.txt
+            # said `Allow: /`, the server answered 200, and only a person reading
+            # the Terms of Use found the clause that decides whether we may crawl
+            # it at all. No amount of probing answers that question, so an
+            # enabled source may not run until someone says they have read them.
+            where = (f"@{source.normalized_handle}" if source.source_type == "telegram"
+                     else source.base_url)
             raise SourceConfigError(
-                f"{source.name} (@{source.normalized_handle}) is enabled but terms_reviewed "
-                "is False. A human must review the channel and set it explicitly; it is "
-                "never set in code. Use --dry-run to inspect the channel first."
+                f"{source.name} ({where}) is enabled but terms_reviewed is False. A human "
+                "must read the source's terms and set it explicitly; it is never set in "
+                "code. Use --dry-run to inspect the source first."
             )
         runnable.append(source)
 

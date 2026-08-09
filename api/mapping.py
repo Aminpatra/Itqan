@@ -182,20 +182,68 @@ def job_matches(gap: dict[str, Any], *, limit: Optional[int] = None) -> list[dic
             # fills in as the corpus refreshes rather than all at once.
             "employer": job.get("company") or "",
             "location": job.get("location") or "",
-            "arrangement": job.get("seniority_level") or "",
+            "arrangement": _arrangement_label(job),
             # gap_score is how much is MISSING, so readiness is its complement.
             # None stays None: no score means no claim.
             "score": None if score is None else round(1.0 - float(score), 4),
             "why": why,
             "matchedSkills": [r["satisfied_by"] for r in matched],
             "source": {
-                "name": job.get("source") or "",
-                "url": job.get("source_url") or "",
+                # CONDITION 2 of GulfTalent's terms exception: "mention the
+                # source clearly as GulfTalent". `attribution` is the publisher's
+                # own name; `source` is our internal key ('gulftalent'), which is
+                # a database identifier and not a credit.
+                "name": job.get("attribution") or job.get("source") or "",
+                # THE APPLY LINK. The employer's own page when Agent B resolved
+                # one, else where we found it. Never blank: `final_url` is NULL
+                # on every posting ingested before Agent B's migration 0011, so
+                # the fallback is the normal case for most of the corpus and
+                # fills in as it refreshes.
+                #
+                # CONDITION 3: "link each snippet back to the corresponding page
+                # on GulfTalent". A posting from a source with that obligation
+                # keeps `final_url` NULL by construction (the pipeline declines
+                # to set it), so this expression already resolves to the
+                # publisher's page — the guard is there, not here, because a
+                # value that never exists cannot be preferred by accident.
+                "url": job.get("final_url") or job.get("source_url") or "",
                 "retrievedAt": job.get("posted_date") or "",
             },
         })
     out.sort(key=lambda j: (j["score"] is None, -(j["score"] or 0)))
     return out[:limit] if limit else out
+
+
+def _arrangement_label(job: dict[str, Any]) -> str:
+    """The chip under a job card's title — "Remote · Internship".
+
+    The UI field is documented as carrying exactly this ("Full time",
+    "Remote") and has been fed `seniority_level` since the API was built,
+    because nothing in the corpus recorded an arrangement. Agent B's
+    destination crawl records both now, so the field can finally mean what its
+    name says.
+
+    Seniority stays as the fallback rather than being dropped: it is what every
+    posting written before migration 0011 has, and an empty chip on most cards
+    would be a regression in service of a purity nobody sees. Nothing is
+    invented — a posting stating neither gets an empty string.
+    """
+    parts = [_HUMANISED.get(job.get(field) or "", "")
+             for field in ("work_arrangement", "employment_type")]
+    stated = [p for p in parts if p]
+    if stated:
+        return " · ".join(stated)
+    return job.get("seniority_level") or ""
+
+
+# The stored values are the vocabulary the database CHECKs enforce; these are
+# what a person reads. Localisation belongs to the frontend's i18n files, which
+# is why this stays a plain map rather than growing a language argument.
+_HUMANISED = {
+    "remote": "Remote", "hybrid": "Hybrid", "onsite": "On-site",
+    "full_time": "Full time", "part_time": "Part time", "contract": "Contract",
+    "internship": "Internship", "temporary": "Temporary",
+}
 
 
 # Platforms whose catalogue is sold rather than given away. Used ONLY to label a

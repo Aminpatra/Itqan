@@ -149,6 +149,48 @@ def test_a_job_with_no_evidence_chain_is_dropped_not_shipped():
     assert "SQL covers their requirement for SQL" in out[0]["why"]
 
 
+_EVIDENCE = [{"skill": "SQL", "verdict": "matched", "satisfied_by": "SQL"}]
+
+
+def _one_job(**fields):
+    gap = {"matched_jobs": [dict(job_id="a", job_title="T", gap_score=0.2,
+                                 skill_resolution=_EVIDENCE, **fields)]}
+    return job_matches(gap)[0]
+
+
+def test_the_apply_link_is_the_employer_page_when_we_resolved_one():
+    """The whole point of recording a destination. Sending someone to the
+    aggregator's article when we know the employer's own vacancy page is the
+    difference between a lead and an application."""
+    job = _one_job(source_url="https://oman.el7far.com/2026/07/eni.html",
+                   final_url="https://jobs.eni.com/en/sites/CX_1004/job/33730")
+    assert job["source"]["url"] == "https://jobs.eni.com/en/sites/CX_1004/job/33730"
+
+
+def test_a_posting_with_no_destination_still_links_somewhere():
+    """`final_url` is NULL on every row ingested before migration 0011, so this
+    is the majority case today, not an edge case. A blank apply link would be a
+    regression on the whole existing corpus."""
+    job = _one_job(source_url="https://oman.el7far.com/2026/07/eni.html")
+    assert job["source"]["url"] == "https://oman.el7far.com/2026/07/eni.html"
+
+
+@pytest.mark.parametrize("fields,want", [
+    ({"work_arrangement": "remote"}, "Remote"),
+    ({"work_arrangement": "remote", "employment_type": "internship"},
+     "Remote · Internship"),
+    ({"employment_type": "full_time"}, "Full time"),
+    # The fallback: what every posting written before the destination crawl has.
+    ({"seniority_level": "Senior"}, "Senior"),
+    # A stated arrangement beats the fallback — that is the upgrade.
+    ({"work_arrangement": "hybrid", "seniority_level": "Senior"}, "Hybrid"),
+    # Nothing stated, nothing shown. Never a guessed "On-site".
+    ({}, ""),
+])
+def test_the_arrangement_chip_says_only_what_the_posting_stated(fields, want):
+    assert _one_job(**fields)["arrangement"] == want
+
+
 def test_a_job_score_is_the_complement_and_null_survives():
     gap = {"matched_jobs": [
         {"job_id": "a", "job_title": "T", "gap_score": None,

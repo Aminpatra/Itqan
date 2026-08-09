@@ -182,6 +182,12 @@ class JobPostingExport(BaseModel):
     source_group: str
     source_type: str
     source_url: str
+    # Where the vacancy actually lives — the employer's own page, when the
+    # aggregator's article linked to one and we could read it. `source_url` is
+    # "where we found it"; this is "where you apply". None on every row written
+    # before migration 0011, and on any posting whose destination we could not
+    # resolve, so a consumer MUST fall back to `source_url` rather than assume.
+    final_url: Optional[str] = None
 
     title: str
     raw_description: str
@@ -195,6 +201,28 @@ class JobPostingExport(BaseModel):
     location: Optional[str] = None
     country: Optional[str] = None
     posted_date: Optional[str] = None       # ISO date; None when never stated
+
+    # What the employer's page states and an aggregator summary almost never
+    # does. EVERY ONE IS None UNLESS THE PAGE SAID SO — never inferred, never
+    # defaulted. An office address is not a claim that the role is onsite, and
+    # a salary of 0 is a statement about pay, not a missing value.
+    work_arrangement: Optional[str] = None  # remote | hybrid | onsite
+    employment_type: Optional[str] = None   # full_time | part_time | contract |
+                                            # internship | temporary
+    salary_min: Optional[float] = None
+    salary_max: Optional[float] = None
+    salary_currency: Optional[str] = None
+    salary_period: Optional[str] = None     # hour | day | week | month | year
+
+    # How the publisher must be NAMED to a user, and the terms this row was
+    # collected under. For a source crawled under a conditional permission —
+    # GulfTalent's terms allow it only if we credit and link back — these are
+    # not decoration; they are the condition. None for sources with no such
+    # obligation, where consumers fall back to `source`.
+    attribution: Optional[str] = None
+    terms_url: Optional[str] = None
+    # The publisher's own statement of when the vacancy stops being real.
+    expires_at: Optional[str] = None
 
     legitimacy_score: Optional[float] = None
     listing_intent: str = "vacancy"         # by filter; carried for transparency

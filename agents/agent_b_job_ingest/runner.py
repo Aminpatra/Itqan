@@ -127,6 +127,13 @@ def run_cycle(
             if root_fetcher is not None:
                 root_fetcher.close()
 
+    # Carried out of the fetcher and into the cycle's own warnings, so a crawl
+    # that lost its browser says so where an operator is already looking rather
+    # than in a log line nobody reads.
+    if root_fetcher is not None and root_fetcher.warnings:
+        state.setdefault("warnings", []).extend(
+            f"root fetch: {w}" for w in root_fetcher.warnings)
+
     # A partial cycle exits non-zero so a scheduler's only signal — the exit
     # code — reflects that inventory was fetched incompletely.
     exit_code = 1 if state.get("partial_cycle") else 0

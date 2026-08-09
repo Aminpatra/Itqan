@@ -35,6 +35,7 @@ from .records import PersistedPosting
 from .root_fetch import candidate_job_link
 from .schemas import JobExtraction, JobExtractionBatch, LegitimacyVerdict
 from .sources.base import RawPosting
+from .stated_facts import verify_stated_facts
 
 
 @dataclass
@@ -48,6 +49,7 @@ class IngestSummary:
     rejected: int = 0
     needs_review: int = 0
     link_duplicates: int = 0
+    destination_duplicates: int = 0
     embed_duplicates: int = 0
     extractions: int = 0
     adjudications: int = 0
@@ -57,6 +59,27 @@ class IngestSummary:
     # replaced by the real job page's.
     root_fetches: int = 0
     root_enrichments: int = 0
+    # Fields the model asserted and the source could not support, dropped to
+    # NULL. NOT an error count — it is the verifier working. A cycle where this
+    # is 0 across hundreds of postings means the check stopped running, which is
+    # exactly the failure that would otherwise be invisible.
+    unstated_fields_dropped: int = 0
+    # Postings whose extraction raised — a malformed model response, a rejected
+    # sector, an API error. One posting each, never a batch. Counted so a spike
+    # is visible: a handful is the model being the model, a hundred means the
+    # prompt or the schema has drifted.
+    extraction_failures: int = 0
+    # Postings a `require_destination` source produced that resolved to no
+    # employer page, and were therefore never written. Counted and printed every
+    # cycle: this is the number that says how much a source is actually
+    # contributing under the rule, and a silent 180 would look identical to a
+    # silent 0.
+    skipped_no_destination: int = 0
+    # Split vacancies that kept the whole post body because the model's quoted
+    # span could not be verified against it. Counted rather than hidden: a run
+    # where this equals the split count means the prompt stopped working, and
+    # the rows would be silently clustered again.
+    unsliced_vacancies: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {k: v for k, v in self.__dict__.items()}
@@ -99,6 +122,7 @@ class IngestPipeline:
         config: Any,
         model_name: str = "unknown",
         root_fetcher: Any = None,
+        source_configs: Any = (),
     ) -> None:
         self.store = store
         self.extractor = extractor          # prompt | structured(llm, JobExtractionBatch)
@@ -109,10 +133,23 @@ class IngestPipeline:
         self.root_fetcher = root_fetcher
         self.config = config
         self.model_name = model_name
+        # The source registry, INJECTED rather than imported.
+        #
+        # `require_destination` and `link_back_required` are properties of a
+        # named production source, and a pipeline constructed directly — every
+        # offline test — must not inherit them from whatever fixture name it
+        # happened to pick. Defaulting to empty means a test using
+        # `source="el7far"` as a stand-in gets stand-in behaviour; production
+        # reaches this through `GraphDeps.pipeline()`, which passes the real
+        # registry.
+        self.source_configs = tuple(source_configs or ())
 
     # ------------------------------------------------------------------
     def run(self, postings: list[RawPosting]) -> IngestSummary:
         summary = IngestSummary(received=len(postings))
+        self._unstated = 0
+        self._extraction_errors: list[str] = []
+        self._unsliced = 0
 
         deduped = _dedupe_within_batch(postings)
         # Change detection is at the POST level: one source post may split into
@@ -188,7 +225,27 @@ class IngestPipeline:
                     f"cited: {verdict.evidence_quote.strip()!r})"
                 )
 
-            jobs = self._extract_jobs(raw, summary)
+            # ONE posting's extraction, inside its own boundary.
+            #
+            # The batch already had a boundary (in `nodes.make_ingest`), but it
+            # wraps the WHOLE source, so any failure here cost every posting in
+            # the cycle. Measured 2026-08-08: a 352-posting GulfTalent census
+            # died on ONE model response with country="null" — 367 pages
+            # fetched politely over 20 minutes, 352 extractions paid for, zero
+            # rows written.
+            #
+            # The audit's own P4 said "one bad posting must cost one posting".
+            # It was true of the batch and not of the posting. It is now both.
+            try:
+                jobs = self._extract_jobs(raw, summary)
+            except Exception as exc:      # noqa: BLE001 - deliberate boundary
+                # Includes the pydantic ValidationError that `_known_sector` and
+                # `_iso_alpha2` raise BY DESIGN on bad model output. Refusing the
+                # value is right; refusing the other 351 postings is not.
+                summary.extraction_failures += 1
+                self._extraction_errors.append(f"{raw.source_url}: {type(exc).__name__}: {exc}")
+                continue
+
             for index, job in enumerate(jobs):
                 item = self._child_work(raw, post_hash, job, index, len(jobs), assessment)
                 if flagged:
@@ -202,6 +259,12 @@ class IngestPipeline:
         # root-source enrichment — replace thin aggregator skills with the real
         # job page's, before embedding so the essence reflects the true skills.
         self._enrich_from_root(live, summary)
+
+        # Destination dedup FIRST: it is the strongest signal we have, and it is
+        # exact. Two aggregators summarising one vacancy differently defeat
+        # embedding similarity, but they cannot disagree about which page they
+        # link to. Runs after _enrich_from_root because that is what sets it.
+        self._resolve_destination_duplicates(live, summary)
 
         # link dedup — deterministic, before any embedding
         self._resolve_link_duplicates(live, summary)
@@ -218,10 +281,48 @@ class IngestPipeline:
         # duplicate_of must point at a ROOT before anything is written.
         self._flatten_duplicate_chains(work)
 
+        # A source that only wants final destinations does not store a posting
+        # that has none. THE ENFORCEMENT POINT for that decision: deleting such
+        # rows afterwards buys twelve hours, because the next cycle sees the
+        # posts as new and writes every one of them back.
+        #
+        # Applied here, after root enrichment has had its chance, so the test is
+        # "did this posting resolve to a vacancy page?" rather than "did it come
+        # with a link?". A rejected posting is not written at all — not stored
+        # as rejected, not stored as needs_review; it simply does not enter the
+        # corpus, which is what "I only want final destinations" asks for.
         rows = [w.row for w in work]
+        if rows:
+            keep, refused = [], 0
+            for row in rows:
+                if self._requires_destination(row.source) and not row.final_url:
+                    refused += 1
+                    continue
+                keep.append(row)
+            summary.skipped_no_destination = refused
+            rows = keep
+
         self.store.upsert_batch(rows)
         summary.written = len(rows)
+        summary.unstated_fields_dropped = self._unstated
+        summary.unsliced_vacancies = self._unsliced
+        # Surfaced on the pipeline so the ingest node can warn with the actual
+        # URLs. A counter alone tells an operator something broke; the URLs tell
+        # them what, which is the difference between a number and a lead.
+        self.extraction_errors = list(self._extraction_errors)
         return summary
+
+    def _requires_destination(self, source: str) -> bool:
+        """Does this source only contribute postings that reach a vacancy page?
+
+        User decision 2026-08-09: "I only want final destinations." Measured on
+        el7far, that means ~5 postings a cycle instead of ~180 — the rest are
+        articles saying "send your CV to hr@..." with nothing to follow.
+        """
+        for cfg in self.source_configs:
+            if cfg.name == source:
+                return cfg.require_destination
+        return False
 
     # ------------------------------------------------------------------
     def _base_row(self, raw: RawPosting, pid: str, src_url: str, chash: str,
@@ -240,6 +341,11 @@ class IngestPipeline:
             listing_intent=raw.listing_intent,
             poster_type=raw.poster_type,
             extraction_model=self.model_name,
+            # Who published it and on what terms. A row must be able to say this
+            # for as long as it exists, independently of the source registry.
+            attribution=raw.attribution,
+            terms_url=raw.terms_url,
+            expires_at=raw.expires_at,
         )
 
     def _rejected_work(self, raw: RawPosting, chash: str, assessment: Any) -> _Work:
@@ -267,13 +373,58 @@ class IngestPipeline:
             pid = id_for(raw)
 
         row = self._base_row(raw, pid, src_url, chash, title)
+        # A vacancy split out of a roundup keeps only its OWN text. Measured
+        # before this: every child of all 40 el7far roundups stored the entire
+        # article, so a row titled "Accounts Payable In-Charge" carried 20,000
+        # characters describing 38 unrelated jobs.
+        #
+        # Only when the post actually split. A single-vacancy post's body IS
+        # about that vacancy, and slicing it could only lose context.
+        if is_split:
+            slice_ = _verified_slice(job, raw.raw_description, title)
+            if slice_:
+                row.raw_description = slice_
+            else:
+                self._unsliced += 1
         row.legitimacy_score = assessment.score
         row.sector = job.sector
         row.required_skills = job.required_skills
-        row.company = job.company
-        row.seniority_level = job.seniority_level
+        # Source-stated wins, model fills the silence. A publisher naming the
+        # employer in a STRUCTURED field (schema.org `hiringOrganization`) is
+        # better evidence than a model finding a name in prose, and it is not
+        # subject to the text-grounding check below for the same reason: the
+        # employer's name legitimately appears nowhere in the description.
+        row.company = raw.company or job.company
+        # Source-stated wins, model fills the silence — the same rule as the
+        # facts below and as listing_intent/poster_type above.
+        row.seniority_level = raw.seniority_level or job.seniority_level
         row.location = job.location
-        row.country = job.country
+        # Source-stated wins. GulfTalent files every ad under a country in its
+        # own URL and repeats it in `addressCountry`; the model reads prose and
+        # frequently states nothing, which would leave `country` NULL — and
+        # `export_for_agent_c` filters on country, so those rows would be stored
+        # and never retrieved.
+        row.country = raw.country or job.country
+        # Verified, not taken on trust. Measured on the first live cycle: 19 of
+        # 19 postings came back 'onsite' and NONE of the 19 contained an
+        # arrangement phrase in either language — the model was reading a city
+        # name, exactly as the prompt tells it not to. See `stated_facts.py`.
+        #
+        # A value the SOURCE stated in a structured field is a different thing
+        # and takes precedence: GulfTalent's `employmentType: ["FULL_TIME"]` is
+        # the publisher's own schema.org property, not an interpretation, and
+        # putting it through a text-mention check would discard it because the
+        # description prose never repeats the phrase. Same rule `listing_intent`
+        # and `poster_type` already follow — the model may only fill what the
+        # source left silent.
+        facts = verify_stated_facts(job, raw.raw_description)
+        row.work_arrangement = raw.work_arrangement or facts.work_arrangement
+        row.employment_type = raw.employment_type or facts.employment_type
+        row.salary_min = raw.salary_min if raw.salary_min is not None else facts.salary_min
+        row.salary_max = raw.salary_max if raw.salary_max is not None else facts.salary_max
+        row.salary_currency = raw.salary_currency or facts.salary_currency
+        row.salary_period = raw.salary_period or facts.salary_period
+        self._unstated += len(facts.dropped)
 
         # Ground the employer the same way Agent A grounds a skill span: a company
         # the model named must actually appear in the posting, or it is a
@@ -394,16 +545,38 @@ class IngestPipeline:
 
             result = self.extractor.invoke({"title": item.raw.title, "body": text})
             jobs = list(result.jobs) if isinstance(result, JobExtractionBatch) else [result]
-            # Exactly one job = a real single job page. More = a listing/hub we
-            # do not deep-crawl. Zero/no skills = nothing better than we have.
-            if len(jobs) != 1 or not jobs[0].required_skills:
+            # Exactly one job = a real single job page. More = a listing/hub we do
+            # not deep-crawl, and a hub is NOT where anyone applies — so it never
+            # becomes a final_url.
+            if len(jobs) != 1:
                 continue
 
-            self._merge_root(item.row, jobs[0])
+            # The URL is recorded even when the page yields no skills. It resolved
+            # to one vacancy, so it IS the destination; "we learned nothing from
+            # it" and "it is not the place to apply" are different statements, and
+            # only the second should withhold the link.
+            #
+            # UNLESS the publisher's terms require linking back to them. Then the
+            # employer's page is not ours to send people to: GulfTalent permits
+            # this crawl only on condition that each snippet links back to the
+            # corresponding GulfTalent page, and quietly redirecting the apply
+            # button to the employer would take their content AND their traffic.
+            # The skills are still harvested below — reading the destination is
+            # not the same act as replacing the link to it.
+            if not _links_back_to_source(item.raw, self.source_configs or None):
+                item.row.final_url = link
+
+            if not jobs[0].required_skills:
+                continue
+
+            # Verified against the DESTINATION's text, not the aggregator's —
+            # this is the page that states these things, so it is the page that
+            # has to support them.
+            self._merge_root(item.row, jobs[0], text)
             summary.root_enrichments += 1
 
-    @staticmethod
-    def _merge_root(row: PersistedPosting, job: JobExtraction) -> None:
+    def _merge_root(self, row: PersistedPosting, job: JobExtraction,
+                    source_text: str = "") -> None:
         """Root page is authoritative for the job's facts: its skills REPLACE the
         aggregator's, and each scalar fact is taken from the root when it states
         one, else the aggregator's value is kept."""
@@ -413,6 +586,58 @@ class IngestPipeline:
         row.seniority_level = job.seniority_level or row.seniority_level
         row.location = job.location or row.location
         row.country = job.country or row.country
+
+        # The fields the employer's page states and an aggregator summary almost
+        # never does. Same rule as the scalars above — the root wins when it says
+        # something, and silence never overwrites — but only AFTER the page has
+        # been made to support the claim.
+        facts = verify_stated_facts(job, source_text)
+        self._unstated += len(facts.dropped)
+
+        row.work_arrangement = facts.work_arrangement or row.work_arrangement
+        row.employment_type = facts.employment_type or row.employment_type
+        # `is not None`, not `or`: a salary of 0 is falsy, and an unpaid
+        # internship stating 0 is a real answer that must not be read as silence.
+        if facts.salary_min is not None:
+            row.salary_min = facts.salary_min
+        if facts.salary_max is not None:
+            row.salary_max = facts.salary_max
+        row.salary_currency = facts.salary_currency or row.salary_currency
+        row.salary_period = facts.salary_period or row.salary_period
+
+    # ---- destination dedup -------------------------------------------
+    def _resolve_destination_duplicates(self, live: list[_Work],
+                                        summary: IngestSummary) -> None:
+        """Two postings pointing at one employer page are one vacancy.
+
+        Cheaper and more certain than the embedding near-dup this supplements:
+        the evidence is an exact URL rather than a similarity above a threshold,
+        and it catches the case similarity is worst at — the same job written up
+        twice, in different words, by two different aggregators.
+
+        A stored canonical row wins over anything in this batch; within the batch
+        the lowest posting_id wins, so the outcome does not depend on the order
+        sources happened to be fetched in.
+        """
+        candidates = [w for w in live
+                      if w.row.final_url and not w.is_link_duplicate]
+        if not candidates:
+            return
+
+        stored = self.store.find_by_final_urls(
+            sorted({w.row.final_url for w in candidates}))
+
+        # Deterministic winner per destination inside this batch.
+        canonical: dict[str, str] = {}
+        for item in sorted(candidates, key=lambda w: w.posting_id):
+            canonical.setdefault(item.row.final_url, item.posting_id)
+
+        for item in candidates:
+            target = stored.get(item.row.final_url) or canonical[item.row.final_url]
+            if target and target != item.posting_id:
+                item.row.duplicate_of = target
+                item.is_link_duplicate = True   # also skips embedding, as link dups do
+                summary.destination_duplicates += 1
 
     # ---- link dedup --------------------------------------------------
     def _resolve_link_duplicates(self, live: list[_Work], summary: IngestSummary) -> None:
@@ -576,6 +801,91 @@ class IngestPipeline:
 
 
 # ---------------------------------------------------------------------------
+# An absolute floor, deliberately low.
+#
+# It started at 80 on the theory that anything shorter was the model echoing the
+# title back. Measured against the real corpus, that rejected 37 of 38 CORRECT
+# answers: a Majees-style roundup is a LIST of role titles, so all the article
+# says about one vacancy is
+#
+#     Project Coordinator - ELV
+#     - Muscat, Oman
+#
+# — 40 characters, and genuinely the whole of it. A floor tuned to an imagined
+# failure was discarding the source's actual shape. The real guard is not length
+# but `_adds_to_title` below: a span has to say something the row does not
+# already know.
+MIN_SLICE_CHARS = 25
+# And a "slice" that is essentially the whole article has sliced nothing. The
+# failure it guards against is the model returning the input unchanged, which
+# would leave every child clustered while reporting success.
+MAX_SLICE_RATIO = 0.9
+
+
+def _adds_to_title(span: str, title: str) -> bool:
+    """Does this span say anything beyond the role title the row already has?
+
+    "Project Coordinator - ELV" alone is not a description, it is the title
+    twice. "Project Coordinator - ELV / Muscat, Oman" is — it adds where the job
+    is. Compared on normalised text so punctuation and spacing do not decide it.
+    """
+    from shared.grounding import normalize
+
+    if not title:
+        return True
+    return len(normalize(span)) > len(normalize(title)) + 5
+
+
+def _verified_slice(job: JobExtraction, body: str, title: str = "") -> Optional[str]:
+    """The text of ONE vacancy, if the model quoted it and the posting contains it.
+
+    Returns None whenever the slice cannot be trusted, and every caller then
+    keeps the full body. That asymmetry is deliberate: this runs over 245 live
+    rows, and the worst outcome it can produce is the status quo.
+
+    Four ways to fail, in order of how often they fire:
+      * nothing quoted (a single-vacancy post — the normal case);
+      * too short to be a description rather than an echoed title;
+      * so long it is the article again, i.e. no slicing happened;
+      * not actually in the posting — a paraphrase, which is the one that
+        matters. `verify_quote` is the same check `evidence_quote` goes through,
+        for the same reason: the model may POINT at text, never compose it.
+    """
+    span = (getattr(job, "vacancy_text", None) or "").strip()
+    if not span or len(span) < MIN_SLICE_CHARS:
+        return None
+    # A span that is only the role title tells the row nothing it does not
+    # already store in `title`. This is the check the length floor was reaching
+    # for and getting wrong — "is it informative?", not "is it long?".
+    if not _adds_to_title(span, title or (job.title or "")):
+        return None
+    if len(span) > len(body) * MAX_SLICE_RATIO:
+        return None
+    if not verify_quote(span, body):
+        return None
+    # `verify_quote` has confirmed this text is in the posting under
+    # normalisation (whitespace, Arabic orthography, digit forms). Stored as the
+    # model returned it: re-deriving raw offsets from a normalised match is
+    # fiddly and buys nothing a reader would notice.
+    return span
+
+
+def _links_back_to_source(raw: RawPosting, source_configs: Any = None) -> bool:
+    """Must this posting's apply link stay on the publisher's own page?
+
+    True when the source was configured `link_back_required` — a terms
+    condition, not a preference. Read from the registry so that changing the
+    obligation is one edit in one place, and so a row already written cannot
+    disagree with the terms now in force.
+    """
+    from .sources.config import DEFAULT_SOURCES
+
+    for cfg in (source_configs if source_configs is not None else DEFAULT_SOURCES):
+        if cfg.name == raw.source:
+            return cfg.link_back_required
+    return False
+
+
 def _dedupe_within_batch(postings: list[RawPosting]) -> list[RawPosting]:
     """Same URL twice in one cycle collapses to one, keeping the first seen."""
     seen: set[str] = set()

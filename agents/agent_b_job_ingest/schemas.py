@@ -37,6 +37,14 @@ LISTING_INTENTS = ("vacancy", "seeking", "service", "unknown")
 POSTER_TYPES = ("company", "individual", "unknown")
 
 
+# What a model writes into an optional field instead of leaving it null. Shared
+# rather than inlined per validator: `country` had its own validator, never got
+# this list, and a single country="null" in a 352-posting census raised a
+# ValidationError that cost every one of them.
+_ABSENT_MARKERS = {"n/a", "na", "none", "null", "nil", "unknown", "not specified",
+                   "not stated", "unspecified", "-", "--"}
+
+
 class JobExtraction(BaseModel):
     """What the LLM reads out of one posting's text.
 
@@ -72,6 +80,41 @@ class JobExtraction(BaseModel):
     # postings for several countries, and scope is a separate axis from scam.
     country: Optional[str] = None
 
+    # --- what an employer's own page says and an aggregator summary does not ---
+    #
+    # These arrive mainly through root enrichment: the destination page states
+    # them, the article that linked to it usually does not. All three are None
+    # unless the text SAYS so. That is the rule the whole file already follows —
+    # a defaulted 'onsite' is a fabricated fact about an employer, and a salary of
+    # 0 reads as unpaid.
+
+    # Closes a real gap: a user asked to filter by arrangement and the system
+    # could only bias retrieval text, because nothing in the corpus recorded it.
+    work_arrangement: Optional[Literal["remote", "hybrid", "onsite"]] = Field(
+        default=None,
+        description=("remote / hybrid / onsite, ONLY if the posting states it. "
+                     "null if it does not say."),
+    )
+    employment_type: Optional[
+        Literal["full_time", "part_time", "contract", "internship", "temporary"]
+    ] = Field(
+        default=None,
+        description="Only if the posting states it; null otherwise.",
+    )
+    # Pay as quoted. A range because postings quote ranges; a period because
+    # "3000" means very different things monthly and annually. Gives the
+    # legitimacy check its "unrealistic pay" tell something to check against —
+    # finding E2 of the Agent B audit, where the prompt named the tell and
+    # nothing measured it.
+    salary_min: Optional[float] = Field(
+        default=None, description="Lower bound as stated. null if no pay is quoted.")
+    salary_max: Optional[float] = Field(
+        default=None, description="Upper bound as stated; equal to min for a single figure.")
+    salary_currency: Optional[str] = Field(
+        default=None, description="ISO-4217 if stated, e.g. OMR, AED, USD. null otherwise.")
+    salary_period: Optional[Literal["hour", "day", "week", "month", "year"]] = Field(
+        default=None, description="The period the figure covers, ONLY if stated.")
+
     # Read from the CONTENT, not from source metadata. "I am looking for a job"
     # is the poster stating their own intent; a named employer hiring is a
     # vacancy. Both stay 'unknown' when the text does not make them explicit, and
@@ -79,12 +122,36 @@ class JobExtraction(BaseModel):
     listing_intent: Literal["vacancy", "seeking", "service", "unknown"] = "unknown"
     poster_type: Literal["company", "individual", "unknown"] = "unknown"
 
+    # The part of the post that describes THIS vacancy, quoted verbatim.
+    #
+    # Only meaningful when one post advertises several roles. Measured on the
+    # live corpus: all 40 el7far roundups stored ONE body on every child, so a
+    # row titled "Accounts Payable In-Charge" carried all 20,000 characters of
+    # "Majees Technical Services Careers - 38 Job Opportunities" — 245 rows and
+    # 4.1 MB of duplicated text, none of it about the row it sat on.
+    #
+    # VERBATIM is the whole point and it is checked in code
+    # (`pipeline._verified_slice`): a span that cannot be found in the body is a
+    # paraphrase, and the row keeps the full body rather than storing words the
+    # source never wrote. Same rule as `evidence_quote` and Agent A's
+    # `source_span` — the model may point at text, it may not compose it.
+    vacancy_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "When this post advertises SEVERAL vacancies: the exact text from the "
+            "body that describes THIS one, copied character-for-character. Null "
+            "when the post is about a single vacancy."
+        ),
+    )
+
     @field_validator("sector")
     @classmethod
     def _known_sector(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         value = value.strip()
+        if value.casefold() in _ABSENT_MARKERS:
+            return None
         if value not in ISCO_MAJOR_GROUPS:
             # Reject rather than coerce: a sector the model invented is a signal
             # the extraction is unreliable, not a value to salvage.
@@ -95,6 +162,16 @@ class JobExtraction(BaseModel):
     @classmethod
     def _iso_alpha2(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
+            return None
+        # The absent-markers FIRST, exactly as `_empty_is_none` handles them for
+        # company/location/title. This field had its own validator and never got
+        # that treatment, so a quirk this codebase already documented ("the model
+        # wrote the WORD null into an optional field") hit an unguarded path.
+        #
+        # MEASURED 2026-08-08: one posting in a 352-posting GulfTalent census
+        # came back with country="null" and the resulting ValidationError cost
+        # ALL 352. The word means "not stated", which is what None means.
+        if value.strip().casefold() in _ABSENT_MARKERS:
             return None
         value = value.strip().upper()
         if len(value) != 2 or not value.isalpha():
@@ -109,7 +186,7 @@ class JobExtraction(BaseModel):
         if value is None:
             return None
         cleaned = value.strip()
-        if not cleaned or cleaned.casefold() in {"n/a", "none", "null", "unknown", "not specified"}:
+        if not cleaned or cleaned.casefold() in _ABSENT_MARKERS:
             # "null" the string included: seen in live output — the model wrote
             # the WORD null into an optional field instead of leaving it null.
             return None

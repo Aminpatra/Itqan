@@ -13,6 +13,7 @@ from .base import SourceAdapter
 from .config import SourceConfig
 from .dubizzle import DubizzleAdapter
 from .el7far import El7farAdapter
+from .gulftalent import GulfTalentAdapter
 from .telegram import TelegramAdapter
 
 
@@ -43,6 +44,20 @@ def build_adapter(
         )
 
     if source.source_type == "html_scrape":
+        # Two html_scrape sources now, so the type alone no longer identifies the
+        # adapter. Dispatching on `name` rather than adding a source_type per
+        # site: `html_scrape` describes the transport honestly, and the DB CHECK
+        # that constrains it should not have to grow a value per publisher.
+        if source.name == "gulftalent":
+            return GulfTalentAdapter(
+                name=source.name,
+                source_group=source.source_group,
+                base_url=source.base_url,
+                config=config,
+                is_known_unchanged=is_known_unchanged,
+                attribution=source.credit,
+                terms_url=source.terms_url,
+            )
         return DubizzleAdapter(
             name=source.name,
             source_group=source.source_group,

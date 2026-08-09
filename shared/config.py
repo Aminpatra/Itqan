@@ -359,6 +359,52 @@ class Config:
         )
     )
     max_response_bytes: int = 5_000_000
+
+    # --- browser transport (shared/scraping/browser.py) --------------------
+    # Chromium instead of httpx, for sources that render their content in
+    # JavaScript. Off per-source by default: a browser costs the target a full
+    # page render and costs us ~300-500 MB of RAM, so it is opted into by the
+    # sources that need it rather than imposed on the ones that do not.
+    browser_enabled: bool = field(
+        default_factory=lambda: os.getenv("ITQAN_BROWSER", "1") not in ("0", "false", "False")
+    )
+    # Floor between requests to one source. Higher than the httpx default on
+    # purpose — a rendered page is far more work for the target than a document.
+    browser_min_interval_s: float = 1.5
+    # Added at random on top of the interval. Mechanically-spaced requests are
+    # what make an otherwise polite crawler read as a script.
+    browser_jitter_s: float = 0.7
+    # Hard ceiling per URL, so one unresponsive host cannot stall an unattended
+    # cycle behind it.
+    browser_timeout_s: float = 90.0
+    # Render the employer pages `root_fetch` follows.
+    #
+    # MEASURED 2026-08-08, on the 9 destination links one live el7far cycle
+    # produced. Of the 6 that robots did not refuse, THREE are unreadable to
+    # httpx and readable to Chromium — and none of the three fail in a way a
+    # retry would fix:
+    #
+    #   sah.om            SSL: CERTIFICATE_VERIFY_FAILED  ->  5,003 chars
+    #   careers.dhl.com   HTTP 410 Gone                   ->  4,934 chars
+    #   sjscareers        empty shell                     ->  (still empty)
+    #
+    # An incomplete certificate chain is common on small Omani hosts and
+    # browsers repair it; a 410 to a non-browser client is a site declining to
+    # talk to scripts. The two hosts httpx CAN read (careers.oq.com,
+    # erp.uob.edu.om) return byte-identical text rendered, so nothing regresses.
+    browser_fetch_destinations: bool = True
+    # Source adapters that should fetch through Chromium instead of httpx.
+    #
+    # EMPTY, and that is a measured decision rather than an oversight. The same
+    # probe found NO gain for any of them: el7far's article pages 1.00x,
+    # telegram byte-identical, dubizzle 0.86x (a browser at `domcontentloaded`
+    # sees FEWER listing cards than the served HTML carries). And el7far's feed
+    # is Atom XML, which a browser hands back wrapped in Chrome's XML viewer —
+    # rendering it would break the parse for a gain that does not exist.
+    #
+    # The knob stays because a source can start refusing scripts overnight, and
+    # then this is a one-value change rather than a code change.
+    browser_sources: tuple[str, ...] = ()
     blogger_max_pages: int = 8
     # MUST be >= window_days. A posting is counted as demand for `window_days`, so
     # if the feed is only read back `blogger_lookback_days`, everything in the gap

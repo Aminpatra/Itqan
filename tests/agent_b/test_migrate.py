@@ -38,6 +38,17 @@ def test_real_migrations_are_discoverable_and_ordered():
         # 0010: persists `company`, which was extracted and grounded from the
         # first version and then discarded for want of a column.
         "posting_company",
+        # 0011: where the job actually is, plus what the employer's own page says
+        # that an aggregator summary does not — arrangement, salary, contract type.
+        "final_destination",
+        # 0012: who published a row and on what terms. Added for GulfTalent,
+        # which is crawled under a conditional exception in its own terms — a
+        # row has to be able to state its provenance for as long as it exists.
+        "attribution",
+        # 0013: WHY a row has no destination. Load-bearing the moment postings
+        # are deleted for lacking one — "why did 481 rows go?" has to be
+        # answerable from the database, not from a scrolled-away terminal.
+        "destination_status",
     ]
 
 

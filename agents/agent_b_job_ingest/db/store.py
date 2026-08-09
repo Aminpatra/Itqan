@@ -12,6 +12,7 @@ below rather than invented ahead of their callers.
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -67,6 +68,11 @@ class JobStore:
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
         self._conn: psycopg.Connection | None = None
+        # A SEPARATE connection for reads issued during the scrape phase — see
+        # `exists_during_scrape` for why sharing the main one silently discarded
+        # a whole cycle's writes.
+        self._scrape_conn: psycopg.Connection | None = None
+        self._scrape_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -76,8 +82,29 @@ class JobStore:
         return cls(config.require_database_url())
 
     def connect(self) -> psycopg.Connection:
+        """The cycle's connection. AUTOCOMMIT, and that is load-bearing.
+
+        psycopg opens an IMPLICIT transaction on a connection's first statement.
+        Any read taken before the first `transaction()` block therefore leaves
+        one open, every later `with conn.transaction()` nests inside it as a
+        SAVEPOINT, and releasing a savepoint commits nothing — so the work is
+        rolled back when the connection closes, with no error anywhere.
+
+        This has now cost two silent data losses:
+
+          * a scrape-phase `existing_ids` lookup — 25 postings extracted,
+            embedded, logged `written=25`, and zero rows in the table;
+          * a `destination_survey` read before a prune — "deleted 432
+            posting(s)" printed, 432 rows still present.
+
+        Both were fixed locally, twice, which is the signal that the connection
+        was the problem rather than either caller. With autocommit a bare read
+        holds nothing, and `transaction()` opens a REAL transaction that commits
+        on exit. Every writer already wraps its work in `transaction()`, so
+        batch rollback-on-error is unchanged.
+        """
         if self._conn is None or self._conn.closed:
-            self._conn = psycopg.connect(self.dsn, row_factory=dict_row)
+            self._conn = psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True)
             self._register_vector(self._conn)
         return self._conn
 
@@ -97,10 +124,48 @@ class JobStore:
         except Exception:
             pass
 
+    def exists_during_scrape(self, posting_ids: list[str]) -> set[str]:
+        """`existing_ids`, but safe to call from a scrape branch.
+
+        Two reasons this cannot share the main connection, and the first one
+        cost a silent data loss:
+
+        **1. It would poison the cycle's transactions.** psycopg opens an
+        implicit transaction on the first statement. Scraping happens BEFORE any
+        `transaction()` block, so a read here leaves one open; every later
+        `with conn.transaction()` then nests as a SAVEPOINT rather than being the
+        transaction, and releasing a savepoint commits nothing. The cycle reports
+        `written=25`, raises nothing, and the whole thing rolls back when the
+        connection closes. Measured exactly that: 25 postings extracted,
+        embedded, "written", and zero rows in the table.
+
+        **2. Scrape branches run concurrently.** LangGraph fans them out with
+        `Send`, and a psycopg connection is not safe for concurrent use.
+
+        So: a dedicated autocommit connection, opened on first use and closed
+        with the store. Autocommit because these are point reads that must never
+        hold a transaction open behind a crawl that takes minutes.
+        """
+        if not posting_ids:
+            return set()
+        with self._scrape_lock:
+            if self._scrape_conn is None or self._scrape_conn.closed:
+                self._scrape_conn = psycopg.connect(
+                    self.dsn, row_factory=dict_row, autocommit=True)
+            with self._scrape_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT posting_id FROM job_postings WHERE posting_id = ANY(%s)",
+                    (posting_ids,),
+                )
+                return {r["posting_id"] for r in cur.fetchall()}
+
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:
             self._conn.close()
         self._conn = None
+        if self._scrape_conn is not None and not self._scrape_conn.closed:
+            self._scrape_conn.close()
+        self._scrape_conn = None
 
     def __enter__(self) -> "JobStore":
         self.connect()
@@ -120,6 +185,155 @@ class JobStore:
         conn = self.connect()
         with conn.transaction():
             yield conn
+
+
+    # ------------------------------------------------------------------
+    # operator backfills (agents/agent_b_job_ingest/backfill.py)
+    # ------------------------------------------------------------------
+    def clustered_posts(self, *, sources: list[str] | None = None,
+                        limit: int | None = None) -> list[dict[str, Any]]:
+        """Multi-vacancy posts whose children still share one body.
+
+        `needs_reslice` is computed rather than flagged: a post needs work when
+        more than one of its children holds the SAME description. That makes the
+        backfill idempotent by observation — re-running it finds nothing to do —
+        without a column that could disagree with the rows it describes.
+        """
+        conn = self.connect()
+        clauses = ["source_post_url IS NOT NULL", "source_post_url <> source_url"]
+        params: dict[str, Any] = {}
+        if sources:
+            clauses.append("source = ANY(%(sources)s)")
+            params["sources"] = list(sources)
+        params["limit"] = limit
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT source_post_url,
+                       min(source)      AS source,
+                       min(source_type) AS source_type,
+                       -- Deliberately NOT min(title): a child's title is its
+                       -- ROLE ("Accounts Payable In-Charge"), and the roundup's
+                       -- own headline is stored nowhere. Passing a role title
+                       -- back to the extractor told it the article was about
+                       -- that one job, and it returned exactly one vacancy for
+                       -- a 19-vacancy post. The headline is the body's first
+                       -- line; the caller reads it from there.
+                       array_agg(json_build_object('posting_id', posting_id,
+                                                   'title', title,
+                                                   'company', company)) AS children_rows,
+                       count(*)                        AS children,
+                       count(DISTINCT raw_description) AS distinct_bodies,
+                       -- The longest body is the un-narrowed article: a child
+                       -- that has already been sliced is strictly shorter.
+                       (array_agg(raw_description ORDER BY length(raw_description) DESC))[1] AS body,
+                       array_agg(posting_id) AS posting_ids
+                  FROM job_postings
+                 WHERE {' AND '.join(clauses)}
+                 GROUP BY source_post_url
+                HAVING count(*) > 1
+                 ORDER BY count(*) DESC
+                 LIMIT %(limit)s
+                """,
+                params,
+            )
+            posts = [dict(r) for r in cur.fetchall()]
+
+        for post in posts:
+            # Every child holding one identical body is the defect. Once narrowed,
+            # each child differs and there is nothing left to do.
+            post["needs_reslice"] = post["distinct_bodies"] < post["children"]
+        return posts
+
+    def narrow_descriptions(self, updates: dict[str, str]) -> int:
+        """Replace raw_description on specific rows.
+
+        Deliberately the ONLY write this backfill can make. It cannot insert,
+        delete, or touch identity — a repair command that could remove postings
+        is a different and much more dangerous tool.
+        """
+        if not updates:
+            return 0
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE job_postings SET raw_description = %s WHERE posting_id = %s",
+                [(text, pid) for pid, text in updates.items()],
+            )
+        return len(updates)
+
+    def rows_without_destination(self, *, sources: list[str] | None = None,
+                                 limit: int | None = None,
+                                 single_vacancy_only: bool = False) -> list[dict[str, Any]]:
+        """Single-vacancy postings that have never had a destination resolved.
+
+        DUPLICATES ARE INCLUDED, deliberately. `duplicate_of` is ON DELETE SET
+        NULL, so deleting a destination-less canonical PROMOTES its duplicates
+        to standalone rows — which would re-create exactly what the prune
+        removed. Measured: 45 telegram rows duplicate el7far canonicals. Every
+        row needs its own verdict, or the rule leaks through the FK.
+
+        `single_vacancy_only` excludes split children. Their post's links belong
+        to the whole roundup, so there is rarely a per-role page — verified on
+        the three largest el7far roundups, which link to a careers hub, an ATS
+        listing with no job id, and an image. But when postings are about to be
+        DELETED for lacking a destination, every row deserves its one attempt
+        first, so the prune's tracing pass sets this False.
+        """
+        conn = self.connect()
+        clauses = [
+            "final_url IS NULL",
+            "status <> 'rejected'",
+        ]
+        if single_vacancy_only:
+            clauses.append("(source_post_url IS NULL OR source_post_url = source_url)")
+        params: dict[str, Any] = {"limit": limit}
+        if sources:
+            clauses.append("source = ANY(%(sources)s)")
+            params["sources"] = list(sources)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT posting_id, source, source_type, source_url, title,
+                       (source_post_url IS NOT NULL AND source_post_url <> source_url)
+                           AS is_split
+                  FROM job_postings
+                 WHERE {' AND '.join(clauses)}
+                 -- posting_id breaks the tie, and it is load-bearing. Every
+                 -- row touched by one cycle shares a `last_seen_at`, so
+                 -- ordering on it alone is arbitrary: two capped runs sample
+                 -- different rows and neither makes progress through the
+                 -- backlog. Measured — a --limit 20 run found 0 destinations
+                 -- while the same query in a probe found 2 in its first 8.
+                 ORDER BY last_seen_at DESC, posting_id
+                 LIMIT %(limit)s
+                """,
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def update_posting(self, posting_id: str, values: dict[str, Any]) -> None:
+        """Set named columns on one row. Column names come from this module's own
+        allowlist, never from a caller's keys — a backfill must not be able to
+        name a column."""
+        allowed = {"final_url", "required_skills", "work_arrangement", "employment_type",
+                   "salary_min", "salary_max", "salary_currency", "salary_period",
+                   "seniority_level", "location", "country", "company",
+                   "destination_status"}
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"update_posting refuses unknown columns: {sorted(unknown)}")
+        if not values:
+            return
+        assignments = ", ".join(f"{name} = %({name})s" for name in values)
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE job_postings SET {assignments} WHERE posting_id = %(posting_id)s",
+                {**values, "posting_id": posting_id},
+            )
 
     # ------------------------------------------------------------------
     # migrations
@@ -286,6 +500,29 @@ class JobStore:
                 (urls,),
             )
             return {r["source_url"]: r["posting_id"] for r in cur.fetchall()}
+
+    def find_by_final_urls(self, urls: list[str]) -> dict[str, str]:
+        """Map final_url -> posting_id for vacancies we already hold.
+
+        The employer's own URL is a stronger duplicate key than anything we can
+        infer: two aggregators writing two different summaries of one Siemens
+        vacancy produce two dissimilar texts, so embedding near-dup misses them —
+        but they point at the same page, and that is not a coincidence that needs
+        a threshold.
+
+        Only canonical rows are eligible as targets; pointing a duplicate at
+        another duplicate is what `_flatten_duplicate_chains` exists to undo.
+        """
+        if not urls:
+            return {}
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT final_url, posting_id FROM job_postings "
+                "WHERE final_url = ANY(%s) AND duplicate_of IS NULL",
+                (urls,),
+            )
+            return {r["final_url"]: r["posting_id"] for r in cur.fetchall()}
 
     def touch_seen(self, posting_ids: list[str]) -> int:
         """Mark unchanged postings as seen this cycle without rewriting them.
@@ -803,6 +1040,64 @@ class JobStore:
             cur.execute("DELETE FROM job_postings WHERE source = %s", (source,))
             return cur.rowcount
 
+    def destination_survey(self, sources: list[str]) -> list[dict[str, Any]]:
+        """What the prune would remove, and why, before it removes anything.
+
+        481 rows is far past the point where a bare number is enough to approve
+        a deletion, so this reports the breakdown by `destination_status` and by
+        source. Read-only.
+        """
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source,
+                       COALESCE(destination_status, 'never traced') AS status,
+                       final_url IS NOT NULL AS has_destination,
+                       count(*) AS rows
+                  FROM job_postings
+                 WHERE source = ANY(%s)
+                 GROUP BY 1, 2, 3
+                 ORDER BY 1, 4 DESC
+                """,
+                (list(sources),),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def prune_without_destination(self, sources: list[str]) -> int:
+        """Delete postings from these sources that reach no employer page.
+
+        Scoped to NAMED sources, never "all". A deletion this size must say
+        whose rows it is taking, and a source omitted from the list cannot be
+        caught by a widening bug — which is why GulfTalent is safe here by
+        construction rather than by an exclusion clause someone could edit.
+
+        Deletes only rows we actually LOOKED AT: `destination_status IS NOT
+        NULL` and not one of the resolved values. A row nobody traced is not
+        evidence of anything, and must survive to be traced later.
+
+        `duplicate_of` is ON DELETE SET NULL, so a duplicate of a deleted
+        canonical is promoted to standalone rather than orphaned or removed with
+        it. Callers MUST recompute `skill_demand_stats` afterwards: its
+        `sample_postings` carry posting ids and would otherwise cite rows that
+        no longer exist.
+        """
+        if not sources:
+            return 0
+        conn = self.connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM job_postings
+                 WHERE source = ANY(%s)
+                   AND final_url IS NULL
+                   AND destination_status IS NOT NULL
+                   AND destination_status NOT IN ('resolved', 'source_is_destination')
+                """,
+                (list(sources),),
+            )
+            return cur.rowcount
+
     def sample_for_labelling(self, n: int) -> list[dict[str, Any]]:
         """A random sample of ingested postings for a human to label.
 
@@ -836,6 +1131,9 @@ INSERT INTO job_postings (
     posting_id, source, source_group, source_type, source_url, source_post_url,
     title, raw_description, content_hash,
     status, sector, required_skills, company, seniority_level, location, country, posted_date,
+    final_url, work_arrangement, employment_type,
+    salary_min, salary_max, salary_currency, salary_period,
+    attribution, terms_url, expires_at, destination_status,
     legitimacy_score, review_reason, duplicate_of,
     listing_intent, poster_type, extraction_model, embedding,
     first_seen_at, last_seen_at, missed_cycles, stale_since
@@ -845,6 +1143,9 @@ INSERT INTO job_postings (
     %(title)s, %(raw_description)s, %(content_hash)s,
     %(status)s, %(sector)s, %(required_skills)s, %(company)s, %(seniority_level)s, %(location)s,
     %(country)s, %(posted_date)s,
+    %(final_url)s, %(work_arrangement)s, %(employment_type)s,
+    %(salary_min)s, %(salary_max)s, %(salary_currency)s, %(salary_period)s,
+    %(attribution)s, %(terms_url)s, %(expires_at)s, %(destination_status)s,
     %(legitimacy_score)s, %(review_reason)s, %(duplicate_of)s,
     %(listing_intent)s, %(poster_type)s, %(extraction_model)s, %(embedding)s,
     now(), now(), 0, NULL
@@ -866,6 +1167,28 @@ ON CONFLICT (posting_id) DO UPDATE SET
     location = EXCLUDED.location,
     country = EXCLUDED.country,
     posted_date = EXCLUDED.posted_date,
+    -- COALESCE, not EXCLUDED: a later cycle that could not reach the employer
+    -- page must not erase what an earlier one learned from it. Same rule the
+    -- course refresh follows for volatile columns — absence of an observation is
+    -- not an observation of absence.
+    final_url = COALESCE(EXCLUDED.final_url, job_postings.final_url),
+    work_arrangement = COALESCE(EXCLUDED.work_arrangement, job_postings.work_arrangement),
+    employment_type = COALESCE(EXCLUDED.employment_type, job_postings.employment_type),
+    salary_min = COALESCE(EXCLUDED.salary_min, job_postings.salary_min),
+    salary_max = COALESCE(EXCLUDED.salary_max, job_postings.salary_max),
+    salary_currency = COALESCE(EXCLUDED.salary_currency, job_postings.salary_currency),
+    salary_period = COALESCE(EXCLUDED.salary_period, job_postings.salary_period),
+    -- Attribution is EXCLUDED, not COALESCE: it is a fact about the SOURCE, not
+    -- an observation about the posting, so the current cycle's value is always
+    -- the right one. If we rename how a publisher is credited, every row it owns
+    -- must follow on the next cycle — stale attribution is the one kind this
+    -- table must not carry.
+    attribution = EXCLUDED.attribution,
+    terms_url = EXCLUDED.terms_url,
+    expires_at = COALESCE(EXCLUDED.expires_at, job_postings.expires_at),
+    -- COALESCE: a cycle that did not trace must not erase what a trace learned.
+    destination_status = COALESCE(EXCLUDED.destination_status,
+                                  job_postings.destination_status),
     legitimacy_score = EXCLUDED.legitimacy_score,
     review_reason = EXCLUDED.review_reason,
     duplicate_of = EXCLUDED.duplicate_of,
@@ -896,6 +1219,17 @@ def _row_params(row: Any) -> dict[str, Any]:
         "sector": row.sector,
         "required_skills": row.required_skills,
         "company": row.company,
+        "final_url": row.final_url,
+        "work_arrangement": row.work_arrangement,
+        "employment_type": row.employment_type,
+        "salary_min": row.salary_min,
+        "salary_max": row.salary_max,
+        "salary_currency": row.salary_currency,
+        "salary_period": row.salary_period,
+        "attribution": row.attribution,
+        "terms_url": row.terms_url,
+        "expires_at": row.expires_at,
+        "destination_status": row.destination_status,
         "seniority_level": row.seniority_level,
         "location": row.location,
         "country": row.country,

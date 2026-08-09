@@ -55,6 +55,14 @@ class RawPosting:
     # --- what the source may or may not have stated ---
     company: str | None = None
     location_text: str | None = None
+    # ISO alpha-2, when the SOURCE states it (a publisher's own country section
+    # or a schema.org `addressCountry`). Not a guess from the text — the model
+    # fills this in downstream when the source is silent.
+    #
+    # Load-bearing: `export_for_agent_c` filters on `country`, so a NULL row is
+    # never retrieved however good it is. A source that knows the country and
+    # does not say so produces rows that are stored and never seen.
+    country: str | None = None
     posted_date: datetime | None = None
     # Only for sources that publish prose like "3 days ago". Kept as text and
     # resolved downstream against fetch time; never parsed into posted_date
@@ -70,6 +78,31 @@ class RawPosting:
     # stated fact, and nothing later could tell them apart.
     listing_intent: str = "unknown"
     poster_type: str = "unknown"
+
+    # Facts the publisher states in a STRUCTURED field — a form value or a
+    # schema.org property, not prose a model interpreted. They travel here so
+    # `pipeline._child_work` can tell them apart from a model's assertion: a
+    # source-stated value is authoritative and is NOT re-checked by
+    # `stated_facts`, which exists to verify what the LLM claimed. Running a
+    # text-mention check over `FULL_TIME` from JSON-LD would discard it, because
+    # the description prose never repeats the phrase.
+    work_arrangement: str | None = None
+    employment_type: str | None = None
+    salary_min: float | None = None
+    salary_max: float | None = None
+    salary_currency: str | None = None
+    salary_period: str | None = None
+    seniority_level: str | None = None
+    # The publisher's own statement of when the vacancy dies (schema.org
+    # `validThrough`), as opposed to our inference from missed cycles.
+    expires_at: datetime | None = None
+
+    # --- who published it, and on what terms ---
+    # Set by the adapter from its SourceConfig and carried onto the row, so a
+    # posting states its own provenance for as long as it exists rather than
+    # depending on a registry entry somebody may edit or delete.
+    attribution: str | None = None
+    terms_url: str | None = None
 
     # --- adapter telemetry, not content ---
     # Publisher-assigned tags. Telemetry ONLY in this phase: they are not fed to
@@ -135,6 +168,18 @@ class AdapterResult:
     # distinction was missing, and it cost real data — a sequence of `--limit 40`
     # runs pushed 139 live postings to missed_cycles=2, one cycle from stale.
     truncated: bool = False
+
+    # Postings the adapter DELIBERATELY did not fetch because it already holds
+    # them unchanged — the warm-cycle saving that makes a per-ad source
+    # affordable (430 ads at a 12-hour cadence is 860 requests a day otherwise).
+    #
+    # They must still be TOUCHED, and that is the whole reason this field
+    # exists. A posting the adapter never emits never reaches the pipeline,
+    # so `touch_seen` never runs on it, so `age_missed` counts it as missing and
+    # it ages toward deletion — the source would quietly delete its own
+    # inventory for the crime of being unchanged. The ingest node touches these
+    # ids explicitly.
+    seen_unchanged_ids: list[str] = field(default_factory=list)
 
     pages_fetched: int = 0
     bytes_fetched: int = 0

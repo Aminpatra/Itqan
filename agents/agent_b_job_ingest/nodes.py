@@ -31,6 +31,7 @@ from .aggregate import recompute_stats
 from .pipeline import IngestPipeline, IngestSummary
 from .sources.base import AdapterResult, SourceAdapter
 from .sources.config import DEFAULT_SOURCES, SourceConfig, select_sources
+from .hashing import id_for
 from .sources.factory import build_adapter
 from .state import IngestState
 
@@ -59,7 +60,40 @@ class GraphDeps:
     def build_adapter(self, cfg: SourceConfig) -> SourceAdapter:
         if self.adapter_for is not None:
             return self.adapter_for(cfg, self.config)
-        return build_adapter(cfg, config=self.config)
+        return build_adapter(cfg, config=self.config,
+                             is_known_unchanged=self._known_unchanged)
+
+    def _known_unchanged(self, posting: Any) -> bool:
+        """Do we already hold this posting?
+
+        Every adapter has accepted this predicate since phase 2 and NOTHING EVER
+        SUPPLIED IT — `build_adapter` was called without it in both production
+        call sites, so it lived only in tests. That cost nothing while every
+        source answered in one feed request. It stops being free the moment a
+        source costs a request per posting: GulfTalent has 430 ads, so an
+        unfiltered cycle is 430 fetches twice a day against a site that
+        throttles SEO crawlers to one request per 30 seconds.
+
+        Deliberately "known", not "unchanged": with only a URL in hand the
+        alternative is fetching the page to compare hashes, which is the request
+        this exists to avoid. A job ad is near-immutable after publication —
+        edits are rare, and the lifecycle that does matter (the vacancy closing)
+        is handled by staleness and by the publisher's own `validThrough`. The
+        adapter reports what it skipped so those rows are still touched.
+
+        Injected rather than imported by the adapter, which keeps the rule that
+        an adapter cannot reach the database itself.
+        """
+        try:
+            # `exists_during_scrape`, NOT `existing_ids`: this runs in a scrape
+            # branch, before the cycle's first transaction and concurrently with
+            # other branches. Using the shared connection here left an implicit
+            # transaction open, turned every later `transaction()` into a
+            # savepoint, and silently rolled back the entire cycle — measured as
+            # 25 postings "written" and zero rows in the table.
+            return bool(self.store.exists_during_scrape([id_for(posting)]))
+        except Exception:      # noqa: BLE001 - a lookup failure must not sink a fetch
+            return False       # fail toward doing the work, never toward skipping it
 
     def pipeline(self) -> IngestPipeline:
         return IngestPipeline(
@@ -70,6 +104,10 @@ class GraphDeps:
             config=self.config,
             model_name=self.model_name,
             root_fetcher=self.root_fetcher,
+            # The real registry, so `require_destination` and
+            # `link_back_required` apply in production but not to a test that
+            # names its fixture "el7far".
+            source_configs=self.source_configs,
         )
 
     def config_by_name(self, name: str) -> SourceConfig:
@@ -154,6 +192,19 @@ def make_ingest(deps: GraphDeps) -> Callable[[IngestState], dict]:
         # the deterministic link-dedup path find its target already persisted.
         ordered = sorted(outcomes, key=lambda o: o.get("source_type") == "telegram")
 
+        # Postings an adapter skipped because it already holds them unchanged.
+        #
+        # They MUST be touched here. `age_missed` has already run above, so a row
+        # the adapter deliberately did not re-fetch now has missed_cycles+1 and is
+        # three cycles from stale and sixty days from deleted — the source would
+        # delete its own inventory as a direct consequence of the optimisation
+        # that makes it affordable. Touching them resets that, at the cost of one
+        # UPDATE and no network.
+        seen_unchanged = [pid for o in outcomes for pid in o["result"].seen_unchanged_ids]
+        if seen_unchanged:
+            with store.transaction():
+                store.touch_seen(seen_unchanged)
+
         pipe = deps.pipeline()
         total = IngestSummary()
         for outcome in ordered:
@@ -170,6 +221,16 @@ def make_ingest(deps: GraphDeps) -> Callable[[IngestState], dict]:
             try:
                 with store.transaction():
                     total.merge(pipe.run(postings))
+                # Per-posting failures, which the batch survived. Reported with
+                # the offending URLs because a bare count sends an operator
+                # hunting; three examples usually identify the pattern.
+                failures = getattr(pipe, "extraction_errors", [])
+                if failures:
+                    warnings.append(
+                        f"{outcome['source']}: {len(failures)} posting(s) failed extraction "
+                        f"and were skipped; the rest were written. "
+                        f"First: {'; '.join(failures[:3])}"
+                    )
             except Exception as exc:  # noqa: BLE001 - deliberate boundary
                 warnings.append(
                     f"{outcome['source']}: ingestion failed ({type(exc).__name__}: {exc}); "
@@ -278,6 +339,11 @@ def _assemble_run_log(state, outcomes, health_rows) -> dict[str, Any]:
             "source": outcome["source"],
             "postings": len(r.postings),
             "skipped": r.skipped,
+            # Postings already held, so their detail page was NOT fetched. The
+            # measure of whether the warm cycle is working: on a source costing
+            # one request per posting, this is the difference between 2 requests
+            # and 430 twice a day.
+            "already_held": len(r.seen_unchanged_ids),
             "pages_fetched": r.pages_fetched,
             "bytes_fetched": r.bytes_fetched,
             "ok": r.ok,

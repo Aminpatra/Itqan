@@ -44,6 +44,15 @@ RUN pip install --no-cache-dir -r requirements.txt \
         echo "building WITHOUT OCR — scanned documents will be refused by name"; \
     fi
 
+# Chromium for the crawl transport, behind its own flag.
+#
+# `playwright install --with-deps` pulls the browser binary (~450 MB) plus the
+# shared libraries a headless Chromium needs. Only the ingestion agents use it;
+# the API serving user requests never launches a browser, so a build that only
+# serves does not need to carry one.
+ARG WITH_BROWSER=0
+RUN if [ "$WITH_BROWSER" = "1" ]; then         echo "building WITH the browser transport (~450 MB of Chromium)";         playwright install --with-deps chromium;     else         echo "building WITHOUT the browser transport";     fi
+
 COPY . .
 
 # Pre-warm the OCR model weights INTO the image.

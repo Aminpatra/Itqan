@@ -8,6 +8,7 @@ implementation in ``shared/`` rather than duplicating it.
 
 from __future__ import annotations
 
+from shared.scraping import build_client, build_robots  # noqa: F401
 from shared.scraping.http import (  # noqa: F401
     Blocked,
     PoliteClient,
@@ -16,4 +17,5 @@ from shared.scraping.http import (  # noqa: F401
     host_of,
 )
 
-__all__ = ["Blocked", "PoliteClient", "ResponseTooLarge", "SourcePolicy", "host_of"]
+__all__ = ["Blocked", "PoliteClient", "ResponseTooLarge", "SourcePolicy", "host_of",
+           "build_client", "build_robots"]
