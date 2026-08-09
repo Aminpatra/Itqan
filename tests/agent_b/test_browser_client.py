@@ -185,16 +185,31 @@ def test_robots_is_never_fetched_through_a_browser():
     assert isinstance(policy._client, PoliteClient)
 
 
-def test_the_root_fetcher_renders_pages_but_not_robots():
+def test_the_root_fetcher_renders_pages_but_not_robots(monkeypatch):
     """Both halves in one place, because this is the object that actually
-    crawls the employer pages — the only place the browser measured a gain."""
+    crawls the employer pages — the only place the browser measured a gain.
+
+    `_ensure_browser` is stubbed so this asserts the WIRING without launching
+    anything. The first version of this test did not stub it, passed on a
+    machine with Chromium installed, and failed in CI — where the fallback
+    correctly handed back a `PoliteClient`. That is the fallback working, and a
+    test that only passes where a 450 MB binary happens to exist is testing the
+    machine rather than the code.
+    """
     from agents.agent_b_job_ingest.root_fetch import RootFetcher
+
+    monkeypatch.setattr(BrowserClient, "_ensure_browser",
+                        classmethod(lambda cls, cfg: object()))
 
     cfg = Config(user_agent="ItqanJobBot/1.0 (+me@example.com)")
     fetcher = RootFetcher(cfg, browser=True)
     client, robots = fetcher._for_host("https://careers.dhl.com/global/en/job/123")
     assert isinstance(client, BrowserClient)
+    # Never rendered: a browser wraps robots.txt in <html><body><pre>, the
+    # parser reads one unparseable line, and an unparseable robots file parses
+    # as an EMPTY one — which permits everything.
     assert isinstance(robots._client, PoliteClient)
+    assert fetcher.warnings == [], "a working browser must not warn"
 
     plain, _ = RootFetcher(cfg, browser=False)._for_host("https://careers.oq.com/job/1")
     assert isinstance(plain, PoliteClient)
