@@ -20,6 +20,7 @@ services:
     # and this is the same image CI runs against, so "works in CI" means
     # something.
     image: pgvector/pgvector:pg16
+    shm_size: "512mb"
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-itqan}
