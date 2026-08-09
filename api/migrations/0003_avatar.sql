@@ -1,0 +1,15 @@
+-- Where a user's profile photo lives.
+--
+-- On the ACCOUNT rather than in the confirmed-profile blob, for the same reason
+-- `onboarded` is: a photo set on a phone has to be there on a laptop, and the
+-- profile payload is rewritten wholesale by every save. Keeping it here is what
+-- lets `PUT /api/profile` be unable to blank someone's picture as a side effect
+-- of correcting a birth date — the contract BACKEND.md states in those words.
+--
+-- A PATH, not the bytes. Images go on the uploads volume that already holds
+-- CV uploads and already survives `docker compose up -d --build`; putting them
+-- in Postgres would push image data through the same connection the HNSW
+-- queries use, in a database that is already 1.7 GB.
+--
+-- NULL means no photo, which the UI renders as initials.
+ALTER TABLE app_users ADD COLUMN IF NOT EXISTS avatar_path text;

@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from shared.config import Config
 
+from . import avatars
 from . import jobs as jobs_module
 from . import mapping
 from .db import AppStore, apply_migrations, verify_password
@@ -115,7 +116,17 @@ def create_app(config: Optional[Config] = None, *,
                             samesite="lax", secure=secure, path="/")
 
     # ---- auth: the site owns credentials, the app only reads the session ----
-    @app.post("/api/placeholder/signup")
+    #
+    # BOTH paths are live, deliberately. `/api/placeholder/*` shipped the word
+    # "placeholder" in a production URL and is renamed to `/api/auth/*`, but the
+    # marketing site is static Astro: the HTML on the box posts to whatever path
+    # it was BUILT with, and it deploys from a different repo by a different job.
+    # Whichever of the two deploys lands second, there is a window where live
+    # HTML posts to a path the live API might not have. The alias makes that
+    # window harmless. Remove it once both sides are deployed and the old path
+    # shows no traffic.
+    @app.post("/api/auth/signup")
+    @app.post("/api/placeholder/signup")   # alias — see the note below
     async def signup(response: Response, email: str = Form(...), password: str = Form(...),
                      name: str = Form("")) -> Any:
         store: AppStore = app.state.store
@@ -127,7 +138,8 @@ def create_app(config: Optional[Config] = None, *,
         set_session(response, user["user_id"], user["locale"])
         return {"ok": True}
 
-    @app.post("/api/placeholder/login")
+    @app.post("/api/auth/login")
+    @app.post("/api/placeholder/login")    # alias — see the note below
     async def login(response: Response, email: str = Form(...),
                     password: str = Form(...)) -> Any:
         store: AppStore = app.state.store
@@ -297,6 +309,98 @@ def create_app(config: Optional[Config] = None, *,
         # working when the user lands on the dashboard, and a progress bar they can
         # see is the difference between "still going" and "broken".
         return {"ok": True, "jobId": awaiting["job_id"]}
+
+    # ---- the profile screen ------------------------------------------------
+    def _avatar_url(user: dict[str, Any]) -> Optional[str]:
+        """Same-origin, and only when a file is actually recorded."""
+        return f"/api/profile/avatar/{user['user_id']}" if user.get("avatar_path") else None
+
+    @app.get("/api/profile")
+    async def get_profile(request: Request) -> Any:
+        """`StoredProfile`, or 404 when nothing has been confirmed.
+
+        404 is the CONTRACT here, not a failure: the app renders it as an empty
+        state ("nothing confirmed yet"), exactly as /api/dashboard already does.
+
+        This route did not exist while the app was calling it, and the client
+        does `.catch(() => null)` — so the profile screen showed its empty state
+        for every user, however complete their profile, with nothing in any log.
+        """
+        user = require_user(request)
+        store: AppStore = app.state.store
+        confirmed = store.profile(user["user_id"])
+        if confirmed is None:
+            return JSONResponse({"error": "no_profile"}, status_code=404)
+        completed = store.latest_completed_run(user["user_id"]) or {}
+        return mapping.stored_profile(
+            confirmed=confirmed,
+            account=user,
+            documents=[mapping.uploaded_document(d)
+                       for d in store.all_documents(user["user_id"])],
+            gap=completed.get("skill_gap"),
+            avatar_url=_avatar_url(user),
+        )
+
+    @app.put("/api/profile")
+    async def update_profile(request: Request) -> Any:
+        """An edit from the profile screen. MUST NOT re-run the pipeline.
+
+        It writes the same row `POST /api/profile` does, and the difference is
+        the whole point: POST is the end of onboarding and starts phase two,
+        while this is someone correcting a phone number. If this ever spawned a
+        run, every edit would cost a full re-match and silently change the
+        dashboard under the user — which is why it is a separate route and has
+        its own test rather than a comment.
+        """
+        user = require_user(request)
+        payload = await request.json()
+        store: AppStore = app.state.store
+        # Keep the run this profile already belonged to; an edit does not re-bind
+        # it to a different run, and it must not orphan it either.
+        existing = store.profile(user["user_id"]) or {}
+        store.save_profile(user["user_id"], payload, existing.get("run_id"))
+        return {"ok": True}
+
+    @app.post("/api/profile/avatar")
+    async def upload_avatar(request: Request, file: UploadFile = File(...)) -> Any:
+        """Return the URL; never accept one. The server owns storage, so a client
+        can never point this at a path it chose."""
+        user = require_user(request)
+        try:
+            path = avatars.store_avatar(user["user_id"], await file.read(),
+                                        config=app.state.config)
+        except avatars.AvatarRejected as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        store: AppStore = app.state.store
+        # The old file goes only once the new one is safely written.
+        avatars.remove_avatar(user.get("avatar_path"))
+        store.set_avatar_path(user["user_id"], path)
+        return {"avatarUrl": f"/api/profile/avatar/{user['user_id']}"}
+
+    @app.delete("/api/profile/avatar", status_code=204)
+    async def delete_avatar(request: Request) -> Response:
+        user = require_user(request)
+        avatars.remove_avatar(user.get("avatar_path"))
+        app.state.store.set_avatar_path(user["user_id"], None)
+        return Response(status_code=204)
+
+    @app.get("/api/profile/avatar/{user_id}")
+    async def serve_avatar(user_id: str) -> Any:
+        """Public by design: it is an <img src> on a page the owner is already
+        looking at, and requiring the session cookie on an image request buys
+        nothing while breaking caching. The filename carries random bytes, so the
+        URL cannot be guessed from a user id alone."""
+        row = app.state.store.user_by_id(user_id)
+        path = (row or {}).get("avatar_path")
+        if not path or not avatars.is_within_avatar_dir(path, config=app.state.config):
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            # Recorded but gone from disk — a restore, or a hand-cleaned volume.
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return Response(data, media_type=avatars.content_type(path),
+                        headers={"Cache-Control": "private, max-age=300"})
 
     # ---- reads: never run an agent here -----------------------------------
     def _envelopes(request: Request) -> Optional[dict[str, Any]]:

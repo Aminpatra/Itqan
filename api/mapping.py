@@ -152,6 +152,68 @@ def analysis_result(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+def suggested_role(gap: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """What the agents infer the candidate is closest to, or nothing.
+
+    NOT `preferences.preferredRole`. That is the role the user typed; this is
+    what the matching found, and the profile screen shows them side by side on
+    purpose. Merging them would present a guess as a stated preference.
+
+    Derived from the run's best-scoring match: its title, its retrieval
+    similarity as the confidence, and the SAME evidence chain the job cards
+    carry. No new agent, no new model call — `job_matches` already drops any
+    posting whose match cannot be explained, so taking its first row means a
+    suggestion without a reason is unreachable rather than merely unlikely.
+
+    None when no run has completed, and None when nothing survived that check. A
+    bare job title with no reasoning behind it is exactly the unfounded claim the
+    trust rules exist to prevent.
+    """
+    if not gap:
+        return None
+    ranked = job_matches(gap, limit=1)
+    if not ranked:
+        return None
+    best = ranked[0]
+    if not best.get("why") or best.get("score") is None:
+        return None
+    return {"title": best["title"], "confidence": best["score"], "why": best["why"]}
+
+
+def stored_profile(
+    *,
+    confirmed: Optional[dict[str, Any]],
+    account: dict[str, Any],
+    documents: list[dict[str, Any]],
+    gap: Optional[dict[str, Any]],
+    avatar_url: Optional[str],
+) -> dict[str, Any]:
+    """`StoredProfile` — the confirmed payload plus what only the account knows.
+
+    `email` comes from the ACCOUNT and never from the extraction. It is the one
+    field on that screen the pipeline must not be able to rewrite: a CV listing a
+    university address would otherwise silently replace the address the person
+    signs in with.
+
+    `phone` is passed through untouched. Nothing in the pipeline reads it,
+    onboarding never asks for it, and the profile screen does not count it as
+    missing — so it is stored and returned, not validated.
+    """
+    payload = dict((confirmed or {}).get("payload") or {})
+    confirmed_at = (confirmed or {}).get("confirmed_at")
+    return {
+        **payload,
+        "email": account["email"],
+        "phone": payload.get("phone"),
+        "documents": documents,
+        "avatarUrl": avatar_url,
+        "suggestedRole": suggested_role(gap),
+        # Milliseconds: the UI formats it with `new Date(...)`.
+        "updatedAt": int(confirmed_at.timestamp() * 1000) if confirmed_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 def job_matches(gap: dict[str, Any], *, limit: Optional[int] = None) -> list[dict[str, Any]]:
     """`JobMatch[]` from Agent C's per-job results.
 

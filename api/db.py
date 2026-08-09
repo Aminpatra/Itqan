@@ -144,8 +144,18 @@ class AppStore:
         return self._one("SELECT * FROM app_users WHERE email = %s", (email.strip().lower(),))
 
     def user_by_id(self, user_id: str) -> Optional[dict[str, Any]]:
+        """The signed-in user, WITHOUT the password hash.
+
+        The column list is explicit rather than `*` on purpose: this is what
+        every authenticated request resolves, and the hash has no business
+        travelling with it. A new column therefore has to be added here
+        deliberately — which is exactly what `avatar_path` needed, and its
+        absence made a photo upload return 200 while the profile kept reporting
+        no photo at all.
+        """
         return self._one(
-            "SELECT user_id, email, full_name, locale, onboarded FROM app_users WHERE user_id = %s",
+            "SELECT user_id, email, full_name, locale, onboarded, avatar_path "
+            "FROM app_users WHERE user_id = %s",
             (user_id,))
 
     def set_locale(self, user_id: str, locale: str) -> None:
@@ -300,6 +310,30 @@ class AppStore:
 
     def profile(self, user_id: str) -> Optional[dict[str, Any]]:
         return self._one("SELECT * FROM app_profiles WHERE user_id = %s", (user_id,))
+
+    def all_documents(self, user_id: str) -> list[dict[str, Any]]:
+        """Every document this user has uploaded, newest first.
+
+        Deliberately a separate method rather than letting `documents()` take an
+        empty id list to mean "all": that method's whole point is scoping a read
+        to specific ids the caller named, and loosening it so a missing filter
+        returns everything is the wrong direction for a method that exists to
+        stop one user reading another's files.
+        """
+        return self._all(
+            "SELECT * FROM app_documents WHERE user_id = %s ORDER BY created_at DESC",
+            (user_id,))
+
+    def set_avatar_path(self, user_id: str, path: Optional[str]) -> None:
+        """Where this user's photo lives on disk, or None once removed.
+
+        On the ACCOUNT, like `onboarded`, because a photo set on a phone must
+        still be there on a laptop. Written only by the avatar routes — never by
+        a profile save, so storing a corrected birth date can never blank
+        someone's picture as a side effect.
+        """
+        self._exec("UPDATE app_users SET avatar_path = %s WHERE user_id = %s",
+                   (path, user_id))
 
 
 # ---------------------------------------------------------------------------
