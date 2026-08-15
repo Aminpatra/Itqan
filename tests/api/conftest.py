@@ -26,8 +26,8 @@ from api.jobs import PipelineRunner             # noqa: E402
 from api.main import create_app                 # noqa: E402
 from shared.config import Config                # noqa: E402
 
-_APP_TABLES = ("app_profiles", "app_onboarding_progress", "app_runs",
-               "app_documents", "app_users")
+_APP_TABLES = ("app_assistant_messages", "app_assistant_usage", "app_profiles",
+               "app_onboarding_progress", "app_runs", "app_documents", "app_users")
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: ARG001
@@ -178,6 +178,34 @@ def runner() -> FakeRunner:
     return FakeRunner()
 
 
+class FakeAssistantLLM:
+    """Stands in for `structured(build_llm(...), AssistantReply)`.
+
+    Returns whatever `reply` is set to, and records what it was shown — which is
+    how the isolation tests check the FACT SHEET rather than only the prose. An
+    answer that happens not to mention another user is luck; a prompt that never
+    contained them is the guarantee.
+
+    Callable rather than `.invoke`-only: the graph composes `prompt | llm`, and
+    LCEL accepts a Runnable, a plain callable or a dict — an object exposing
+    only `invoke` is rejected before `invoke` is ever consulted.
+    """
+
+    def __init__(self, reply: Any = None) -> None:
+        from agents.agent_s_assistant.schemas import AssistantReply
+        self.reply = reply or AssistantReply(answer="Here is what your results say.")
+        self.prompts: list[str] = []
+
+    def __call__(self, payload: Any) -> Any:
+        self.prompts.append(str(payload))
+        return self.reply
+
+
+@pytest.fixture
+def assistant_llm() -> "FakeAssistantLLM":
+    return FakeAssistantLLM()
+
+
 @pytest.fixture
 def store(dsn: str) -> AppStore:
     s = AppStore(dsn)
@@ -188,8 +216,10 @@ def store(dsn: str) -> AppStore:
 
 
 @pytest.fixture
-def client(dsn: str, store: AppStore, runner: FakeRunner) -> TestClient:
-    app = create_app(Config(database_url=dsn), store=store, runner=runner, migrate=False)
+def client(dsn: str, store: AppStore, runner: FakeRunner,
+           assistant_llm: "FakeAssistantLLM") -> TestClient:
+    app = create_app(Config(database_url=dsn), store=store, runner=runner,
+                     assistant_llm=assistant_llm, migrate=False)
     return TestClient(app)
 
 

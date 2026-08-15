@@ -14,6 +14,7 @@ surfaces in `shared/`, so the eligibility predicates stay single-sourced.
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
 from pathlib import Path
@@ -24,6 +25,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from shared.config import Config
 
+from . import assistant as assistant_module
 from . import avatars
 from . import jobs as jobs_module
 from . import mapping
@@ -57,6 +59,7 @@ def password_problems(password: str) -> list[str]:
 def create_app(config: Optional[Config] = None, *,
                store: Optional[AppStore] = None,
                runner: Optional[jobs_module.PipelineRunner] = None,
+               assistant_llm: Any = None,
                migrate: bool = True) -> FastAPI:
     """Dependencies are injected, like every agent's `Deps` — so the tests drive
     the real routes with a fake pipeline and never touch OpenAI or OCR."""
@@ -72,6 +75,20 @@ def create_app(config: Optional[Config] = None, *,
     app.state.runner = runner or jobs_module.PipelineRunner(config)
     app.state.upload_dir = Path(config.output_dir) / "uploads"
     app.state.upload_dir.mkdir(parents=True, exist_ok=True)
+    # Agent S's model, built once. Injected in tests; built here otherwise, and
+    # LAZILY — importing langchain and constructing a client at boot would make
+    # an API that never chats pay for one, and `require_api_key` would refuse to
+    # start a deployment that only serves the dashboard.
+    #
+    # Absent, Agent S answers deterministically rather than erroring. That is a
+    # real degradation and it is COUNTED: `answer_source` on every row says
+    # 'template', so a key that silently stops working is visible in one query
+    # instead of looking like a model that got terser.
+    app.state.assistant_llm = assistant_llm
+    if assistant_llm is None and os.getenv("OPENAI_API_KEY"):
+        from agents.agent_s_assistant.schemas import AssistantReply
+        from shared.llm import build_llm, structured
+        app.state.assistant_llm = structured(build_llm(config), AssistantReply)
 
     # ---- session plumbing -------------------------------------------------
     def current_user(request: Request) -> Optional[dict[str, Any]]:
@@ -426,6 +443,13 @@ def create_app(config: Optional[Config] = None, *,
     async def courses_route(request: Request) -> Any:
         row = _envelopes(request)
         return mapping.courses(row["recommendations"] or {}) if row else []
+
+    # ---- Agent S -----------------------------------------------------------
+    # Registered last, and given `require_user` rather than reaching for it:
+    # every route in there is scoped to the session's user, and passing the
+    # dependency in keeps that visible at the mount point instead of buried.
+    assistant_module.register(app, require_user=require_user,
+                              jobs_module=jobs_module, mapping=mapping)
 
     @app.get("/api/health")
     async def health() -> Any:

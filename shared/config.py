@@ -352,6 +352,34 @@ class Config:
     # `supply.courses_available` saturates here rather than being exact.
     agent_e_max_candidates_per_skill: int = 200
 
+    # ------------------------------------------------------------------
+    # Agent S — the assistant over a user's own results
+    # ------------------------------------------------------------------
+    # DECISIONS, not measurements (user, 2026-08-15), and labelled that way
+    # because every other calibrated constant in this file carries the evidence
+    # that set it and these two carry none yet.
+    #
+    # What to re-measure after a week of real use: how often a user reaches 10,
+    # and how often a rerun actually CHANGED anything. A rerun returning
+    # identical results is a credit spent for nothing, and at one per week that
+    # is the whole allowance.
+    #
+    # Both are enforced by a guarded UPDATE in `AppStore.claim_quota`, never by
+    # asking the model to respect them — see the module docstring there.
+    assistant_daily_messages: int = 10
+    assistant_weekly_reruns: int = 1
+
+    # Quota periods are local days and weeks, NOT UTC ones. Telling a user in
+    # Muscat that their quota resets at midnight and having it reset at 4am is a
+    # bug, and taking UTC because it is the default is how you get it.
+    assistant_tz: str = "Asia/Muscat"
+
+    # How much of the conversation the model is shown. Ten messages a day means
+    # a session is short, so this is the whole day rather than a sliding window
+    # — and it bounds the prompt, which is the cost control that matters when a
+    # user controls how often we call a model.
+    assistant_history_turns: int = 10
+
     # --- scraping ---
     user_agent: str = field(
         default_factory=lambda: os.getenv(

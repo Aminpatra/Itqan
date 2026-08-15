@@ -47,6 +47,10 @@ AGENTS = {
         "agents.agent_e_course_recommend.cli",
         "Recommend one course per missing skill from a candidate's skill gap",
     ),
+    "agent-s": (
+        "agents.agent_s_assistant.cli",
+        "Ask about a user's own results (reads what A/C/E produced; spends no quota)",
+    ),
     "status": (
         "agents.status",
         "One read-only view of the whole system: corpus, aggregation freshness, "

@@ -22,6 +22,7 @@ import json
 import re
 import secrets
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -334,6 +335,93 @@ class AppStore:
         """
         self._exec("UPDATE app_users SET avatar_path = %s WHERE user_id = %s",
                    (path, user_id))
+
+    # --- Agent S: quotas and conversation ------------------------------------
+    #
+    # `claim_quota` is the only thing standing between a chat box and an
+    # unbounded model bill, and it is the reason the usage table exists at all.
+    # Read the docstring before changing either.
+
+    def claim_quota(self, user_id: str, *, kind: str, limit: int,
+                    period_start: date) -> Optional[int]:
+        """Spend one unit of quota. Returns the new count, or None if over.
+
+        **This must stay a single guarded UPDATE.** The obvious alternative —
+        count the rows, compare, then insert — is a read and a write with a gap
+        between them, and two requests interleaving in that gap both see "9 of
+        10 used" and both proceed. That is not a theoretical race: FastAPI runs
+        sync handlers in a threadpool, so concurrent messages from one user are
+        the normal case, not the exotic one.
+
+        `used < %s` inside the UPDATE makes the check and the increment the same
+        statement, which is atomic under any isolation level and needs no lock.
+        Zero rows affected means the limit was already reached.
+
+        The INSERT is separate and deliberately `ON CONFLICT DO NOTHING`: it
+        creates the period's row the first time it is needed. A new day or week
+        is simply a new row, so there is no reset job to schedule and none to
+        fail silently.
+
+        Callers must claim BEFORE doing the work, and must call `refund_quota`
+        if the work then fails — see `POST /api/assistant/messages`. The spec's
+        rule is that usage logs only on success, and the honest way to get that
+        is to make the failure path give the unit back rather than to check the
+        limit, do the work, and increment afterwards (which is the same race
+        wearing a different hat).
+        """
+        self._exec(
+            "INSERT INTO app_assistant_usage (user_id, kind, period_start, used) "
+            "VALUES (%s, %s, %s, 0) ON CONFLICT DO NOTHING",
+            (user_id, kind, period_start))
+        row = self._one(
+            "UPDATE app_assistant_usage SET used = used + 1 "
+            " WHERE user_id = %s AND kind = %s AND period_start = %s AND used < %s "
+            "RETURNING used",
+            (user_id, kind, period_start, limit))
+        return row["used"] if row else None
+
+    def refund_quota(self, user_id: str, *, kind: str, period_start: date) -> None:
+        """Give back a claimed unit because the work did not happen.
+
+        Never below zero — the CHECK constraint would reject it and the guard
+        here means a double refund is a no-op rather than an error. This is the
+        only method that decreases usage, and it exists so that a model timeout
+        does not cost someone one of their ten daily messages.
+        """
+        self._exec(
+            "UPDATE app_assistant_usage SET used = used - 1 "
+            " WHERE user_id = %s AND kind = %s AND period_start = %s AND used > 0",
+            (user_id, kind, period_start))
+
+    def quota_used(self, user_id: str, *, kind: str, period_start: date) -> int:
+        row = self._one(
+            "SELECT used FROM app_assistant_usage "
+            " WHERE user_id = %s AND kind = %s AND period_start = %s",
+            (user_id, kind, period_start))
+        return row["used"] if row else 0
+
+    def add_assistant_message(self, *, user_id: str, role: str, content: str,
+                              run_id: Optional[str] = None,
+                              answer_source: Optional[str] = None) -> dict[str, Any]:
+        return self._one(
+            "INSERT INTO app_assistant_messages "
+            "  (message_id, user_id, run_id, role, content, answer_source) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+            (f"m_{secrets.token_hex(8)}", user_id, run_id, role, content, answer_source))
+
+    def assistant_history(self, user_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """This user's turns, oldest first.
+
+        Scoped to `user_id` with no parameter that could widen it — the same
+        reason `all_documents` exists as its own method. Agent S's isolation is
+        not the model declining to discuss other people; it is that no method
+        here can fetch them.
+        """
+        rows = self._all(
+            "SELECT * FROM app_assistant_messages WHERE user_id = %s "
+            "ORDER BY created_at DESC, message_id DESC LIMIT %s",
+            (user_id, limit))
+        return list(reversed(rows))
 
 
 # ---------------------------------------------------------------------------
