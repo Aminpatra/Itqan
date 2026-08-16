@@ -353,6 +353,44 @@ class Config:
     agent_e_max_candidates_per_skill: int = 200
 
     # ------------------------------------------------------------------
+    # Email — password recovery only, for now
+    # ------------------------------------------------------------------
+    # Unset means no relay, and in PRODUCTION that fails the boot
+    # (`assert_deployable`). An app that accepts every reset request and sends
+    # nothing is worse than one that will not start: the endpoint answers 200
+    # either way to avoid leaking who is registered, so a missing relay is
+    # invisible to everyone except the person waiting for an email that is never
+    # coming.
+    smtp_host: str = field(default_factory=lambda: os.getenv("ITQAN_SMTP_HOST", ""))
+    smtp_port: int = field(default_factory=lambda: int(os.getenv("ITQAN_SMTP_PORT", "587")))
+    smtp_user: str = field(default_factory=lambda: os.getenv("ITQAN_SMTP_USER", ""))
+    smtp_password: str = field(default_factory=lambda: os.getenv("ITQAN_SMTP_PASSWORD", ""))
+    # The From address. Falls back to the login user, which is what most relays
+    # require them to match anyway.
+    smtp_from: str = field(default_factory=lambda: os.getenv("ITQAN_SMTP_FROM", ""))
+    smtp_starttls: bool = field(
+        default_factory=lambda: os.getenv("ITQAN_SMTP_STARTTLS", "1") not in ("0", "false", "False"))
+    # Short: the send is on a background thread, but a relay that never answers
+    # would otherwise hold one open for the life of the process.
+    smtp_timeout_s: float = 20.0
+
+    # Where the reset link points. The marketing site owns the forgot-password
+    # page, per BACKEND.md, so this is the SITE origin and not the API's.
+    site_url: str = field(
+        default_factory=lambda: os.getenv("ITQAN_SITE_URL", "http://localhost:4321"))
+
+    # Long enough to walk to another device and find the mail, short enough that
+    # a link left in an inbox is not a standing key to the account.
+    reset_token_minutes: int = 60
+
+    # An endpoint that emails an arbitrary address on request is a bombing vector
+    # aimed at people who are not our users, so it is bounded both ways: by
+    # address, so one victim cannot be flooded, and by IP, so one attacker cannot
+    # spray many. Enforced by the same guarded UPDATE the assistant's quota uses.
+    reset_requests_per_email_hour: int = 3
+    reset_requests_per_ip_hour: int = 10
+
+    # ------------------------------------------------------------------
     # Agent S — the assistant over a user's own results
     # ------------------------------------------------------------------
     # DECISIONS, not measurements (user, 2026-08-15), and labelled that way

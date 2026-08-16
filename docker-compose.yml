@@ -90,6 +90,19 @@ services:
       # contacted by the sites it visits should stop the deploy, not start.
       ITQAN_USER_AGENT: ${ITQAN_USER_AGENT:?set ITQAN_USER_AGENT in .env, e.g. "ItqanJobBot/1.0 (+you@example.com)"}
       ITQAN_OUTPUT_DIR: /data/output
+      # Password recovery. `:?` on the host for the same reason the two above
+      # have it: the API refuses to boot in production without a relay, because
+      # forgot-password answers 200 whether or not the address has an account —
+      # so with no relay it would accept every request, send nothing, and give
+      # nobody any way to notice. Failing the deploy is the loud version.
+      ITQAN_SMTP_HOST: ${ITQAN_SMTP_HOST:?set ITQAN_SMTP_HOST in .env}
+      ITQAN_SMTP_PORT: ${ITQAN_SMTP_PORT:-587}
+      ITQAN_SMTP_USER: ${ITQAN_SMTP_USER:-}
+      ITQAN_SMTP_PASSWORD: ${ITQAN_SMTP_PASSWORD:-}
+      ITQAN_SMTP_FROM: ${ITQAN_SMTP_FROM:-}
+      # Where the emailed reset link points — the SITE, which owns the
+      # forgot-password page, not this API's origin.
+      ITQAN_SITE_URL: ${ITQAN_SITE_URL:?set ITQAN_SITE_URL in .env, e.g. https://itqan.example}
     volumes:
       # Uploads and per-run artifacts. A named volume rather than an anonymous
       # one so `up -d --build` keeps them: phase two reads a file phase one wrote,

@@ -119,9 +119,9 @@ def test_the_session_cookie_is_not_readable_by_script(signed_in: TestClient):
 
 
 def test_production_refuses_to_boot_without_a_session_secret(monkeypatch):
-    """The cookie is `user_id.HMAC(secret, user_id)` and the development fallback
-    is a literal string in a public repository — so with it in place, anyone who
-    has read this file can mint a session for any account.
+    """The cookie is signed with it, and the development fallback is a literal
+    string in a public repository — so with it in place, anyone who has read this
+    file can mint a session for any account.
 
     Refusing to start is the point. A warning in a log nobody reads would leave a
     deployment that works perfectly right up until someone tries it.
@@ -129,6 +129,7 @@ def test_production_refuses_to_boot_without_a_session_secret(monkeypatch):
     from api.main import assert_deployable
 
     monkeypatch.setenv("ITQAN_ENV", "production")
+    monkeypatch.setenv("ITQAN_SMTP_HOST", "smtp.example.test")
     monkeypatch.delenv("ITQAN_SESSION_SECRET", raising=False)
     with pytest.raises(RuntimeError, match="ITQAN_SESSION_SECRET"):
         assert_deployable()
@@ -139,6 +140,34 @@ def test_production_refuses_to_boot_without_a_session_secret(monkeypatch):
     # Development is unaffected — every local run and this whole suite rely on it.
     monkeypatch.setenv("ITQAN_ENV", "development")
     monkeypatch.delenv("ITQAN_SESSION_SECRET", raising=False)
+    monkeypatch.delenv("ITQAN_SMTP_HOST", raising=False)
+    assert_deployable()
+
+
+def test_production_refuses_to_boot_without_an_email_relay(monkeypatch):
+    """The other silent failure, and the reason it has to be fatal.
+
+    Password recovery answers 200 whether or not the address has an account —
+    that is what stops the form leaking who is registered. With no relay it would
+    accept every request and send nothing, and nobody would ever find out,
+    because every user is told to check their email either way.
+
+    There is no user-visible symptom to notice, so refusing to start is the only
+    loud failure available.
+    """
+    from api.main import assert_deployable
+
+    monkeypatch.setenv("ITQAN_ENV", "production")
+    monkeypatch.setenv("ITQAN_SESSION_SECRET", "0" * 64)
+    monkeypatch.delenv("ITQAN_SMTP_HOST", raising=False)
+    with pytest.raises(RuntimeError, match="ITQAN_SMTP_HOST"):
+        assert_deployable()
+
+    monkeypatch.setenv("ITQAN_SMTP_HOST", "smtp.example.test")
+    assert_deployable()
+
+    monkeypatch.setenv("ITQAN_ENV", "development")
+    monkeypatch.delenv("ITQAN_SMTP_HOST", raising=False)
     assert_deployable()
 
 

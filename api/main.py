@@ -27,9 +27,22 @@ from shared.config import Config
 
 from . import assistant as assistant_module
 from . import avatars
+from . import email as email_module
 from . import jobs as jobs_module
 from . import mapping
-from .db import AppStore, apply_migrations, verify_password
+from .db import AppStore, apply_migrations, hash_password, verify_password
+
+
+def _sha256(value: str) -> str:
+    """What gets stored instead of the thing itself.
+
+    Used for reset tokens and for throttle keys. A fast hash is correct for both:
+    a token is 256 bits of entropy rather than a guessable secret, and an email
+    address is hashed to keep the throttle table from becoming a list of who
+    tried — not to withstand an offline attack on the address space.
+    """
+    import hashlib
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 SESSION_COOKIE = "itqan_session"          # names fixed by dev/site-plugin.ts
 LOCALE_COOKIE = "itqan_locale"
@@ -95,7 +108,19 @@ def create_app(config: Optional[Config] = None, *,
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
             return None
-        return request.app.state.store.user_by_id(_user_from_token(token))
+        user_id, epoch = _user_from_token(token)
+        if not user_id:
+            return None
+        user = request.app.state.store.user_by_id(user_id)
+        if user is None:
+            return None
+        # The signature proves the cookie is ours; the epoch proves it has not
+        # been revoked since. A password reset bumps the row, and every cookie
+        # minted before it stops resolving here — which is what makes recovering
+        # a compromised account actually evict whoever was in it.
+        if int(user.get("session_epoch") or 0) != epoch:
+            return None
+        return user
 
     def require_user(request: Request) -> dict[str, Any]:
         user = current_user(request)
@@ -115,7 +140,8 @@ def create_app(config: Optional[Config] = None, *,
         return {"id": row["user_id"], "fullName": row["full_name"],
                 "email": row["email"], "onboarded": bool(row["onboarded"])}
 
-    def set_session(response: Response, user_id: str, locale: str) -> None:
+    def set_session(response: Response, user_id: str, locale: str,
+                    epoch: int = 0) -> None:
         # httpOnly so no script can read it; SameSite=Lax because the site and the
         # app are same-site. Secure is omitted on http://localhost, where the
         # browser would otherwise drop the cookie and every local login would
@@ -127,7 +153,7 @@ def create_app(config: Optional[Config] = None, *,
         # a Secure cookie on http://localhost and every local login would then
         # silently fail to establish a session.
         secure = in_production()
-        response.set_cookie(SESSION_COOKIE, _token_for(user_id), httponly=True,
+        response.set_cookie(SESSION_COOKIE, _token_for(user_id, epoch), httponly=True,
                             samesite="lax", secure=secure, path="/")
         response.set_cookie(LOCALE_COOKIE, locale, httponly=False,
                             samesite="lax", secure=secure, path="/")
@@ -165,7 +191,111 @@ def create_app(config: Optional[Config] = None, *,
         # them apart is an account-enumeration oracle.
         if not row or not verify_password(password, row["password_hash"]):
             return JSONResponse({"error": "invalid_credentials"}, status_code=401)
-        set_session(response, row["user_id"], row["locale"])
+        set_session(response, row["user_id"], row["locale"],
+                    int(row.get("session_epoch") or 0))
+        return {"ok": True}
+
+    # ---- password recovery -------------------------------------------------
+    @app.post("/api/auth/forgot-password")
+    async def forgot_password(request: Request, email: str = Form(...)) -> Any:
+        """Always 200, always the same body, whatever happened.
+
+        A different answer — or a different response TIME — for an address with
+        no account turns this form into a way to enumerate who is registered. So
+        every branch below ends here identically: unknown address, rate-limited,
+        relay down. The only party told about a failure is the operator, through
+        the log and `email_module.SEND_FAILURES`.
+
+        On timing, stated rather than overclaimed: the SMTP conversation is on a
+        background thread, so the two branches differ by one indexed SELECT and
+        one INSERT. That is microseconds, inside the jitter between two packets.
+        An artificial fixed delay was considered and rejected — it would slow
+        every legitimate request to hide a difference already lost in the noise.
+        """
+        store: AppStore = app.state.store
+        config: Config = app.state.config
+        same_answer: Any = {"ok": True}
+
+        address = (email or "").strip().lower()
+        client_ip = request.client.host if request.client else "unknown"
+
+        # Hashed, so this table never becomes a list of who tried to recover an
+        # account — the very fact the identical responses exist to protect.
+        if not store.claim_reset_slot(_sha256(address), kind="email",
+                                      limit=config.reset_requests_per_email_hour):
+            return same_answer
+        if not store.claim_reset_slot(_sha256(client_ip), kind="ip",
+                                      limit=config.reset_requests_per_ip_hour):
+            return same_answer
+
+        row = store.user_by_email(address)
+        if row is None:
+            return same_answer
+
+        token = secrets.token_urlsafe(32)
+        store.create_password_reset(user_id=row["user_id"], token_hash=_sha256(token),
+                                    minutes=config.reset_token_minutes)
+        link = email_module.reset_link(site_url=config.site_url,
+                                       locale=row.get("locale") or "ar", token=token)
+        subject, body = email_module.reset_message(
+            link=link, locale=row.get("locale") or "ar",
+            minutes=config.reset_token_minutes)
+        email_module.send_in_background(to=address, subject=subject, body=body,
+                                        config=config)
+        return same_answer
+
+    @app.post("/api/auth/reset-password")
+    async def reset_password(token: str = Form(""), password: str = Form("")) -> Any:
+        """Spend a token and set a new password.
+
+        Both fields default to empty rather than being required, so that THIS
+        handler owns every case a user can actually reach. Declared `Form(...)`,
+        a missing or empty token is rejected by FastAPI with its own 422 — and a
+        mangled link would then show the generic "could not do that just now"
+        instead of "this link has expired", which is the one message that tells
+        the person what to do next.
+
+        **410 for anything wrong with the token** — unknown, expired, already
+        spent — because the front end renders 400 and 410 as the same "this link
+        has expired" panel and the three are indistinguishable to the user
+        anyway. Telling them apart would confirm that a token had once been
+        issued for an address.
+
+        **422 for a password that fails the rules**, and NOT 400: 400 is spoken
+        for by that expired panel, so it would tell someone their link had died
+        when their password was merely too short — sending them to fetch a new
+        link that fails in exactly the same way. 422 lands on the front end's
+        generic "could not do that just now", which is at least true.
+        """
+        store: AppStore = app.state.store
+
+        # A missing or empty token is a broken link, not a malformed request:
+        # answer it with the panel that tells them to ask for a new one.
+        if not token.strip():
+            return JSONResponse({"error": "invalid_token"}, status_code=410)
+
+        # The password is checked BEFORE the token is spent. Failing the rules
+        # must not consume a single-use token and force a second email over a
+        # typo.
+        if password_problems(password):
+            return JSONResponse({"error": "invalid_password"}, status_code=422)
+
+        claimed = store.consume_password_reset(_sha256(token))
+        if claimed is None:
+            return JSONResponse({"error": "invalid_token"}, status_code=410)
+
+        user_id = claimed["user_id"]
+        store.set_password(user_id, hash_password(password))
+        # Any OTHER outstanding token dies with this one: two "forgot password"
+        # clicks must not leave a spare key to an account its owner believes they
+        # have just secured.
+        store.invalidate_password_resets(user_id)
+        # And every session issued before now stops resolving, which is the whole
+        # point of recovering an account somebody else may be sitting in.
+        store.bump_session_epoch(user_id)
+
+        # Deliberately NOT signed in: the front end navigates to the login page,
+        # and making them use the new password proves it is the one that works.
         return {"ok": True}
 
     @app.get("/api/handoff")
@@ -512,19 +642,50 @@ def assert_deployable() -> None:
             "and redeploy."
         )
 
+    if not os.getenv("ITQAN_SMTP_HOST"):
+        raise RuntimeError(
+            "ITQAN_SMTP_HOST is unset in production. Password recovery answers 200 "
+            "whether or not an address has an account — that is what stops the form "
+            "leaking who is registered — so with no relay it would accept every "
+            "request and send nothing, and NOBODY would find out: the user is told "
+            "to check their email either way. Refusing to start is the only loud "
+            "failure available. Set ITQAN_SMTP_{HOST,PORT,USER,PASSWORD,FROM}."
+        )
 
-def _token_for(user_id: str) -> str:
+
+def _token_for(user_id: str, epoch: int = 0) -> str:
+    """`user_id.epoch.mac`, signed over the first two parts.
+
+    The epoch is what makes a session revocable. Before it, this was
+    `user_id + HMAC(secret, user_id)` — deterministic and permanent, so a cookie
+    captured once worked forever and a password reset did nothing to it. That is
+    the single case password recovery exists for, and it was the case it failed.
+
+    Changing the format invalidates every cookie minted under the old one, which
+    signs everybody out exactly once. Accepted deliberately (2026-08-16).
+    """
     import hmac
-    mac = hmac.new(_secret(), user_id.encode(), "sha256").hexdigest()[:32]
-    return f"{user_id}.{mac}"
+    payload = f"{user_id}.{epoch}"
+    mac = hmac.new(_secret(), payload.encode(), "sha256").hexdigest()[:32]
+    return f"{payload}.{mac}"
 
 
-def _user_from_token(token: str) -> str:
+def _user_from_token(token: str) -> tuple[str, int]:
+    """`(user_id, epoch)`, or `("", 0)` if the signature does not hold.
+
+    The epoch is returned rather than checked here because verifying it needs the
+    database, and this function deliberately does not have one. The caller
+    compares it against the row — see `current_user`.
+    """
     import hmac
-    user_id, _, mac = token.rpartition(".")
-    if not user_id or not hmac.compare_digest(mac, _token_for(user_id).split(".")[-1]):
-        return ""
-    return user_id
+    payload, _, mac = token.rpartition(".")
+    user_id, _, raw_epoch = payload.rpartition(".")
+    if not user_id or not raw_epoch.isdigit():
+        return "", 0
+    epoch = int(raw_epoch)
+    if not hmac.compare_digest(mac, _token_for(user_id, epoch).rpartition(".")[2]):
+        return "", 0
+    return user_id, epoch
 
 
 def _new_run_id() -> str:

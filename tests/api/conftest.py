@@ -26,8 +26,14 @@ from api.jobs import PipelineRunner             # noqa: E402
 from api.main import create_app                 # noqa: E402
 from shared.config import Config                # noqa: E402
 
-_APP_TABLES = ("app_assistant_messages", "app_assistant_usage", "app_profiles",
-               "app_onboarding_progress", "app_runs", "app_documents", "app_users")
+# `app_reset_throttle` is listed EXPLICITLY and must stay listed: it is the one
+# table here with no foreign key to `app_users`, so `TRUNCATE ... CASCADE` does
+# not reach it. Left out, its hourly counters accumulate across tests until the
+# limit is exhausted, and every later test quietly receives no email — which is
+# exactly how it failed the first time, as fifteen unrelated assertions.
+_APP_TABLES = ("app_assistant_messages", "app_assistant_usage", "app_reset_throttle",
+               "app_password_resets", "app_profiles", "app_onboarding_progress",
+               "app_runs", "app_documents", "app_users")
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: ARG001

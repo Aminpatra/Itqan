@@ -155,7 +155,7 @@ class AppStore:
         no photo at all.
         """
         return self._one(
-            "SELECT user_id, email, full_name, locale, onboarded, avatar_path "
+            "SELECT user_id, email, full_name, locale, onboarded, avatar_path, session_epoch "
             "FROM app_users WHERE user_id = %s",
             (user_id,))
 
@@ -335,6 +335,92 @@ class AppStore:
         """
         self._exec("UPDATE app_users SET avatar_path = %s WHERE user_id = %s",
                    (path, user_id))
+
+    # --- password recovery ---------------------------------------------------
+    #
+    # The raw token never enters this class. Callers hash it first and pass the
+    # hash, so there is no code path here that could log or store the credential
+    # itself — see `api/email.py` for where the token does exist, briefly.
+
+    def create_password_reset(self, *, user_id: str, token_hash: str,
+                              minutes: int) -> None:
+        self._exec(
+            "INSERT INTO app_password_resets (token_hash, user_id, expires_at) "
+            "VALUES (%s, %s, now() + make_interval(mins => %s))",
+            (token_hash, user_id, minutes))
+
+    def consume_password_reset(self, token_hash: str) -> Optional[dict[str, Any]]:
+        """Spend a token, or return None if it cannot be spent.
+
+        One statement, and that is the point: checking validity and marking the
+        token used in separate steps leaves a window where two requests both see
+        an unused token and both reset the password. `used_at IS NULL` inside the
+        UPDATE closes it, exactly as `claim_quota` does for the daily limit.
+
+        None covers every failure — unknown, expired, already used — because the
+        caller must answer all three identically. A response that distinguished
+        "expired" from "never existed" would confirm that a token had once been
+        issued for an address.
+        """
+        return self._one(
+            "UPDATE app_password_resets SET used_at = now() "
+            " WHERE token_hash = %s AND used_at IS NULL AND expires_at > now() "
+            "RETURNING user_id",
+            (token_hash,))
+
+    def invalidate_password_resets(self, user_id: str) -> int:
+        """Expire every outstanding token for this user.
+
+        Called after a successful reset. Two "forgot password" clicks issue two
+        tokens, and spending one must not leave the other usable — otherwise an
+        attacker who triggered a reset earlier still holds a key to an account
+        whose owner believes they have just secured it.
+        """
+        return self._exec(
+            "UPDATE app_password_resets SET used_at = now() "
+            " WHERE user_id = %s AND used_at IS NULL",
+            (user_id,))
+
+    def claim_reset_slot(self, subject_hash: str, *, kind: str, limit: int) -> bool:
+        """True if this request is within the hourly limit, having consumed one.
+
+        A guarded UPDATE for the same reason `claim_quota` is one: checking a
+        count and then incrementing it is a race, and here losing it means an
+        inbox gets flooded.
+
+        `subject_hash` is a hash and must stay one — see the migration. The
+        period is truncated to the hour in SQL rather than in Python so that two
+        processes with different clocks still agree on which bucket they are in.
+        """
+        self._exec(
+            "INSERT INTO app_reset_throttle (subject, kind, period_start, used) "
+            "VALUES (%s, %s, date_trunc('hour', now()), 0) ON CONFLICT DO NOTHING",
+            (subject_hash, kind))
+        row = self._one(
+            "UPDATE app_reset_throttle SET used = used + 1 "
+            " WHERE subject = %s AND kind = %s AND period_start = date_trunc('hour', now()) "
+            "   AND used < %s "
+            "RETURNING used",
+            (subject_hash, kind, limit))
+        return row is not None
+
+    def set_password(self, user_id: str, password_hash: str) -> None:
+        self._exec("UPDATE app_users SET password_hash = %s WHERE user_id = %s",
+                   (password_hash, user_id))
+
+    def bump_session_epoch(self, user_id: str) -> int:
+        """Invalidate every session cookie issued to this account so far.
+
+        The epoch is signed into the session token and compared on every request,
+        so incrementing it here evicts anyone holding an older cookie. Without
+        this, resetting a password would leave a stolen session working — the
+        feature failing at the one case it exists for.
+        """
+        row = self._one(
+            "UPDATE app_users SET session_epoch = session_epoch + 1 "
+            " WHERE user_id = %s RETURNING session_epoch",
+            (user_id,))
+        return row["session_epoch"] if row else 0
 
     # --- Agent S: quotas and conversation ------------------------------------
     #
