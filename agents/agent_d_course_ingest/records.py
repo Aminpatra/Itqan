@@ -50,6 +50,13 @@ class PersistedCourse:
     price_amount: Optional[float] = None
     price_currency: Optional[str] = None
     price_is_free: Optional[bool] = None
+    # Duration as a RANGE, plus the provider's own words. Equal ends mean one
+    # stated figure; a midpoint is never computed. See `duration.py` — collapsing
+    # "2-4 hours a week for 4 weeks" to 12 would publish a number nobody stated,
+    # which is why durations were left unstored rather than guessed at.
+    hours_min: Optional[float] = None
+    hours_max: Optional[float] = None
+    duration_text: Optional[str] = None
     # False = this cycle did not successfully read the provider's quality/price
     # signals, so the store must keep whatever it already holds instead of
     # writing these Nones over it. Not a column: it governs the write, it is not

@@ -91,6 +91,23 @@ DEFAULT_SOURCES: tuple[CourseSourceConfig, ...] = (
         # False — it is the flag that licenses deletion.
         census=True,
     ),
+    CourseSourceConfig(
+        name="edx",
+        source_group="edx",
+        source_type="html_scrape",
+        base_url="https://www.edx.org",
+        # OFF, and it stays off until a person reads edX's terms and sets this
+        # True in this file. robots.txt permitting a path is not the same as
+        # terms permitting a crawl — the lesson GulfTalent taught Agent B, where
+        # robots said `Allow: /`, the servers answered 200, and only a human
+        # reading the Terms of Use found the clause that governed it.
+        terms_reviewed=False,
+        enabled=False,
+        # 5,304 English course pages at one request each. A cycle sees a slice,
+        # so absence from a fetch says nothing about whether a course still
+        # exists, and this source must never age its own inventory.
+        census=False,
+    ),
 )
 
 

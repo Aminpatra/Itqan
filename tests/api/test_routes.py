@@ -552,7 +552,11 @@ def test_dashboard_jobs_and_courses_after_a_run(signed_in: TestClient):
     assert "Power BI" in course["unlocks"] and "data visualisation" in course["unlocks"]
     # The honesty rules: absent means null, never a plausible zero.
     assert course["price"] is None, "a missing price must not render as free"
-    assert course["hours"] is None, "Agent D stores no duration; 0 would be a lie"
+    # Duration is a RANGE now, and an unstated one is null in every field. The
+    # card renders that as silence; a 0 in any of them would be a false claim
+    # dressed as data, which is what "0 hours" was.
+    assert course["hoursMin"] is None and course["hoursMax"] is None
+    assert course["durationText"] is None
 
 
 def test_a_gap_with_no_course_still_reaches_the_dashboard(signed_in: TestClient):

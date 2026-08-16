@@ -7,6 +7,7 @@ from shared.config import Config
 from .base import CourseAdapter
 from .config import CourseSourceConfig
 from .coursera import CourseraAdapter
+from .edx import EdxAdapter
 from .freecodecamp import FreeCodeCampAdapter
 
 
@@ -29,6 +30,11 @@ def build_adapter(
             base_url=source.base_url, config=config, is_known_unchanged=is_known_unchanged,
             max_pages=backfill,
             enrich=False if backfill else None,
+        )
+    if source.name == "edx":
+        return EdxAdapter(
+            name=source.name, source_group=source.source_group,
+            base_url=source.base_url, config=config, is_known_unchanged=is_known_unchanged,
         )
     if source.name == "freecodecamp":
         return FreeCodeCampAdapter(

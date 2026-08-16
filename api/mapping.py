@@ -351,10 +351,16 @@ def courses(recommendations: dict[str, Any]) -> list[dict[str, Any]]:
             "id": course.get("course_id") or "",
             "title": course.get("title") or "",
             "provider": course.get("provider") or "",
-            # Agent D stores no duration. Coursera's API exposes `workload` and
-            # the adapter even requests it, but nothing persists it — so null,
-            # not 0, which would render as "0 hours".
-            "hours": course.get("hours"),
+            # A RANGE, because that is what providers actually state:
+            # "4 weeks of study, 2-4 hours a week" is 8 to 16, and reporting 12
+            # would be a figure nobody published. Equal ends mean one stated
+            # figure. All three are null when the provider said nothing, and the
+            # card must then show NOTHING — the previous single `hours` field was
+            # published as null and rendered as "0 hours", because the front-end
+            # type declared it non-nullable.
+            "hoursMin": quality.get("hours_min"),
+            "hoursMax": quality.get("hours_max"),
+            "durationText": quality.get("duration_text"),
             # Measured: 0 of 1,999 Coursera courses publish a price. null means
             # "not listed"; 0 would mean FREE, which is a different claim. The
             # amount is left exactly as measured and `priceLabel` carries what can

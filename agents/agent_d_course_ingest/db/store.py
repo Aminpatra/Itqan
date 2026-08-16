@@ -55,8 +55,31 @@ class CourseStore:
         return cls(config.require_database_url())
 
     def connect(self) -> psycopg.Connection:
+        """The cycle's connection. AUTOCOMMIT, and that is load-bearing.
+
+        Without it, psycopg opens an implicit transaction on the connection's
+        FIRST statement — and a cycle reads before it writes. Every later
+        `with conn.transaction()` then nests inside that implicit one as a
+        SAVEPOINT, and releasing a savepoint commits nothing. The run logs its
+        work, raises nothing, and the table is unchanged.
+
+        Agent B was bitten by exactly this twice, in two unrelated callers: a
+        cycle logged `written=25` against an empty table, and a prune printed
+        "deleted 432 posting(s)" with all 432 still present. Hitting it a second
+        time was the signal that the CONNECTION was the problem rather than
+        either caller, and `JobStore.connect` has been autocommit ever since.
+
+        This store had not had the same fix, and it was not theoretical: a
+        verification script here reported 148 courses refreshed and wrote none,
+        because it called the pipeline without wrapping it in `transaction()` the
+        way `nodes.py` does.
+
+        Batch rollback-on-error is unchanged: every writer already wraps its work
+        in `transaction()`, which under autocommit opens a REAL transaction
+        instead of a savepoint. `test_a_failed_batch_writes_nothing` pins it.
+        """
         if self._conn is None or self._conn.closed:
-            self._conn = psycopg.connect(self.dsn, row_factory=dict_row)
+            self._conn = psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True)
             self._register_vector(self._conn)
         return self._conn
 
@@ -203,7 +226,17 @@ class CourseStore:
         conn = self.connect()
         # Absent flag means False: a caller that cannot say it observed these
         # values does not get to overwrite stored ones.
-        params = [{**r, "volatile_observed": bool(r.get("volatile_observed"))} for r in rows]
+        # `has_duration` is derived from whether the caller SUPPLIED the keys,
+        # not from whether they are None. A caller that knows nothing about
+        # durations must leave stored ones alone — defaulting the columns to
+        # None would erase them, which is exactly the trap `volatile_observed`
+        # exists to prevent one field over.
+        params = [{
+            "hours_min": None, "hours_max": None, "duration_text": None,
+            **r,
+            "volatile_observed": bool(r.get("volatile_observed")),
+            "has_duration": "duration_text" in r,
+        } for r in rows]
         with conn.cursor() as cur:
             # executemany rather than a Python loop of execute(): psycopg3
             # pipelines it into one round trip instead of one per course. At 31
@@ -541,6 +574,14 @@ class CourseStore:
 
 _REFRESH_VOLATILE_SQL = """
 UPDATE courses SET
+    -- Gated on whether the caller SUPPLIED a duration, not on
+    -- `volatile_observed`: duration arrives in the catalogue response, not the
+    -- page fetch that flag guards. So a failed page lookup must not stop it
+    -- being written, and a caller that never carries it must not erase it.
+    hours_min         = CASE WHEN %(has_duration)s THEN %(hours_min)s ELSE hours_min END,
+    hours_max         = CASE WHEN %(has_duration)s THEN %(hours_max)s ELSE hours_max END,
+    duration_text     = CASE WHEN %(has_duration)s THEN %(duration_text)s
+                             ELSE duration_text END,
     rating            = CASE WHEN %(volatile_observed)s THEN %(rating)s ELSE rating END,
     review_count      = CASE WHEN %(volatile_observed)s THEN %(review_count)s ELSE review_count END,
     enrollment_count  = CASE WHEN %(volatile_observed)s THEN %(enrollment_count)s
@@ -565,6 +606,7 @@ INSERT INTO courses (
     name, raw_description, content_hash, status,
     taught_skills, provider, level, primary_language, subject, country,
     review_reason, duplicate_of, attribution, license, extraction_model, embedding,
+    hours_min, hours_max, duration_text,
     rating, review_count, enrollment_count, last_updated,
     price_amount, price_currency, price_is_free, price_observed_at,
     first_seen_at, last_seen_at, missed_cycles, stale_since
@@ -574,6 +616,7 @@ INSERT INTO courses (
     %(taught_skills)s, %(provider)s, %(level)s, %(primary_language)s, %(subject)s, %(country)s,
     %(review_reason)s, %(duplicate_of)s, %(attribution)s, %(license)s, %(extraction_model)s,
     %(embedding)s,
+    %(hours_min)s, %(hours_max)s, %(duration_text)s,
     %(rating)s, %(review_count)s, %(enrollment_count)s, %(last_updated)s,
     %(price_amount)s, %(price_currency)s, %(price_is_free)s,
     -- Only stamp the observation time when something was actually observed.
@@ -594,6 +637,12 @@ ON CONFLICT (course_id) DO UPDATE SET
     review_reason = EXCLUDED.review_reason, duplicate_of = EXCLUDED.duplicate_of,
     attribution = EXCLUDED.attribution, license = EXCLUDED.license,
     extraction_model = EXCLUDED.extraction_model, embedding = EXCLUDED.embedding,
+    -- Duration is CONTENT, not a volatile signal: it arrives in the same
+    -- catalogue response as the name and description, so if we have the
+    -- record we have the field. Gating it on `volatile_observed` would tie
+    -- it to a page fetch it does not come from.
+    hours_min = EXCLUDED.hours_min, hours_max = EXCLUDED.hours_max,
+    duration_text = EXCLUDED.duration_text,
     -- Volatile columns follow the same rule as refresh_volatile: a fetch that
     -- did not observe them must not erase what is stored. A course's TEXT can
     -- change (re-extracted here) while its rating lookup failed, so these two
@@ -627,6 +676,8 @@ def _row_params(row: Any) -> dict[str, Any]:
         "country": row.country, "review_reason": row.review_reason,
         "duplicate_of": row.duplicate_of, "attribution": row.attribution, "license": row.license,
         "extraction_model": row.extraction_model, "embedding": row.embedding,
+        "hours_min": row.hours_min, "hours_max": row.hours_max,
+        "duration_text": row.duration_text,
         "rating": row.rating, "review_count": row.review_count,
         "enrollment_count": row.enrollment_count, "last_updated": row.last_updated,
         "price_amount": row.price_amount, "price_currency": row.price_currency,

@@ -80,16 +80,39 @@ def test_a_real_amount_needs_no_label():
     assert out["price"] == 18.0 and out["currency"] == "OMR"
 
 
-def test_hours_stays_null_because_agent_d_stores_no_duration():
-    """Coursera's `workload` is free text and multilingual — '2 heures',
-    '4 weeks of study, 2-4 hours a week'. Reducing that to one number means
-    choosing a point inside an 8-16 hour range."""
-    out = courses({"recommendations": [{
-        "skill": "x", "no_course_found": False,
-        "course": {"course_id": "c", "title": "T", "provider": "P", "url": "u",
-                   "covers_other_skills": [], "quality": {}},
-    }]})
-    assert out[0]["hours"] is None
+def test_an_unstated_duration_is_null_across_all_three_fields():
+    """This test used to assert that Agent D stored NO duration, which was true
+    and was the bug: `workload` was fetched and discarded, the API published
+    `hours: null`, and the card rendered "0 hours" because the front-end type
+    said a number was always there.
+
+    Agent D stores it now — but "nothing stated" must still be null in every
+    field, because that is what the card renders as silence.
+    """
+    out = courses(_course())[0]
+
+    assert out["hoursMin"] is None
+    assert out["hoursMax"] is None
+    assert out["durationText"] is None
+
+
+def test_a_range_is_published_as_a_range():
+    """'4 weeks of study, 2-4 hours a week' is 8 to 16. Publishing 12 would be a
+    figure no provider ever stated — the reason durations were left unstored
+    rather than guessed at."""
+    out = courses(_course(hours_min=8.0, hours_max=16.0,
+                          duration_text="4 weeks of study, 2-4 hours a week"))[0]
+
+    assert (out["hoursMin"], out["hoursMax"]) == (8.0, 16.0)
+    assert out["durationText"] == "4 weeks of study, 2-4 hours a week"
+
+
+def test_one_stated_figure_has_equal_ends():
+    """Not an average of anything: the provider said '2 heures'."""
+    out = courses(_course(hours_min=2.0, hours_max=2.0,
+                          duration_text="2 heures"))[0]
+
+    assert out["hoursMin"] == out["hoursMax"] == 2.0
 
 
 def test_a_null_gap_score_becomes_a_null_readiness_not_a_zero():

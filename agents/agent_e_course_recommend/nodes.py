@@ -513,6 +513,11 @@ def make_attach_flags(deps: Deps) -> Callable[[RecommendState], dict]:
                         "enrollment_count": cc.enrollment_count,
                         "level": getattr(cc, "level", None),
                         "price": cc.price.model_dump() if cc.price else None,
+                        # A RANGE and the provider's own words. Never a midpoint:
+                        # see agents/agent_d_course_ingest/duration.py.
+                        "hours_min": getattr(cc, "hours_min", None),
+                        "hours_max": getattr(cc, "hours_max", None),
+                        "duration_text": getattr(cc, "duration_text", None),
                         "last_updated": cc.last_updated,
                     },
                     "rationale": None,          # filled by generate_rationale

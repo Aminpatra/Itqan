@@ -57,7 +57,8 @@ def _connection(config: Config) -> Iterator[Any]:
 _COURSE_COLUMNS = """
     c.course_id, c.name, c.provider, c.source, c.source_url, c.taught_skills,
     c.rating, c.review_count, c.enrollment_count, c.level, c.last_updated,
-    c.price_amount, c.price_currency, c.price_is_free
+    c.price_amount, c.price_currency, c.price_is_free,
+    c.hours_min, c.hours_max, c.duration_text
 """
 
 _BY_ESCO_SQL = f"""
@@ -190,6 +191,9 @@ def _candidate(row: dict[str, Any]) -> CourseCandidate:
         review_count=row.get("review_count"),
         enrollment_count=row.get("enrollment_count"),
         level=row.get("level"),
+        hours_min=float(row["hours_min"]) if row.get("hours_min") is not None else None,
+        hours_max=float(row["hours_max"]) if row.get("hours_max") is not None else None,
+        duration_text=row.get("duration_text"),
         last_updated=row["last_updated"].isoformat() if row.get("last_updated") else None,
         price=_price(row),
     )

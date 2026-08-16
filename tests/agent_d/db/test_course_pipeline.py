@@ -7,8 +7,11 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from agents.agent_b_job_ingest.esco_map import sync_taxonomy
 from agents.agent_d_course_ingest.aggregate import recompute_supply
+from agents.agent_d_course_ingest.db.store import CourseStore
 from agents.agent_d_course_ingest.esco_map import map_new_course_skills
 from agents.agent_d_course_ingest.pipeline import CoursePipeline
 from agents.agent_d_course_ingest.prompts.extraction import EXTRACTION_PROMPT
@@ -397,3 +400,43 @@ def test_supply_retention_refuses_to_go_below_the_floor(store):
 
     with _pytest.raises(ValueError, match="floor"):
         store.prune_stats_windows(keep=1)
+
+
+# ---------------------------------------------------------------------------
+# the connection itself
+# ---------------------------------------------------------------------------
+def test_a_bare_write_commits_without_an_explicit_transaction(store):
+    """The bug this store had, and that Agent B was bitten by twice.
+
+    Without autocommit, psycopg opens an implicit transaction on the FIRST
+    statement — and a cycle reads before it writes — so every later
+    `with conn.transaction()` nests as a SAVEPOINT, and releasing a savepoint
+    commits nothing. The run logs its work, raises nothing, and the table is
+    unchanged. A verification script here reported 148 courses refreshed and
+    wrote none.
+    """
+    store.upsert_batch([_row("c_bare", name="Bare write")])
+
+    fresh = CourseStore(store.dsn)
+    try:
+        assert fresh.lookup_hashes(["c_bare"]), "the write never committed"
+    finally:
+        fresh.close()
+
+
+def test_a_failed_batch_still_writes_nothing(store):
+    """Autocommit must not have cost the rollback it looks like it costs.
+
+    Writers wrap their work in `transaction()`, which under autocommit opens a
+    REAL transaction rather than a savepoint — so a failure mid-batch still
+    leaves the table as it was.
+    """
+    before = len(store.lookup_hashes(["c_ok", "c_boom"]))
+
+    with pytest.raises(RuntimeError):
+        with store.transaction():
+            store.upsert_batch([_row("c_ok", name="Fine")])
+            raise RuntimeError("something failed after the write")
+
+    assert len(store.lookup_hashes(["c_ok", "c_boom"])) == before, (
+        "a failed batch left rows behind")

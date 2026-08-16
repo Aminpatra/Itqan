@@ -24,6 +24,7 @@ import re
 from typing import Any
 
 from shared.config import Config
+from shared.scraping import build_client
 from shared.scraping.http import Blocked, PoliteClient, ResponseTooLarge, SourcePolicy
 from shared.scraping.robots import RobotsPolicy
 
@@ -198,6 +199,12 @@ class CourseraAdapter(BaseAdapter):
             provider=provider,
             level=None,               # not exposed by this API; extracted or unknown
             primary_language=primary,
+            # `workload` has been in COURSE_FIELDS since this adapter was written
+            # and was never persisted, so every card said "0 hours". It is free
+            # text by the course author — '1 hour 30 minutes', '2 heures',
+            # '4 weeks of study, 2-4 hours a week', or '' — and it is kept
+            # verbatim; the pipeline parses a RANGE from it and never a midpoint.
+            duration_text=(el.get("workload") or "").strip() or None,
             attribution=f"{provider} via Coursera",
             license=None,             # proprietary; we catalog facts + a link only
         )
@@ -206,7 +213,23 @@ class CourseraAdapter(BaseAdapter):
     # ------------------------------------------------------------------
     def _ensure_page_client(self):
         if self._page_client is None:
-            self._page_client = PoliteClient(
+            # Through the shared factory, so Chromium for this source becomes a
+            # one-value config change (`browser_sources`) rather than a code
+            # change — the same seam Agent B has.
+            #
+            # SHIPS OFF, and that is measured rather than assumed. Probed
+            # 2026-08-16: a Coursera course we hold with no rating serves HTML
+            # containing no `ratingValue` and no `AggregateRating` at all, and
+            # enrichment has already run on 2,000 of 2,000 rows. The ratings are
+            # missing because the publisher never issued them, not because they
+            # are drawn client-side, so a browser adds nothing and costs 300-500
+            # MB of RAM on a 4 GB box.
+            #
+            # The API client above is deliberately NOT routed through here: the
+            # catalogue is JSON, and a browser would hand back Chrome's JSON
+            # viewer instead — the same trap that rules out rendering el7far's
+            # Atom feed.
+            self._page_client = build_client(
                 source=f"{self.name}_page",
                 policy=SourcePolicy(
                     min_interval_s=self.config.coursera_enrich_interval_s,

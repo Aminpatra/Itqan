@@ -207,3 +207,58 @@ def test_fcc_honours_robots_via_require():
     adapter = FreeCodeCampAdapter(client=client, robots=Deny(), config=Config())
     result = adapter.fetch()
     assert result.courses == [] and not result.ok
+
+
+# ---------------------------------------------------------------------------
+# freeCodeCamp: blocks alongside certifications
+# ---------------------------------------------------------------------------
+def test_blocks_are_emitted_as_courses_of_their_own():
+    """A certification is a course and so is each block inside it. "Basic CSS"
+    is something a person can be pointed at on its own, and it carries its own
+    intro rather than inheriting the certification's."""
+    from agents.agent_d_course_ingest.sources.freecodecamp import FreeCodeCampAdapter
+    from tests.agent_d.fake_client import FakeClient, fixture
+
+    result = FreeCodeCampAdapter(
+        client=FakeClient({"intro.json": fixture("freecodecamp_intro.json")}),
+        config=Config()).fetch()
+
+    names = [c.name for c in result.courses]
+    assert "Basic HTML and HTML5" in names
+    assert "Basic CSS" in names
+
+
+def test_a_certification_keeps_its_url_and_therefore_its_identity():
+    """The 99 existing rows must not be re-minted. `course_id` is derived from
+    `source_url`, this source is census=True, and a changed id would have aged —
+    then DELETED — every row it replaced. Same shape as the Agent B identity
+    finding that double-counted demand across an overlap.
+    """
+    from agents.agent_d_course_ingest.sources.freecodecamp import FreeCodeCampAdapter
+    from tests.agent_d.fake_client import FakeClient, fixture
+
+    result = FreeCodeCampAdapter(
+        client=FakeClient({"intro.json": fixture("freecodecamp_intro.json")}),
+        config=Config()).fetch()
+
+    urls = {c.source_url for c in result.courses}
+    assert "https://www.freecodecamp.org/learn/responsive-web-design" in urls
+    # And each block hangs off it, so their ids are distinct from the parent's.
+    assert "https://www.freecodecamp.org/learn/responsive-web-design/basic-css" in urls
+
+
+def test_a_block_without_its_own_intro_is_skipped_not_given_the_parents():
+    """A row whose description belongs to something else extracts the wrong
+    skills — the clustering bug Agent B had to un-pick across 245 rows."""
+    import json
+
+    from agents.agent_d_course_ingest.sources.freecodecamp import FreeCodeCampAdapter
+    from tests.agent_d.fake_client import FakeClient, fixture
+
+    data = json.loads(fixture("freecodecamp_intro.json"))
+    data["responsive-web-design"]["blocks"]["basic-css"].pop("intro")
+    result = FreeCodeCampAdapter(
+        client=FakeClient({"intro.json": json.dumps(data)}), config=Config()).fetch()
+
+    assert "Basic CSS" not in [c.name for c in result.courses]
+    assert "Basic HTML and HTML5" in [c.name for c in result.courses]

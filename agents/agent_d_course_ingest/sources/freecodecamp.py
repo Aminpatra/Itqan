@@ -121,11 +121,34 @@ class FreeCodeCampAdapter(BaseAdapter):
                 # still distinguishable from an empty one.
                 result.skipped += 1
                 continue
-            if self._is_known_unchanged and self._is_known_unchanged(course):
-                continue
-            result.courses.append(course)
-            if limit is not None and len(result.courses) >= limit:
-                return
+            if not (self._is_known_unchanged and self._is_known_unchanged(course)):
+                result.courses.append(course)
+                if limit is not None and len(result.courses) >= limit:
+                    return
+
+            # Then each BLOCK inside it, as its own row.
+            #
+            # A superblock is a whole certification ("Responsive Web Design");
+            # a block is a self-contained unit ("Basic CSS", "CSS Flexbox") that
+            # a person can be pointed at on its own, and it carries its own
+            # intro. Emitting both takes freeCodeCamp from 99 rows to several
+            # hundred without touching a single existing `course_id` — the
+            # superblock rows keep their identity, so nothing is orphaned and
+            # nothing ages out. That mattered: this source is census=True, and a
+            # re-minted id would have deleted the 99 rows it replaced.
+            #
+            # HONEST COST, stated rather than discovered: a certification and its
+            # own blocks both teach CSS, so `skill_supply_stats` counts more
+            # courses per skill than before. The count becomes "how many distinct
+            # things teach this", which is defensible — but the demand-vs-supply
+            # join reads differently, so it wants a before/after rather than a
+            # shrug.
+            for block in self._blocks(slug, payload):
+                if self._is_known_unchanged and self._is_known_unchanged(block):
+                    continue
+                result.courses.append(block)
+                if limit is not None and len(result.courses) >= limit:
+                    return
 
         # The file loaded but nothing in it parsed as a course: freeCodeCamp has
         # not withdrawn its curriculum, the file changed shape. This source is
@@ -162,6 +185,57 @@ class FreeCodeCampAdapter(BaseAdapter):
             price={"amount": 0.0, "currency": None, "is_free": True},
             volatile_observed=True,
         )
+
+
+    def _blocks(self, superblock: str, payload: object) -> list[RawCourse]:
+        """One course per block inside a certification.
+
+        A block with no title or no intro is skipped rather than given the
+        superblock's text: a row whose description belongs to something else
+        extracts the wrong skills, which is the clustering bug Agent B had to
+        un-pick across 245 rows.
+        """
+        if not isinstance(payload, dict):
+            return []
+        blocks = payload.get("blocks")
+        if not isinstance(blocks, dict):
+            return []
+
+        out: list[RawCourse] = []
+        for key, block in blocks.items():
+            if not key or not isinstance(block, dict):
+                continue
+            title = (block.get("title") or "").strip()
+            intro = _intro_text(block.get("intro"))
+            if not title or not intro:
+                continue
+            out.append(RawCourse(
+                source=self.name,
+                source_group=self.source_group,
+                source_type=self.source_type,
+                # The block's own page, which is where a learner actually lands.
+                # Distinct from the superblock URL, so the id is distinct too.
+                source_url=f"{LEARN_URL.format(slug=superblock)}/{key}",
+                name=title,
+                raw_description=intro,
+                provider="freeCodeCamp",
+                level=None,
+                primary_language="en",
+                attribution=ATTRIBUTION,
+                license=LICENSE,
+                price={"amount": 0.0, "currency": None, "is_free": True},
+                volatile_observed=True,
+            ))
+        return out
+
+
+def _intro_text(intro: object) -> str:
+    """A block's intro is a list of paragraphs, occasionally a bare string."""
+    if isinstance(intro, list):
+        return "\n".join(str(p).strip() for p in intro if str(p).strip()).strip()
+    if isinstance(intro, str):
+        return intro.strip()
+    return ""
 
 
 def _describe(payload: dict) -> str:

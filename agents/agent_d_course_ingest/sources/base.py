@@ -51,6 +51,13 @@ class RawCourse:
     review_count: int | None = None
     enrollment_count: int | None = None
     last_updated: str | None = None      # ISO8601, the provider's own field if present
+    # How long the provider says it takes, EXACTLY as they said it — Coursera's
+    # free-text `workload`, edX's ISO-8601 `duration`. Parsed into a range by
+    # `agents.agent_d_course_ingest.duration`; both ends equal means the provider
+    # stated ONE figure, never that a range was averaged. Kept alongside the
+    # numbers so a range can always be checked against the words it came from,
+    # and so an unparseable-but-present duration is still worth showing.
+    duration_text: str | None = None
     # {"amount": float|None, "currency": str|None, "is_free": bool}, or None when
     # the provider reports no price at all. Free -> amount 0.0, is_free True.
     price: dict | None = None

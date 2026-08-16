@@ -470,6 +470,20 @@ class Config:
     #
     # The knob stays because a source can start refusing scripts overnight, and
     # then this is a one-value change rather than a code change.
+    #
+    # AGENT D's course sources were wired to the same factory on 2026-08-16 and
+    # are empty here for the same reason — measured, not assumed:
+    #
+    #   coursera  a course we hold with NO rating serves HTML containing no
+    #             `ratingValue` and no `AggregateRating` at all, and enrichment
+    #             has already run on 2,000 of 2,000 rows. The 1,750 missing
+    #             ratings are missing because the publisher never issued them.
+    #             A browser cannot conjure a rating that does not exist.
+    #   edx       552 KB of server-rendered HTML with full JSON-LD to httpx.
+    #   fcc       a JSON file in a GitHub repo; no browser was ever involved.
+    #
+    # Enabling one here costs the target a full page render and costs us
+    # 300-500 MB of RAM on a 4 GB box that already peaks at 1.2 GB during OCR.
     browser_sources: tuple[str, ...] = ()
     blogger_max_pages: int = 8
     # MUST be >= window_days. A posting is counted as demand for `window_days`, so

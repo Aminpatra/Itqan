@@ -328,6 +328,15 @@ class CourseCandidate(BaseModel):
     url: str                                     # the course's `source_url` column
     taught_skills: list[str] = Field(default_factory=list)
 
+    # How long the provider says it takes, as a RANGE plus their own words.
+    # Equal ends mean one stated figure; a midpoint is never computed, because
+    # collapsing "2-4 hours a week for 4 weeks" to 12 would publish a number
+    # nobody stated. None means the provider said nothing — which the UI must
+    # render as silence, not as "0 hours".
+    hours_min: Optional[float] = None
+    hours_max: Optional[float] = None
+    duration_text: Optional[str] = None
+
     rating: Optional[float] = None
     review_count: Optional[int] = None
     enrollment_count: Optional[int] = None

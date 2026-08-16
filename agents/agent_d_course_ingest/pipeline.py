@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .duration import parse_workload
 from .hashing import content_hash, id_for
 from .records import PersistedCourse
 from .schemas import CourseExtraction
@@ -144,12 +145,16 @@ class CoursePipeline:
 
     # ------------------------------------------------------------------
     def _new_work(self, raw: RawCourse, cid: str, chash: str) -> _Work:
+        # A RANGE from the provider's own words, or nothing. Equal ends mean one
+        # stated figure; a midpoint is never computed — see `duration.py`.
+        hours_min, hours_max = parse_workload(raw.duration_text)
         row = PersistedCourse(
             course_id=cid, source=raw.source, source_group=raw.source_group,
             source_type=raw.source_type, source_url=raw.source_url,
             name=raw.name, raw_description=raw.raw_description, content_hash=chash,
             provider=raw.provider, level=raw.level, primary_language=raw.primary_language,
             attribution=raw.attribution, license=raw.license,
+            hours_min=hours_min, hours_max=hours_max, duration_text=raw.duration_text,
             extraction_model=self.model_name,
             # Volatile signals travel with the full upsert for changed/new courses
             # (unchanged ones go through refresh_volatile instead). Deterministic,
@@ -285,10 +290,23 @@ class CoursePipeline:
 
 # ---------------------------------------------------------------------------
 def _volatile_row(cid: str, raw: RawCourse) -> dict:
-    """The volatile-column payload for an unchanged course's cheap refresh."""
+    """The volatile-column payload for an unchanged course's cheap refresh.
+
+    Duration rides along, and NOT behind `volatile_observed`. That flag exists
+    because the quality signals come from a separate page fetch that can fail —
+    it stops a robots refusal nulling every stored rating. Duration comes from
+    the catalogue response itself, so if we are refreshing this course at all we
+    are holding its `workload`; gating it on a page fetch it never came from
+    would mean the 2,000 courses already stored — all of them unchanged, all of
+    them taking this path — never received a duration at all.
+    """
+    hours_min, hours_max = parse_workload(raw.duration_text)
     return {
         "course_id": cid,
         "volatile_observed": raw.volatile_observed,
+        "hours_min": hours_min,
+        "hours_max": hours_max,
+        "duration_text": raw.duration_text,
         "rating": raw.rating,
         "review_count": raw.review_count,
         "enrollment_count": raw.enrollment_count,
