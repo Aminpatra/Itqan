@@ -28,6 +28,7 @@ controls.
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -118,6 +119,17 @@ def gaps_from(gap: dict[str, Any]) -> list[Any]:
         return [{"skill": d.get("skill"), "jobs_missing_in": d.get("jobs_missing_in"),
                  "low_confidence": d.get("low_confidence")} for d in details][:10]
     return list(aggregate.get("most_common_missing_skills") or [])[:10]
+
+
+def _newest(docs: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    """The most recent document of one kind, or none.
+
+    `all_documents` returns newest first, so this takes the head. One CV, not
+    every CV a person has ever uploaded: re-reading three old resumes alongside
+    the current one would blend them into a profile that describes nobody.
+    """
+    matches = [d for d in docs if d.get("kind") == kind]
+    return matches[:1]
 
 
 def register(app: Any, *, require_user, jobs_module, mapping) -> None:
@@ -269,35 +281,74 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
 
     @app.post("/api/assistant/rerun")
     async def rerun(request: Request) -> Any:
-        """Spend one weekly credit to re-match.
+        """Spend one weekly credit to re-run. Two modes.
 
         The ONLY path that consumes a rerun credit, and it requires the user to
         have said so in this request. The model has no way to reach here: it
         returns text and a boolean, and neither is routed to this function.
 
-        Re-runs phase two only (user decision, 2026-08-15) — Agents C and E
-        against the corpus as it stands, reusing the confirmed profile. Agent A
-        does not run, so no document is re-read and the confirm screen does not
-        reopen.
+        * **`match`** (default) — Agents C and E against the corpus as it stands,
+          reusing the confirmed profile. No document is re-read, and it runs to
+          `done` on its own.
+        * **`full`** — Agent A as well, from the user's documents as they stand
+          now, so a newly uploaded CV is picked up.
+
+        **A full rerun STOPS at `awaiting_confirmation`, by design** (user
+        decision, 2026-08-15). That pause is where a person corrects what the
+        model extracted, and running past it would publish a fresh extraction
+        nobody reviewed — silently overwriting any correction they made last
+        time. So this returns `awaitingConfirmation: true` and the caller must
+        say plainly that the run is waiting for them, not finished.
         """
         user = require_user(request)
         store, config = _store(), _config()
         body = await request.json()
+
+        mode = (body.get("mode") or "match").strip().lower()
+        if mode not in ("match", "full"):
+            return JSONResponse({"error": "unknown_mode"}, status_code=400)
 
         if body.get("confirm") is not True:
             # Explicit, in this request. At one credit a week, an accidental
             # spend is the user's whole allowance.
             return JSONResponse(
                 {"error": "confirmation_required",
-                 "message": "This will use your rerun credit for this week.",
+                 "message": ("This will use your rerun credit for this week."
+                             if mode == "match" else
+                             "This will use your rerun credit for this week, re-read "
+                             "your documents, and ask you to confirm the details again."),
                  "usage": quota_state(store, config, user["user_id"], "rerun")},
                 status_code=400)
 
+        # Everything that makes a run impossible is checked BEFORE the credit is
+        # claimed. A user must not be able to spend their whole weekly allowance
+        # discovering that there was nothing to run.
         latest = store.latest_completed_run(user["user_id"])
-        if latest is None:
-            # Nothing to re-match. Checked BEFORE the credit is claimed, so a
-            # user cannot spend their weekly allowance on a no-op.
-            return JSONResponse({"error": "no_completed_run"}, status_code=409)
+        docs: list[dict[str, Any]] = []
+        if mode == "match":
+            if latest is None:
+                return JSONResponse({"error": "no_completed_run"}, status_code=409)
+        else:
+            # NOT blocked by an existing paused run, and that was a real bug
+            # caught by running this against a live account rather than fixtures.
+            #
+            # `stale_runs` deliberately never expires `awaiting_confirmation` —
+            # someone taking ten minutes over the form is not a crashed process —
+            # so abandoned onboarding attempts accumulate and live forever. The
+            # dev account had FOUR, none newer than a week. A guard on "any run
+            # is paused" therefore meant: anyone who ever abandoned onboarding can
+            # never re-run again.
+            #
+            # Nothing is lost by allowing it. `awaiting_run` returns the NEWEST,
+            # which is the one the app shows and the one `POST /api/profile`
+            # binds to, so the older ones are already invisible. And the double-
+            # spend worry is covered by the credit itself: at one a week, a second
+            # attempt is refused by the quota, not by this.
+            docs = store.all_documents(user["user_id"])
+            if not any(d["kind"] == "cv" for d in docs):
+                # Agent A cannot run without a CV. Named here rather than failing
+                # three stages in, which is the same courtesy /api/analysis does.
+                return JSONResponse({"error": "cv_required"}, status_code=409)
 
         period = week_start(config)
         used = store.claim_quota(user["user_id"], kind="rerun",
@@ -312,16 +363,38 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
                 status_code=429)
 
         try:
-            profile = store.profile(user["user_id"]) or {}
-            preferences = (profile.get("payload") or {}).get("preferences") or {}
-            job_id = store.create_run(user_id=user["user_id"],
-                                      document_ids=[], run_id=latest["run_id"])
-            jobs_module.spawn_phase_two(
-                store, app.state.runner, job_id=job_id, run_id=latest["run_id"],
-                preferences=preferences, profile=latest.get("profile"))
+            if mode == "match":
+                profile = store.profile(user["user_id"]) or {}
+                preferences = (profile.get("payload") or {}).get("preferences") or {}
+                job_id = store.create_run(user_id=user["user_id"],
+                                          document_ids=[], run_id=latest["run_id"])
+                jobs_module.spawn_phase_two(
+                    store, app.state.runner, job_id=job_id, run_id=latest["run_id"],
+                    preferences=preferences, profile=latest.get("profile"))
+                awaiting = False
+            else:
+                # A NEW run id: Agent A writes into `output/<run_id>/`, and reusing
+                # the old one would overwrite a completed run's artifacts with a
+                # half-finished one before the user has confirmed anything.
+                run_id = f"run_{uuid.uuid4().hex[:12]}"
+                # The newest of each kind, so a CV uploaded since the last run is
+                # what gets read — which is the main reason to want this at all.
+                cvs = _newest(docs, "cv")
+                transcripts = _newest(docs, "transcript")
+                job_id = store.create_run(
+                    user_id=user["user_id"], run_id=run_id,
+                    document_ids=[d["document_id"] for d in cvs + transcripts])
+                jobs_module.spawn(
+                    store, app.state.runner, job_id=job_id, run_id=run_id,
+                    cv_paths=[d["stored_path"] for d in cvs],
+                    transcript_paths=[d["stored_path"] for d in transcripts])
+                awaiting = True
         except Exception:
             store.refund_quota(user["user_id"], kind="rerun", period_start=period)
             raise
 
-        return {"jobId": job_id,
+        return {"jobId": job_id, "mode": mode,
+                # Load-bearing for the caller's wording: a full rerun is NOT
+                # finished when this returns, it is waiting for a person.
+                "awaitingConfirmation": awaiting,
                 "usage": quota_state(store, config, user["user_id"], "rerun")}

@@ -35,6 +35,46 @@ def sheet(**over) -> str:
 # ---------------------------------------------------------------------------
 # the fact sheet
 # ---------------------------------------------------------------------------
+def test_no_machine_timestamp_ever_reaches_the_sheet():
+    """The bug, as a regression.
+
+    A real user was told their results were produced on
+    "2026-08-09T04:09:49.388371+00:00". The model echoed what it was handed, so
+    this asserts on what it is handed.
+    """
+    text = sheet(matched_at="2026-08-09T04:09:49.388371+00:00")
+
+    assert "T04:09" not in text and "388371" not in text
+    assert "9 August 2026" in text
+
+
+@pytest.mark.parametrize("delta_days, expected", [
+    (0, "today"), (1, "yesterday"), (6, "6 days ago"), (29, "29 days ago"),
+])
+def test_how_long_ago_is_stated_because_staleness_is_a_real_question(delta_days, expected):
+    """"Are my results out of date?" cannot be answered from a timestamp without
+    arithmetic the model should not be doing."""
+    from datetime import datetime, timedelta, timezone
+    when = datetime.now(timezone.utc) - timedelta(days=delta_days, hours=1)
+
+    assert expected in sheet(matched_at=when.isoformat())
+
+
+def test_an_old_result_gets_a_date_without_a_misleading_day_count():
+    """"412 days ago" is arithmetic, not information."""
+    from datetime import datetime, timedelta, timezone
+    when = datetime.now(timezone.utc) - timedelta(days=400)
+
+    text = sheet(matched_at=when.isoformat())
+    assert "days ago" not in text
+    assert str(when.year) in text
+
+
+def test_an_unparseable_date_survives_rather_than_crashing():
+    """Better a strange string in one line than no fact sheet at all."""
+    assert "sometime" in sheet(matched_at="sometime")
+
+
 def test_a_missing_readiness_is_stated_not_omitted():
     """Null is not zero, and an omitted line invites the model to fill the gap.
     A line that states the absence gives it the true answer to quote instead."""

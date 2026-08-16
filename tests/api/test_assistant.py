@@ -47,6 +47,19 @@ def _ask(client, text: str = "how am I doing?"):
     return client.post("/api/assistant/messages", json={"text": text})
 
 
+def _await_stage(client, job_id: str, timeout: float = 5.0) -> str:
+    """The worker is a thread, so poll it exactly as the UI does."""
+    import time
+    deadline = time.time() + timeout
+    stage = ""
+    while time.time() < deadline:
+        stage = client.get(f"/api/analysis/{job_id}").json()["stage"]
+        if stage in ("awaiting_confirmation", "done", "failed"):
+            return stage
+        time.sleep(0.05)
+    return stage
+
+
 # ---------------------------------------------------------------------------
 # quotas — enforced in SQL, not by the model
 # ---------------------------------------------------------------------------
@@ -222,6 +235,104 @@ def test_one_credit_cannot_be_spent_twice_at_once(signed_in):
             for _ in range(4)]]
 
     assert codes.count(200) == 1, f"the single weekly credit was spent {codes.count(200)}x"
+
+
+# ---------------------------------------------------------------------------
+# the FULL rerun — Agent A too, and it stops for a person
+# ---------------------------------------------------------------------------
+def test_a_full_rerun_re_reads_the_documents(signed_in, runner):
+    """The difference from `match`: Agent A actually runs again."""
+    _finish_a_run(signed_in)
+    runner.calls.clear()
+
+    res = signed_in.post("/api/assistant/rerun", json={"confirm": True, "mode": "full"})
+
+    assert res.status_code == 200
+    assert res.json()["mode"] == "full"
+    for _ in range(200):
+        if signed_in.get(f"/api/analysis/{res.json()['jobId']}").json()["stage"] in (
+                "awaiting_confirmation", "failed"):
+            break
+    assert "A" in runner.calls, "a full rerun did not re-read the documents"
+
+
+def test_a_full_rerun_stops_for_confirmation_and_says_so(signed_in, runner):
+    """THE test for this mode (user decision, 2026-08-15).
+
+    Running past the pause would publish a fresh extraction nobody reviewed and
+    silently overwrite whatever the person corrected last time. So it stops —
+    and `awaitingConfirmation` is what lets the caller say "waiting for you"
+    rather than "finished", which are very different things to be told.
+    """
+    _finish_a_run(signed_in)
+    runner.calls.clear()
+
+    body = signed_in.post("/api/assistant/rerun",
+                          json={"confirm": True, "mode": "full"}).json()
+
+    assert body["awaitingConfirmation"] is True
+    stage = _await_stage(signed_in, body["jobId"])
+    assert stage == "awaiting_confirmation"
+    assert "C" not in runner.calls, "matching ran without the user confirming"
+    assert "E" not in runner.calls
+
+
+def test_a_match_rerun_does_not_claim_to_be_waiting(signed_in):
+    _finish_a_run(signed_in)
+
+    body = signed_in.post("/api/assistant/rerun", json={"confirm": True}).json()
+
+    assert body["mode"] == "match"
+    assert body["awaitingConfirmation"] is False
+
+
+def test_an_abandoned_paused_run_does_not_lock_the_account_out(signed_in):
+    """A real bug, found by running this against a live account.
+
+    `stale_runs` never expires `awaiting_confirmation` — someone taking ten
+    minutes over the form is not a crashed process — so abandoned onboarding
+    attempts live forever. The dev account had FOUR. An earlier version refused a
+    full rerun whenever any run was paused, which meant anyone who had ever
+    walked away from onboarding could never re-run again.
+
+    The quota is what prevents a double spend, not this.
+    """
+    _finish_a_run(signed_in)
+    first = signed_in.post("/api/assistant/rerun",
+                           json={"confirm": True, "mode": "full"}).json()
+    assert _await_stage(signed_in, first["jobId"]) == "awaiting_confirmation"
+
+    # A second attempt is refused for having no CREDIT, not for the paused run.
+    res = signed_in.post("/api/assistant/rerun", json={"confirm": True, "mode": "full"})
+
+    assert res.status_code == 429
+    assert res.json()["error"] == "rerun_limit_reached"
+
+
+def test_a_full_rerun_without_a_cv_is_refused_for_free(signed_in):
+    """Agent A cannot run without one. Named here rather than failing three
+    stages in — and crucially, before the weekly credit is spent."""
+    res = signed_in.post("/api/assistant/rerun", json={"confirm": True, "mode": "full"})
+
+    assert res.status_code == 409
+    assert res.json()["error"] == "cv_required"
+    assert signed_in.get("/api/assistant/usage").json()["reruns"]["used"] == 0
+
+
+def test_an_unknown_mode_is_refused_for_free(signed_in):
+    res = signed_in.post("/api/assistant/rerun",
+                         json={"confirm": True, "mode": "everything"})
+
+    assert res.status_code == 400
+    assert signed_in.get("/api/assistant/usage").json()["reruns"]["used"] == 0
+
+
+def test_a_full_rerun_still_needs_confirmation(signed_in):
+    res = signed_in.post("/api/assistant/rerun", json={"mode": "full"})
+
+    assert res.status_code == 400
+    assert "documents" in res.json()["message"], (
+        "the confirmation should say what a FULL rerun does differently")
 
 
 def test_a_rerun_with_nothing_to_re_match_costs_nothing(signed_in):

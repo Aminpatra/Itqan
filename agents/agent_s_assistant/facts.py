@@ -12,6 +12,7 @@ check. A fence you do not test is a fence you hope is holding.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # Reused from Agent E's verifier, deliberately identical in behaviour: comma
@@ -36,6 +37,42 @@ def _numbers(text: str) -> set[str]:
     return out
 
 
+def _when(value: Any) -> str:
+    """A date a person can read, and how long ago it was.
+
+    The raw value reached a real user verbatim — *"The results last produced on
+    2026-08-09T04:09:49.388371+00:00"* — inside a sentence about their career.
+    The model echoed exactly what it was handed, so the fix belongs in what it is
+    handed rather than in an instruction not to repeat it.
+
+    "6 days ago" is not decoration either: "are my results out of date?" is one
+    of the questions this assistant exists to answer, and it cannot be answered
+    from a timestamp without arithmetic the model should not be doing.
+    """
+    if not value:
+        return "no completed match yet"
+    try:
+        when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return str(value)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+
+    # `%-d` strips the leading zero on Linux and raises on Windows, so the day
+    # is assembled by hand.
+    stamp = f"{when.day} {when:%B %Y}"
+    days = (datetime.now(timezone.utc) - when).days
+    if days < 0:
+        return stamp
+    if days == 0:
+        return f"{stamp} (today)"
+    if days == 1:
+        return f"{stamp} (yesterday)"
+    if days <= 30:
+        return f"{stamp} ({days} days ago)"
+    return stamp
+
+
 def build_fact_sheet(*, readiness: Any, jobs: list[dict[str, Any]],
                      courses: list[dict[str, Any]], gaps: list[str],
                      suggested_role: Optional[dict[str, Any]],
@@ -57,7 +94,7 @@ def build_fact_sheet(*, readiness: Any, jobs: list[dict[str, Any]],
         f"Readiness score: {readiness}/100" if readiness is not None
         else "Readiness score: not measured yet"
     )
-    lines.append(f"Results last produced: {matched_at or 'no completed match yet'}")
+    lines.append(f"Results last produced: {_when(matched_at)}")
 
     if suggested_role and suggested_role.get("title"):
         lines.append(f"Role the analysis suggests: {suggested_role['title']}"
