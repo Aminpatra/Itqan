@@ -33,6 +33,18 @@ from . import mapping
 from .db import AppStore, apply_migrations, hash_password, verify_password
 
 
+def _locale_of(request: Request) -> str:
+    """The language this request was made in, or English.
+
+    Reads the `itqan_locale` cookie the site's language toggle sets. English is
+    the fallback rather than Arabic (2026-08-16): a visitor who has never touched
+    the toggle has expressed no preference, and defaulting them into a language
+    they may not read is the worse of the two guesses.
+    """
+    value = (request.cookies.get(LOCALE_COOKIE) or "").strip().lower()
+    return value if value in ("ar", "en") else "en"
+
+
 def _sha256(value: str) -> str:
     """What gets stored instead of the thing itself.
 
@@ -170,14 +182,21 @@ def create_app(config: Optional[Config] = None, *,
     # shows no traffic.
     @app.post("/api/auth/signup")
     @app.post("/api/placeholder/signup")   # alias — see the note below
-    async def signup(response: Response, email: str = Form(...), password: str = Form(...),
-                     name: str = Form("")) -> Any:
+    async def signup(request: Request, response: Response, email: str = Form(...),
+                     password: str = Form(...), name: str = Form("")) -> Any:
         store: AppStore = app.state.store
         if store.user_by_email(email):
             return JSONResponse({"error": "email_taken"}, status_code=409)
         if password_problems(password):
             return JSONResponse({"error": "invalid_input"}, status_code=400)
-        user = store.create_user(email=email, full_name=name, password=password)
+        # The language they were actually reading when they signed up. This route
+        # used to pass no locale at all, so every account — including one created
+        # entirely on the English site — was stored 'ar' from the column default,
+        # and every agent-authored string and email came back in Arabic. The
+        # cookie is already written by the site's language toggle; nothing new is
+        # needed to know this.
+        user = store.create_user(email=email, full_name=name, password=password,
+                                 locale=_locale_of(request))
         set_session(response, user["user_id"], user["locale"])
         return {"ok": True}
 
@@ -235,11 +254,15 @@ def create_app(config: Optional[Config] = None, *,
         token = secrets.token_urlsafe(32)
         store.create_password_reset(user_id=row["user_id"], token_hash=_sha256(token),
                                     minutes=config.reset_token_minutes)
+        # The account's own locale wins: it is the person's stated preference,
+        # and the person requesting a reset is not necessarily the person who
+        # will read the mail. The request's cookie is the fallback, for an
+        # account created before signup recorded one.
+        locale = row.get("locale") or _locale_of(request)
         link = email_module.reset_link(site_url=config.site_url,
-                                       locale=row.get("locale") or "ar", token=token)
+                                       locale=locale, token=token)
         subject, body = email_module.reset_message(
-            link=link, locale=row.get("locale") or "ar",
-            minutes=config.reset_token_minutes)
+            link=link, locale=locale, minutes=config.reset_token_minutes)
         email_module.send_in_background(to=address, subject=subject, body=body,
                                         config=config)
         return same_answer

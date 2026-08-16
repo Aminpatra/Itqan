@@ -1,0 +1,16 @@
+-- New accounts default to English.
+--
+-- The column defaulted to 'ar' and `POST /api/auth/signup` passed no locale at
+-- all, so EVERY account ever created was stored Arabic — including accounts
+-- created entirely on the English site. The first anyone noticed was a password
+-- reset email arriving in the wrong language.
+--
+-- Signup now reads the `itqan_locale` cookie the language toggle already sets,
+-- so the stored locale reflects where the person actually was. This default
+-- covers the case where nothing is known.
+--
+-- EXISTING ROWS ARE LEFT ALONE, deliberately. A row saying 'ar' is a stated
+-- preference as far as this system can tell, and rewriting it in a migration
+-- would silently change the language for people who chose it. They can switch
+-- with the toggle; new accounts get the new default.
+ALTER TABLE app_users ALTER COLUMN locale SET DEFAULT 'en';

@@ -143,10 +143,10 @@ def reset_link(*, site_url: str, locale: str, token: str) -> str:
     that needs it — because the day someone changes how tokens are minted, this
     should not become the reason a reset link silently breaks.
     """
-    lang = locale if locale in ("ar", "en") else "ar"
+    lang = locale if locale in ("ar", "en") else "en"
     return f"{site_url.rstrip('/')}/{lang}/forgot-password/?token={quote(token)}"
 
 
 def reset_message(*, link: str, locale: str, minutes: int) -> tuple[str, str]:
-    lang = locale if locale in ("ar", "en") else "ar"
+    lang = locale if locale in ("ar", "en") else "en"
     return _SUBJECT[lang], _BODY[lang].format(link=link, minutes=minutes)

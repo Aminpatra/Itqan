@@ -130,7 +130,7 @@ class AppStore:
 
     # --- users --------------------------------------------------------------
     def create_user(self, *, email: str, full_name: str, password: str,
-                    locale: str = "ar") -> dict[str, Any]:
+                    locale: str = "en") -> dict[str, Any]:
         user_id = f"u_{secrets.token_hex(8)}"
         return self._one(
             """

@@ -381,7 +381,7 @@ class Config:
 
     # Long enough to walk to another device and find the mail, short enough that
     # a link left in an inbox is not a standing key to the account.
-    reset_token_minutes: int = 60
+    reset_token_minutes: int = 10
 
     # An endpoint that emails an arbitrary address on request is a bombing vector
     # aimed at people who are not our users, so it is bounded both ways: by

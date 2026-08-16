@@ -289,6 +289,92 @@ def test_the_link_matches_the_contract_and_carries_the_locale(signed_in, client,
     assert "/ar/" in body or "/en/" in body
 
 
+# ---------------------------------------------------------------------------
+# language — English by default, and the language they were actually reading
+# ---------------------------------------------------------------------------
+def test_a_new_account_defaults_to_english(client, store, relay):
+    """The bug behind an Arabic reset email: signup passed NO locale, so every
+    account — including one created entirely on the English site — was stored
+    'ar' from the column default."""
+    client.post("/api/auth/signup", data={"email": "fresh@itqan.test",
+                                          "password": "Str0ng!pass", "name": "Fresh"})
+
+    assert store.user_by_email("fresh@itqan.test")["locale"] == "en"
+
+
+@pytest.mark.parametrize("cookie, expected", [("ar", "ar"), ("en", "en"),
+                                              ("fr", "en"), ("", "en")])
+def test_signup_stores_the_language_being_browsed(client, store, cookie, expected):
+    """The site's language toggle already writes `itqan_locale`; nothing new was
+    needed to know this, it was simply never read."""
+    if cookie:
+        client.cookies.set("itqan_locale", cookie)
+    client.post("/api/auth/signup", data={"email": f"u{cookie or 'none'}@itqan.test",
+                                          "password": "Str0ng!pass", "name": "U"})
+
+    assert store.user_by_email(f"u{cookie or 'none'}@itqan.test")["locale"] == expected
+
+
+def test_the_email_is_english_for_an_english_account(client, store, relay):
+    """Asserted on the DECODED body: a non-ASCII message arrives base64-encoded,
+    so a naive substring check would pass on anything at all."""
+    client.cookies.set("itqan_locale", "en")
+    client.post("/api/auth/signup", data={"email": "en@itqan.test",
+                                          "password": "Str0ng!pass", "name": "E"})
+    client.post("/api/auth/forgot-password", data={"email": "en@itqan.test"})
+    _wait_for_mail(relay)
+
+    assert "Reset your Itqan password" == relay[-1]["subject"]
+    assert "Open this link to choose a new one" in relay[-1]["body"]
+    assert "/en/forgot-password/" in relay[-1]["body"]
+
+
+def test_an_arabic_account_still_gets_arabic(client, store, relay):
+    """The account's stated preference wins. Silently switching someone who chose
+    Arabic into English would be the same class of mistake in the other
+    direction."""
+    client.cookies.set("itqan_locale", "ar")
+    client.post("/api/auth/signup", data={"email": "ar@itqan.test",
+                                          "password": "Str0ng!pass", "name": "A"})
+    client.post("/api/auth/forgot-password", data={"email": "ar@itqan.test"})
+    _wait_for_mail(relay)
+
+    assert "إتقان" in relay[-1]["subject"]
+    assert "/ar/forgot-password/" in relay[-1]["body"]
+
+
+# ---------------------------------------------------------------------------
+# expiry
+# ---------------------------------------------------------------------------
+def test_the_link_lasts_ten_minutes(signed_in, client, store, relay):
+    """The number in the email comes from the same constant as the database
+    expiry, so the sentence cannot drift from the behaviour."""
+    from shared.config import Config
+    assert Config().reset_token_minutes == 10
+
+    _forgot(client)
+    _wait_for_mail(relay)
+    assert "10 minutes" in relay[-1]["body"]
+
+    with store.connect().cursor() as cur:
+        cur.execute("SELECT expires_at - created_at AS life FROM app_password_resets")
+        life = cur.fetchone()["life"]
+    assert 9 * 60 <= life.total_seconds() <= 11 * 60
+
+
+def test_a_token_is_dead_at_eleven_minutes(signed_in, client, store, relay):
+    _forgot(client)
+    _wait_for_mail(relay)
+    token = _token_from(relay)
+    with store.connect().cursor() as cur:
+        cur.execute("UPDATE app_password_resets "
+                    "SET created_at = now() - interval '11 minutes', "
+                    "    expires_at = now() - interval '1 minute'")
+
+    assert client.post("/api/auth/reset-password",
+                       data={"token": token, "password": GOOD}).status_code == 410
+
+
 def test_a_dead_relay_still_answers_200_and_logs_it(signed_in, client, monkeypatch, caplog):
     """The one failure the user cannot be told about, so the operator must be."""
     import api.email as email_module
