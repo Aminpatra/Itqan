@@ -32,8 +32,8 @@ from shared.config import Config                # noqa: E402
 # limit is exhausted, and every later test quietly receives no email — which is
 # exactly how it failed the first time, as fifteen unrelated assertions.
 _APP_TABLES = ("app_assistant_messages", "app_assistant_usage", "app_reset_throttle",
-               "app_password_resets", "app_profiles", "app_onboarding_progress",
-               "app_runs", "app_documents", "app_users")
+               "app_password_resets", "app_email_verifications", "app_profiles",
+               "app_onboarding_progress", "app_runs", "app_documents", "app_users")
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: ARG001
@@ -230,10 +230,38 @@ def client(dsn: str, store: AppStore, runner: FakeRunner,
 
 
 @pytest.fixture
-def signed_in(client: TestClient) -> TestClient:
-    """A registered, signed-in client — the state every app route requires."""
+def unverified(client: TestClient) -> TestClient:
+    """Registered and signed in, but the address is not proved yet.
+
+    The state a person is in for the seconds or minutes between submitting the
+    signup form and typing the code out of their inbox. Onboarding refuses this
+    client, which is the whole point of the gate — see
+    `tests/api/test_email_verification.py`.
+    """
     res = client.post("/api/placeholder/signup",
                       data={"email": "maryam@itqan.test", "password": "Str0ng!pass",
                             "name": "Maryam Al Balushi"})
     assert res.status_code == 200, res.text
     return client
+
+
+@pytest.fixture
+def signed_in(unverified: TestClient, store: AppStore) -> TestClient:
+    """A registered, signed-in, VERIFIED client — the state every app route requires.
+
+    Verified deliberately, and it is worth saying why rather than leaving the
+    line looking like setup noise: signup now leaves an account unverified, and
+    `require_verified_user` refuses uploads, analysis and profile writes until a
+    code is accepted. Left unverified, this fixture would make dozens of tests
+    about entirely unrelated things fail with 403 — and the new gate would look
+    like it had broken the suite rather than like it was working.
+
+    So this fixture represents the ordinary post-verification state, and the gate
+    gets its own tests through `unverified` above. The flag is set directly
+    instead of by posting a code, because these tests are not about verification
+    and should not break when its wire format changes.
+    """
+    row = store.user_by_email("maryam@itqan.test")
+    assert row is not None
+    store.mark_email_verified(row["user_id"])
+    return unverified

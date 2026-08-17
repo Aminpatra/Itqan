@@ -85,7 +85,7 @@ def test_email_comes_from_the_account_not_the_extraction(signed_in):
     assert signed_in.get("/api/profile").json()["email"] == "maryam@itqan.test"
 
 
-def test_documents_are_listed_and_scoped_to_the_owner(signed_in, client):
+def test_documents_are_listed_and_scoped_to_the_owner(signed_in, client, store):
     signed_in.post("/api/documents", files={"file": ("cv.txt", b"a real cv", "text/plain")},
                    data={"kind": "cv"})
     signed_in.post("/api/profile", json=CONFIRMED)
@@ -98,6 +98,11 @@ def test_documents_are_listed_and_scoped_to_the_owner(signed_in, client):
     client.post("/api/logout")
     client.post("/api/auth/signup", data={"email": "other@itqan.test",
                                           "password": "Str0ng!pass", "name": "Other"})
+    # Verified before it confirms anything: a fresh signup is unverified, and
+    # `POST /api/profile` refuses an unverified account with 403 — which would
+    # make this pass for the wrong reason, reading an empty list off a profile
+    # that was never written rather than off one correctly scoped to its owner.
+    store.mark_email_verified(store.user_by_email("other@itqan.test")["user_id"])
     client.post("/api/profile", json=CONFIRMED)
     assert client.get("/api/profile").json()["documents"] == []
 

@@ -155,7 +155,8 @@ class AppStore:
         no photo at all.
         """
         return self._one(
-            "SELECT user_id, email, full_name, locale, onboarded, avatar_path, session_epoch "
+            "SELECT user_id, email, full_name, locale, onboarded, avatar_path, session_epoch, "
+            "       email_verified_at "
             "FROM app_users WHERE user_id = %s",
             (user_id,))
 
@@ -388,6 +389,12 @@ class AppStore:
         count and then incrementing it is a race, and here losing it means an
         inbox gets flooded.
 
+        Shared by two callers now — password reset (`email` / `ip`) and
+        verification resend (`verify_user` / `verify_ip`) — which is why the
+        kinds are distinct rather than reused. A person asking twice for a
+        verification code must not thereby spend a password-reset attempt they
+        may need later.
+
         `subject_hash` is a hash and must stay one — see the migration. The
         period is truncated to the hour in SQL rather than in Python so that two
         processes with different clocks still agree on which bucket they are in.
@@ -403,6 +410,86 @@ class AppStore:
             "RETURNING used",
             (subject_hash, kind, limit))
         return row is not None
+
+    # --- email verification -------------------------------------------------
+    def issue_verification(self, *, user_id: str, code_hash: str, minutes: int) -> None:
+        """Store a new code, replacing any outstanding one for this account.
+
+        The upsert is the point. One row per user means a resend genuinely starts
+        over — new hash, new expiry, and `attempts` and `consumed_at` reset — so
+        the code in the newest email is the only one that works and an older
+        message becomes inert the moment a replacement is sent.
+
+        Resetting `attempts` here is safe precisely because a resend is rate
+        limited: without that limit this would be the way to buy unlimited
+        guesses, five at a time.
+        """
+        self._exec(
+            """
+            INSERT INTO app_email_verifications (user_id, code_hash, expires_at)
+            VALUES (%s, %s, now() + make_interval(mins => %s))
+            ON CONFLICT (user_id) DO UPDATE
+               SET code_hash   = EXCLUDED.code_hash,
+                   created_at  = now(),
+                   expires_at  = EXCLUDED.expires_at,
+                   attempts    = 0,
+                   consumed_at = NULL
+            """,
+            (user_id, code_hash, minutes))
+
+    def claim_verification_attempt(self, user_id: str,
+                                   *, max_attempts: int) -> Optional[dict[str, Any]]:
+        """Spend one attempt and return the stored hash, or None if none is left.
+
+        **The increment and the read are one statement, and that is the whole
+        control.** Reading the code, comparing it in Python and then recording
+        the failure leaves a window where many concurrent guesses all observe
+        `attempts = 4` and all proceed — which turns a limit of five into a limit
+        of however many requests fit in that window. `attempts < %s` inside the
+        UPDATE closes it, the same way `consume_password_reset` and `claim_quota`
+        close theirs.
+
+        Note the caller is charged for the attempt BEFORE the comparison, so a
+        correct code also costs one. That is deliberate: deciding whether to
+        charge based on the answer means the row is written after the comparison,
+        which is exactly the race this avoids. It costs a correct caller nothing
+        — the code is consumed on success anyway.
+
+        None covers every dead end — no code, expired, already used, out of
+        attempts — because the route answers all four identically: this code is
+        over, ask for another.
+        """
+        return self._one(
+            """
+            UPDATE app_email_verifications SET attempts = attempts + 1
+             WHERE user_id = %s
+               AND consumed_at IS NULL
+               AND expires_at > now()
+               AND attempts < %s
+            RETURNING code_hash, attempts
+            """,
+            (user_id, max_attempts))
+
+    def consume_verification(self, user_id: str) -> None:
+        """Mark the code spent. Idempotent, unlike a reset token.
+
+        Verifying an address twice has no effect worth preventing, so this needs
+        none of the guarding `consume_password_reset` does — where a second use
+        would be a second password change.
+        """
+        self._exec(
+            "UPDATE app_email_verifications SET consumed_at = now() "
+            " WHERE user_id = %s AND consumed_at IS NULL",
+            (user_id,))
+
+    def mark_email_verified(self, user_id: str) -> None:
+        """Set the flag every gated route reads. Idempotent: `IS NULL` keeps the
+        FIRST verification time rather than moving it on a repeat, so the column
+        stays an answer to 'when did they prove this address'."""
+        self._exec(
+            "UPDATE app_users SET email_verified_at = now() "
+            " WHERE user_id = %s AND email_verified_at IS NULL",
+            (user_id,))
 
     def set_password(self, user_id: str, password_hash: str) -> None:
         self._exec("UPDATE app_users SET password_hash = %s WHERE user_id = %s",

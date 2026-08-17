@@ -40,18 +40,43 @@ def _forgot(client, email=EMAIL):
     return client.post("/api/auth/forgot-password", data={"email": email})
 
 
+def _reset_mails(sent: list[dict]) -> list[dict]:
+    """Only the reset messages.
+
+    Two kinds of mail now leave this system, and `signed_in` sends the other one:
+    creating an account mails a verification code. So `sent[-1]` stopped meaning
+    "the reset email" — and worse, it stopped meaning it INTERMITTENTLY, because
+    the send is on a background thread and its position in the list is a race.
+    Selecting by content is what makes these assertions about the reset flow
+    again rather than about thread scheduling.
+    """
+    return [m for m in sent if "token=" in m.get("body", "")]
+
+
+def _reset_mail(sent: list[dict]) -> dict:
+    mails = _reset_mails(sent)
+    assert mails, "no password-reset email was sent"
+    return mails[-1]
+
+
 def _token_from(sent: list[dict]) -> str:
     """Pull the token out of the delivered link, the way a person would."""
-    assert sent, "no email was sent"
-    body = sent[-1]["body"]
+    body = _reset_mail(sent)["body"]
     return body.split("token=")[1].split()[0].strip()
 
 
 def _wait_for_mail(sent: list[dict], count: int = 1) -> None:
-    """The send is on a background thread, so poll for it as the relay would."""
+    """Wait for `count` RESET messages. The send is on a background thread.
+
+    Counting reset mails rather than all mail, for the same reason `_reset_mail`
+    selects by content: `signed_in` now also sends a verification code, so a bare
+    `len(sent) >= 2` could be satisfied by one verification plus one reset — and
+    the caller would read the FIRST token twice, believing it had waited for the
+    second. That failure would have appeared as a flake in a test about tokens.
+    """
     import time
     deadline = time.time() + 3.0
-    while time.time() < deadline and len(sent) < count:
+    while time.time() < deadline and len(_reset_mails(sent)) < count:
         time.sleep(0.02)
 
 
@@ -92,7 +117,7 @@ def test_being_rate_limited_looks_exactly_like_success(signed_in, client, relay)
     assert fourth.status_code == 200 and fourth.json() == {"ok": True}
     import time
     time.sleep(0.2)
-    assert len(relay) == 3, "a 4th email was sent past the hourly limit"
+    assert len(_reset_mails(relay)) == 3, "a 4th email was sent past the hourly limit"
 
 
 def test_the_raw_token_is_never_stored(signed_in, client, store, relay):
@@ -284,7 +309,7 @@ def test_the_link_matches_the_contract_and_carries_the_locale(signed_in, client,
     _forgot(client)
     _wait_for_mail(relay)
 
-    body = relay[-1]["body"]
+    body = _reset_mail(relay)["body"]
     assert "/forgot-password/?token=" in body
     assert "/ar/" in body or "/en/" in body
 
@@ -324,9 +349,9 @@ def test_the_email_is_english_for_an_english_account(client, store, relay):
     client.post("/api/auth/forgot-password", data={"email": "en@itqan.test"})
     _wait_for_mail(relay)
 
-    assert "Reset your Itqan password" == relay[-1]["subject"]
-    assert "Open this link to choose a new one" in relay[-1]["body"]
-    assert "/en/forgot-password/" in relay[-1]["body"]
+    assert "Reset your Itqan password" == _reset_mail(relay)["subject"]
+    assert "Open this link to choose a new one" in _reset_mail(relay)["body"]
+    assert "/en/forgot-password/" in _reset_mail(relay)["body"]
 
 
 def test_an_arabic_account_still_gets_arabic(client, store, relay):
@@ -339,8 +364,8 @@ def test_an_arabic_account_still_gets_arabic(client, store, relay):
     client.post("/api/auth/forgot-password", data={"email": "ar@itqan.test"})
     _wait_for_mail(relay)
 
-    assert "إتقان" in relay[-1]["subject"]
-    assert "/ar/forgot-password/" in relay[-1]["body"]
+    assert "إتقان" in _reset_mail(relay)["subject"]
+    assert "/ar/forgot-password/" in _reset_mail(relay)["body"]
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +379,7 @@ def test_the_link_lasts_ten_minutes(signed_in, client, store, relay):
 
     _forgot(client)
     _wait_for_mail(relay)
-    assert "10 minutes" in relay[-1]["body"]
+    assert "10 minutes" in _reset_mail(relay)["body"]
 
     with store.connect().cursor() as cur:
         cur.execute("SELECT expires_at - created_at AS life FROM app_password_resets")

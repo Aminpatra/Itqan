@@ -81,6 +81,28 @@ def password_problems(password: str) -> list[str]:
     return [why for ok, why in _PW_RULES if not ok(password)]
 
 
+def _new_code(digits: int) -> str:
+    """A zero-padded numeric code from the system CSPRNG.
+
+    `secrets.randbelow`, not `random`: the module that seeds itself from the
+    clock is fine for shuffling and is a credential generator that can be
+    predicted. Zero-padded because a code is a fixed-width string to the person
+    typing it — dropping a leading zero would silently make one code in ten
+    shorter than the field expects.
+    """
+    return str(secrets.randbelow(10 ** digits)).zfill(digits)
+
+
+def verify_path(locale: str) -> str:
+    """Where an unverified person is sent. Same origin, so a relative path.
+
+    Site-owned, like the forgot-password page: the marketing site holds the auth
+    screens and the app holds the product.
+    """
+    lang = locale if locale in ("ar", "en") else "en"
+    return f"/{lang}/verify-email/"
+
+
 def create_app(config: Optional[Config] = None, *,
                store: Optional[AppStore] = None,
                runner: Optional[jobs_module.PipelineRunner] = None,
@@ -141,16 +163,51 @@ def create_app(config: Optional[Config] = None, *,
             raise _Unauthorized()
         return user
 
+    def require_verified_user(request: Request) -> dict[str, Any]:
+        """Signed in AND has proved the address. The gate, in one place.
+
+        **This is what actually enforces verification.** The site redirects an
+        unverified person to the code page and the app's route guards send them
+        there too, but both are navigation: a request made with `curl`, or by a
+        stale build deployed before this one, never sees either. Only a route
+        that refuses can be relied on, which is the same reason `require_user`
+        exists rather than trusting the app not to render a signed-out screen.
+
+        Applied to the routes that ADVANCE onboarding, not to the reads. An
+        unverified account has no completed run, so `/api/dashboard` and friends
+        already answer 404 — gating them too would add a second failure mode
+        without taking away a single capability.
+        """
+        user = require_user(request)
+        if not user.get("email_verified_at"):
+            raise _Unverified()
+        return user
+
     class _Unauthorized(Exception):
+        pass
+
+    class _Unverified(Exception):
         pass
 
     @app.exception_handler(_Unauthorized)
     async def _unauth(_request: Request, _exc: _Unauthorized) -> JSONResponse:
         return JSONResponse({"error": "no_session"}, status_code=401)
 
+    @app.exception_handler(_Unverified)
+    async def _unverified(request: Request, _exc: _Unverified) -> JSONResponse:
+        # 403, not 401: they ARE signed in, and answering 401 would make the app
+        # bounce them to the login page they just came from — a loop, and a
+        # confusing one, since logging in again changes nothing.
+        # `verifyUrl` travels with it so the client does not have to reconstruct
+        # a route the site owns.
+        return JSONResponse({"error": "email_unverified",
+                             "verifyUrl": verify_path(_locale_of(request))},
+                            status_code=403)
+
     def public_user(row: dict[str, Any]) -> dict[str, Any]:
         return {"id": row["user_id"], "fullName": row["full_name"],
-                "email": row["email"], "onboarded": bool(row["onboarded"])}
+                "email": row["email"], "onboarded": bool(row["onboarded"]),
+                "emailVerified": row.get("email_verified_at") is not None}
 
     def set_session(response: Response, user_id: str, locale: str,
                     epoch: int = 0) -> None:
@@ -198,7 +255,31 @@ def create_app(config: Optional[Config] = None, *,
         user = store.create_user(email=email, full_name=name, password=password,
                                  locale=_locale_of(request))
         set_session(response, user["user_id"], user["locale"])
-        return {"ok": True}
+        # Signed in, but NOT verified: the session is what lets them ask for a
+        # new code without this endpoint ever having to accept a bare email
+        # address from an anonymous caller — which is the enumeration and
+        # mail-bombing surface forgot-password had to be built around.
+        _send_verification(user_id=user["user_id"], email=user["email"],
+                           locale=user["locale"])
+        return {"ok": True, "verifyUrl": verify_path(user["locale"])}
+
+    def _send_verification(*, user_id: str, email: str, locale: str) -> None:
+        """Mint a code, store its hash, mail the code. Used by signup and resend.
+
+        The code exists as a string in this function and in the message it is
+        formatted into. It is not returned, not logged and not stored — the store
+        receives `sha256(code)`, and a caller wanting to know what was sent has to
+        read the person's inbox, which is the point.
+        """
+        store: AppStore = app.state.store
+        config: Config = app.state.config
+        code = _new_code(config.verification_code_digits)
+        store.issue_verification(user_id=user_id, code_hash=_sha256(code),
+                                 minutes=config.verification_code_minutes)
+        subject, body = email_module.verification_message(
+            code=code, locale=locale, minutes=config.verification_code_minutes)
+        email_module.send_in_background(to=email, subject=subject, body=body,
+                                        config=config, purpose="verification")
 
     @app.post("/api/auth/login")
     @app.post("/api/placeholder/login")    # alias — see the note below
@@ -213,6 +294,91 @@ def create_app(config: Optional[Config] = None, *,
         set_session(response, row["user_id"], row["locale"],
                     int(row.get("session_epoch") or 0))
         return {"ok": True}
+
+    # ---- email verification ------------------------------------------------
+    @app.post("/api/auth/verify-email")
+    async def verify_email(request: Request, code: str = Form("")) -> Any:
+        """Spend one attempt against the outstanding code.
+
+        `Form("")` rather than `Form(...)` for the same reason the reset route
+        uses it: an empty field must reach THIS handler and get an answer it can
+        act on, not FastAPI's own 422 describing a malformed request.
+
+        **422 for a wrong code**, carrying the attempts left. Telling them costs
+        nothing — it is their own account and their own code — and not telling
+        them means the fifth failure looks identical to the first, right up until
+        the code silently dies.
+
+        **410 for a code that is over** — expired, already used, or out of
+        attempts. All three end the same way, with a new code, and the page shows
+        one panel for that outcome. It is also the only honest answer available:
+        once the attempt limit is spent we deliberately stop comparing, so we do
+        not know whether what they typed was right.
+        """
+        user = require_user(request)
+        store: AppStore = app.state.store
+        config: Config = app.state.config
+
+        if user.get("email_verified_at"):
+            # Already done — the tab was left open, or a second submit landed.
+            # 200, because the state they wanted is the state that holds.
+            return {"ok": True, "alreadyVerified": True}
+
+        row = store.claim_verification_attempt(
+            user["user_id"], max_attempts=config.verification_max_attempts)
+        if row is None:
+            return JSONResponse({"error": "code_expired"}, status_code=410)
+
+        import hmac
+        # Constant-time, though the realistic attack here is guessing rather than
+        # timing. It costs one call, and the alternative is a comparison whose
+        # duration depends on how many leading digits were right.
+        if not hmac.compare_digest(row["code_hash"], _sha256(code.strip())):
+            remaining = max(0, config.verification_max_attempts - int(row["attempts"]))
+            if remaining == 0:
+                # That was the last one. Say so with the code-is-over answer
+                # rather than a wrong-code answer, so the page offers a new code
+                # instead of inviting a sixth try that cannot succeed.
+                return JSONResponse({"error": "code_expired"}, status_code=410)
+            return JSONResponse({"error": "invalid_code", "attemptsRemaining": remaining},
+                                status_code=422)
+
+        store.mark_email_verified(user["user_id"])
+        store.consume_verification(user["user_id"])
+        return {"ok": True}
+
+    @app.post("/api/auth/resend-verification")
+    async def resend_verification(request: Request) -> Any:
+        """A new code, replacing the previous one.
+
+        Always 200, including when rate limited: a throttled resend and a sent
+        one look identical, so hammering the button tells the person nothing they
+        could use and shows them the same "it is on its way" either way.
+
+        Requires a session, so unlike forgot-password there is no address to
+        enumerate and no stranger's inbox to aim at. The limits below bound a
+        user hammering their own mailbox, and — per IP — one attacker doing it
+        from many accounts, which the per-user limit cannot see.
+        """
+        user = require_user(request)
+        config: Config = app.state.config
+        store: AppStore = app.state.store
+        same_answer: Any = {"ok": True}
+
+        if user.get("email_verified_at"):
+            return same_answer
+
+        client_ip = request.client.host if request.client else "unknown"
+        if not store.claim_reset_slot(_sha256(user["user_id"]), kind="verify_user",
+                                      limit=config.verification_resends_per_user_hour):
+            return same_answer
+        if not store.claim_reset_slot(_sha256(client_ip), kind="verify_ip",
+                                      limit=config.verification_resends_per_ip_hour):
+            return same_answer
+
+        _send_verification(user_id=user["user_id"], email=user["email"],
+                           locale=user.get("locale") or _locale_of(request))
+        return same_answer
 
     # ---- password recovery -------------------------------------------------
     @app.post("/api/auth/forgot-password")
@@ -330,8 +496,17 @@ def create_app(config: Optional[Config] = None, *,
         token `/api/session` accepts is the cross-origin version of this, for when
         the site and app are on different domains.
         """
-        signed_in = bool(current_user(request))
-        return RedirectResponse("/app/" if signed_in else "/", status_code=302)
+        user = current_user(request)
+        if user is None:
+            return RedirectResponse("/", status_code=302)
+        # Registered but unproved: the code page, not the app. Caught here as
+        # well as in the app's own guards because the site is static — its built
+        # HTML sends a new signup wherever it was compiled to, and a build made
+        # before this change points straight at /app/.
+        if not user.get("email_verified_at"):
+            return RedirectResponse(verify_path(user.get("locale") or _locale_of(request)),
+                                    status_code=302)
+        return RedirectResponse("/app/", status_code=302)
 
     @app.get("/api/session")
     async def session(request: Request) -> Any:
@@ -353,7 +528,7 @@ def create_app(config: Optional[Config] = None, *,
     @app.post("/api/documents")
     async def upload(request: Request, file: UploadFile = File(...),
                      kind: str = Form("other")) -> Any:
-        user = require_user(request)
+        user = require_verified_user(request)
         if kind not in DOCUMENT_KINDS:
             return JSONResponse({"error": "invalid_input"}, status_code=400)
 
@@ -380,7 +555,7 @@ def create_app(config: Optional[Config] = None, *,
     # ---- analysis: async job, real stage-driven progress -------------------
     @app.post("/api/analysis")
     async def start_analysis(request: Request) -> Any:
-        user = require_user(request)
+        user = require_verified_user(request)
         body = await request.json()
         # camelCase, as `http.ts` sends it.
         ids = body.get("documentIds") or []
@@ -427,7 +602,7 @@ def create_app(config: Optional[Config] = None, *,
 
     @app.put("/api/onboarding/progress")
     async def put_progress(request: Request) -> Any:
-        user = require_user(request)
+        user = require_verified_user(request)
         app.state.store.put_progress(user["user_id"], await request.json())
         return {"ok": True}
 
@@ -448,7 +623,7 @@ def create_app(config: Optional[Config] = None, *,
         had already run, which made them decorative. Starting phase two from here
         is what makes them inputs.
         """
-        user = require_user(request)
+        user = require_verified_user(request)
         payload = await request.json()
         awaiting = app.state.store.awaiting_run(user["user_id"])
         latest = app.state.store.latest_completed_run(user["user_id"])
@@ -522,7 +697,7 @@ def create_app(config: Optional[Config] = None, *,
         dashboard under the user — which is why it is a separate route and has
         its own test rather than a comment.
         """
-        user = require_user(request)
+        user = require_verified_user(request)
         payload = await request.json()
         store: AppStore = app.state.store
         # Keep the run this profile already belonged to; an edit does not re-bind
@@ -535,7 +710,7 @@ def create_app(config: Optional[Config] = None, *,
     async def upload_avatar(request: Request, file: UploadFile = File(...)) -> Any:
         """Return the URL; never accept one. The server owns storage, so a client
         can never point this at a path it chose."""
-        user = require_user(request)
+        user = require_verified_user(request)
         try:
             path = avatars.store_avatar(user["user_id"], await file.read(),
                                         config=app.state.config)

@@ -391,6 +391,34 @@ class Config:
     reset_requests_per_ip_hour: int = 10
 
     # ------------------------------------------------------------------
+    # Email verification at signup (user decisions, 2026-08-17)
+    # ------------------------------------------------------------------
+    # Six digits is a million combinations, which is not a lot, and it is worth
+    # being clear about what carries the weight here: NOT the length, and not the
+    # sha256 the code is stored under. It is `verification_max_attempts`. Five
+    # wrong answers kill the code, so guessing is capped at 5 in 1,000,000 per
+    # issued code, and a resend replaces the code rather than granting a fresh
+    # allowance against the old one.
+    #
+    # Six rather than eight because the limit already makes brute force
+    # impractical, and every extra digit is real friction for someone reading a
+    # code off one device and typing it into another.
+    verification_code_digits: int = 6
+
+    # The same ten minutes the reset link uses, so the two flows expire alike and
+    # the email copy cannot drift apart from the code that enforces it.
+    verification_code_minutes: int = 10
+    verification_max_attempts: int = 5
+
+    # Resends are bounded like every other outbound-mail path. Looser than the
+    # reset limits because this endpoint requires a SESSION — it cannot be aimed
+    # at a stranger's inbox, so the risk it bounds is a user hammering their own,
+    # not a bombing vector. Per IP as well, since one attacker with many accounts
+    # is the case the per-user limit cannot see.
+    verification_resends_per_user_hour: int = 5
+    verification_resends_per_ip_hour: int = 20
+
+    # ------------------------------------------------------------------
     # Agent S — the assistant over a user's own results
     # ------------------------------------------------------------------
     # DECISIONS, not measurements (user, 2026-08-15), and labelled that way
