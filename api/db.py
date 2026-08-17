@@ -437,6 +437,37 @@ class AppStore:
             """,
             (user_id, code_hash, minutes))
 
+    def verification_state(self, user_id: str) -> dict[str, Any]:
+        """How long the outstanding code has left, and how many tries remain.
+
+        **The subtraction happens in SQL, against `now()`** — the same clock
+        `claim_verification_attempt` compares `expires_at` to. Computing it in
+        Python would let the API container and Postgres disagree, and the timer
+        would then count down to a moment other than the one the code actually
+        dies at.
+
+        `GREATEST(0, …)` is not tidiness: the expression goes negative the
+        instant the code expires, and a negative count reaches the page as a
+        timer reading `-1:-13`.
+
+        Absent, spent or expired all report zero seconds. The caller does not
+        need to tell them apart — all three mean "there is nothing to count down
+        to, ask for a new code".
+        """
+        row = self._one(
+            """
+            SELECT GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now()))::int) AS seconds_remaining,
+                   attempts,
+                   consumed_at
+              FROM app_email_verifications
+             WHERE user_id = %s
+            """,
+            (user_id,))
+        if row is None or row["consumed_at"] is not None:
+            return {"seconds_remaining": 0, "attempts": 0}
+        return {"seconds_remaining": int(row["seconds_remaining"]),
+                "attempts": int(row["attempts"])}
+
     def claim_verification_attempt(self, user_id: str,
                                    *, max_attempts: int) -> Optional[dict[str, Any]]:
         """Spend one attempt and return the stored hash, or None if none is left.

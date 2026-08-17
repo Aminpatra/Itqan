@@ -296,6 +296,41 @@ def create_app(config: Optional[Config] = None, *,
         return {"ok": True}
 
     # ---- email verification ------------------------------------------------
+    @app.get("/api/auth/verification")
+    async def verification_status(request: Request) -> Any:
+        """How long the code has left, so the page can show a countdown.
+
+        The page cannot work this out for itself, and the tempting version is
+        wrong: a timer started when the page loads restarts at the full ten
+        minutes after every reload, while the code was issued back at SIGNUP. It
+        would show four minutes remaining on a code the server has already
+        killed — a number nobody computed, presented as fact.
+
+        Seconds rather than an absolute timestamp, deliberately. A timestamp
+        makes the countdown only as accurate as the device's clock, and a phone
+        with a skewed clock would render a confidently wrong number. The server
+        owns the clock, so the server does the subtraction.
+
+        This is a DISPLAY value and never a decision. Nothing here rejects a late
+        code — `claim_verification_attempt`'s `expires_at > now()` does that, and
+        it must stay that way: a client that decided expiry could be persuaded
+        not to.
+        """
+        user = require_user(request)
+        config: Config = app.state.config
+        if user.get("email_verified_at"):
+            return {"verified": True, "secondsRemaining": 0, "attemptsRemaining": 0}
+
+        state = app.state.store.verification_state(user["user_id"])
+        return {
+            "verified": False,
+            "secondsRemaining": state["seconds_remaining"],
+            # Carried because it comes free from the same row, and it closes a
+            # small gap: reload the page today and "3 attempts left" is
+            # forgotten by the browser while the server still remembers.
+            "attemptsRemaining": max(0, config.verification_max_attempts - state["attempts"]),
+        }
+
     @app.post("/api/auth/verify-email")
     async def verify_email(request: Request, code: str = Form("")) -> Any:
         """Spend one attempt against the outstanding code.

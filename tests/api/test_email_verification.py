@@ -186,6 +186,79 @@ def test_a_verified_account_resending_sends_nothing(unverified, relay):
 
 
 # ---------------------------------------------------------------------------
+# the countdown the page shows
+# ---------------------------------------------------------------------------
+def _status(client):
+    return client.get("/api/auth/verification").json()
+
+
+def test_a_fresh_code_reports_close_to_ten_minutes(unverified, relay):
+    _code_from(relay)
+    state = _status(unverified)
+    assert state["verified"] is False
+    assert 570 <= state["secondsRemaining"] <= 600, state
+    assert state["attemptsRemaining"] == 5
+
+
+def test_the_countdown_comes_from_the_row_and_not_from_a_constant(unverified, relay, store):
+    """THE test. A timer started when the page loads restarts at ten minutes
+    after every reload, while the code was issued at signup — so it would show
+    minutes remaining on a code the server has already killed.
+
+    Ageing the row must move this number. If it does not, the endpoint is
+    returning a constant and the page is lying with extra steps.
+    """
+    _code_from(relay)
+    row = store.user_by_email(EMAIL)
+    store._exec("UPDATE app_email_verifications "
+                "   SET expires_at = expires_at - interval '7 minutes' "
+                " WHERE user_id = %s", (row["user_id"],))
+
+    assert 120 <= _status(unverified)["secondsRemaining"] <= 180
+
+
+def test_an_expired_code_reports_zero_and_never_a_negative(unverified, relay, store):
+    """Past the expiry the raw subtraction goes negative, and a negative count
+    reaches the page as a timer reading `-1:-13`."""
+    _code_from(relay)
+    row = store.user_by_email(EMAIL)
+    store._exec("UPDATE app_email_verifications "
+                "   SET expires_at = now() - interval '5 minutes' "
+                " WHERE user_id = %s", (row["user_id"],))
+
+    assert _status(unverified)["secondsRemaining"] == 0
+
+
+def test_a_spent_code_reports_zero(unverified, relay):
+    _verify(unverified, _code_from(relay))
+    state = _status(unverified)
+    assert state["verified"] is True and state["secondsRemaining"] == 0
+
+
+def test_a_resend_restarts_the_countdown(unverified, relay, store):
+    _code_from(relay)
+    row = store.user_by_email(EMAIL)
+    store._exec("UPDATE app_email_verifications "
+                "   SET expires_at = expires_at - interval '8 minutes' "
+                " WHERE user_id = %s", (row["user_id"],))
+    assert _status(unverified)["secondsRemaining"] < 180
+
+    unverified.post("/api/auth/resend-verification")
+    assert _status(unverified)["secondsRemaining"] > 500, "a new code kept the old window"
+
+
+def test_attempts_remaining_survives_a_reload(unverified, relay):
+    """The browser forgets the wrong-code message; the server does not."""
+    _code_from(relay)
+    _verify(unverified, "000000")
+    assert _status(unverified)["attemptsRemaining"] == 4
+
+
+def test_the_countdown_needs_a_session(client):
+    assert client.get("/api/auth/verification").status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # the gate
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("method,path,kwargs", [
