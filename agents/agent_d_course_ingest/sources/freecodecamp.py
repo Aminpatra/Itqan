@@ -30,6 +30,8 @@ import json
 import re
 from urllib.parse import urlsplit
 
+import httpx
+
 from shared.config import Config
 from shared.scraping.http import Blocked, PoliteClient, ResponseTooLarge, SourcePolicy
 from shared.scraping.robots import RobotsPolicy
@@ -121,6 +123,23 @@ class FreeCodeCampAdapter(BaseAdapter):
                 # still distinguishable from an empty one.
                 result.skipped += 1
                 continue
+
+            # Does this certification actually EXIST as a page?
+            #
+            # The check whose absence let 1,353 dead links ship: this adapter
+            # counted rows and never once asked whether a link worked. Measured
+            # 2026-08-16, `/learn/daily-coding-challenge` is a 404 — it is a
+            # curriculum grouping with no `intro`, and it became a row only
+            # because the description fell back to listing its one block title.
+            #
+            # 98 requests cover all ~1,451 rows, because a block's URL is now a
+            # FRAGMENT of its certification's: the certification resolving is
+            # exactly the condition for the block resolving. So one check per
+            # superblock validates the superblock and everything inside it.
+            if not self._resolves(client, course.source_url, result):
+                result.skipped += 1
+                continue
+
             if not (self._is_known_unchanged and self._is_known_unchanged(course)):
                 result.courses.append(course)
                 if limit is not None and len(result.courses) >= limit:
@@ -143,6 +162,25 @@ class FreeCodeCampAdapter(BaseAdapter):
             # things teach this", which is defensible — but the demand-vs-supply
             # join reads differently, so it wants a before/after rather than a
             # shrug.
+            # A block's server-visible URL is NOT the one checked above.
+            #
+            # The certification row carries `/learn/<slug>`; a block carries
+            # `/learn/<slug>/#<key>`, whose fragment never reaches the server —
+            # so what the server actually sees is `/learn/<slug>/`, WITH the
+            # trailing slash. Those are two different strings to a server, and
+            # verifying one is not verifying the other.
+            #
+            # Measured 2026-08-17: all 98 of both forms answer 200, so no stored
+            # row is wrong today. It is checked anyway because blocks are 1,352 of
+            # this source's 1,450 rows: trusting that a trailing slash "obviously"
+            # behaves the same is the identical assumption that shipped 1,353 dead
+            # links, and it would fail exactly as silently.
+            #
+            # Costs one extra request per certification per three-day cycle.
+            if not self._resolves(client, f"{LEARN_URL.format(slug=slug)}/", result):
+                result.skipped += 1
+                continue
+
             for block in self._blocks(slug, payload):
                 if self._is_known_unchanged and self._is_known_unchanged(block):
                     continue
@@ -187,6 +225,37 @@ class FreeCodeCampAdapter(BaseAdapter):
         )
 
 
+    def _resolves(self, client: PoliteClient, url: str, result: AdapterResult) -> bool:
+        """Does this URL answer? A definite 404 is the only reason to say no.
+
+        **A transport failure means KEEP the row**, and that asymmetry is
+        load-bearing. This source is `census=True`, which licenses staleness to
+        delete courses missing from a fetch — so reading a freeCodeCamp outage as
+        "these pages are gone" would let one bad afternoon prune the whole
+        source. Absence of proof is not proof of absence: the same rule
+        `RobotsPolicy` applies in the other direction when it fails closed.
+
+        A GET rather than a HEAD because `PoliteClient` only speaks `get_text`,
+        and a transport that cannot be reached through the polite client is not
+        worth reaching around — the interval, the identifying user agent and the
+        size cap all live in it. One request per certification, once per
+        three-day cycle.
+        """
+        try:
+            client.get_text(url)
+        except Blocked:
+            # 403/429 is the site declining to answer us, not the page being
+            # gone. Keep the row.
+            return True
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                result.dead_links += 1
+                return False
+            return True          # 500s and the rest: unproven
+        except Exception:        # noqa: BLE001 - timeout, DNS, reset
+            return True
+        return True
+
     def _blocks(self, superblock: str, payload: object) -> list[RawCourse]:
         """One course per block inside a certification.
 
@@ -213,9 +282,18 @@ class FreeCodeCampAdapter(BaseAdapter):
                 source=self.name,
                 source_group=self.source_group,
                 source_type=self.source_type,
-                # The block's own page, which is where a learner actually lands.
-                # Distinct from the superblock URL, so the id is distinct too.
-                source_url=f"{LEARN_URL.format(slug=superblock)}/{key}",
+                # A FRAGMENT of the certification's URL, not a page of its own.
+                # Measured 2026-08-16: `/learn/<cert>/<block>` is a 404 for every
+                # block — freeCodeCamp renders blocks inside the certification
+                # page, and the block slug is not even in the rendered markup.
+                # 1,353 rows shipped with a dead link before this was checked.
+                #
+                # The fragment never reaches the server, so this resolves 200 to
+                # the certification that genuinely contains the block. It is also
+                # what keeps `course_id` distinct: `sha(source, source_url)` over
+                # the bare certification URL would collapse every block of a
+                # certification into one row. Do not 'tidy' it away.
+                source_url=f"{LEARN_URL.format(slug=superblock)}/#{key}",
                 name=title,
                 raw_description=intro,
                 provider="freeCodeCamp",

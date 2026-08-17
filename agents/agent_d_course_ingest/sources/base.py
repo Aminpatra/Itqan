@@ -115,6 +115,10 @@ class AdapterResult:
     enriched: int = 0
     enrich_failed: int = 0
     enrich_unparsed: int = 0
+    # Courses dropped because their URL returned a definite 404. Counted
+    # rather than silently skipped: a sudden rise means the source moved
+    # its URL scheme, which is exactly how 1,353 dead links went unnoticed.
+    dead_links: int = 0
 
     @property
     def ok(self) -> bool:

@@ -16,6 +16,15 @@ ESCO/
 # cannot leak it.
 **/legitimacy_labels*.jsonl
 
+# Database dumps taken to move the corpus to the VPS. 26 MB gzipped for the four
+# course tables alone, and a full dump is 1.7 GB — neither belongs in git, and a
+# dump written to the repo root is one `git add -A` away from being committed.
+# Take them outside the working tree; this is the backstop for when they are not.
+# NOT a bare `*.sql`: migrations are tracked .sql files, and ignoring that
+# extension would silently drop the next one from a commit.
+*.sql.gz
+corpus.sql
+
 # Python
 __pycache__/
 *.py[cod]

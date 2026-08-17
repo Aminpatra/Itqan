@@ -137,10 +137,16 @@ def test_freecodecamp_curriculum_with_no_courses_fails_loudly():
 def test_freecodecamp_reads_its_whole_curriculum_so_it_is_a_census():
     """One file, read in full every cycle — which is what licenses this source to
     age (and eventually delete) a course that has genuinely been withdrawn."""
-    adapter = FreeCodeCampAdapter(client=FakeClient({"intro.json": fixture("freecodecamp_intro.json")}),
-                                  robots=AllowAllRobots(), config=Config())
+    # `/learn/` is mapped because the adapter fetches each certification URL to
+    # prove it resolves; FakeClient 404s anything unmapped, which that check
+    # would correctly read as "this page does not exist".
+    adapter = FreeCodeCampAdapter(
+        client=FakeClient({"intro.json": fixture("freecodecamp_intro.json"),
+                           "/learn/": "<html><body>a certification page</body></html>"}),
+        robots=AllowAllRobots(), config=Config())
     result = adapter.fetch()
     assert result.courses and result.may_age_inventory is True
+    assert result.dead_links == 0
 
 
 # ---------------------------------------------------------------------------

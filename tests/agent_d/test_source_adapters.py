@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from agents.agent_d_course_ingest.sources.coursera import CourseraAdapter
 from agents.agent_d_course_ingest.sources.freecodecamp import FreeCodeCampAdapter
+import httpx
+
 from shared.config import Config
 from tests.agent_d.fake_client import AllowAllRobots, FakeClient, fixture
 
@@ -65,7 +67,11 @@ def test_coursera_malformed_json_returns_errored_result():
 # freeCodeCamp (html_scrape)
 # ---------------------------------------------------------------------------
 def fcc():
-    client = FakeClient({"intro.json": fixture("freecodecamp_intro.json")})
+    # `/learn/` is mapped because the adapter now FETCHES each certification URL
+    # to prove it resolves. FakeClient raises a 404 for anything unmapped, which
+    # the check would — correctly — read as "this page does not exist".
+    client = FakeClient({"intro.json": fixture("freecodecamp_intro.json"),
+                         "/learn/": "<html><body>a certification page</body></html>"})
     return FreeCodeCampAdapter(client=client, robots=AllowAllRobots(), config=Config())
 
 
@@ -220,8 +226,9 @@ def test_blocks_are_emitted_as_courses_of_their_own():
     from tests.agent_d.fake_client import FakeClient, fixture
 
     result = FreeCodeCampAdapter(
-        client=FakeClient({"intro.json": fixture("freecodecamp_intro.json")}),
-        config=Config()).fetch()
+        client=FakeClient({"intro.json": fixture("freecodecamp_intro.json"),
+                           "/learn/": "<html><body>ok</body></html>"}),
+        robots=_AllowAll(), config=Config()).fetch()
 
     names = [c.name for c in result.courses]
     assert "Basic HTML and HTML5" in names
@@ -238,13 +245,16 @@ def test_a_certification_keeps_its_url_and_therefore_its_identity():
     from tests.agent_d.fake_client import FakeClient, fixture
 
     result = FreeCodeCampAdapter(
-        client=FakeClient({"intro.json": fixture("freecodecamp_intro.json")}),
-        config=Config()).fetch()
+        client=FakeClient({"intro.json": fixture("freecodecamp_intro.json"),
+                           "/learn/": "<html><body>ok</body></html>"}),
+        robots=_AllowAll(), config=Config()).fetch()
 
     urls = {c.source_url for c in result.courses}
     assert "https://www.freecodecamp.org/learn/responsive-web-design" in urls
-    # And each block hangs off it, so their ids are distinct from the parent's.
-    assert "https://www.freecodecamp.org/learn/responsive-web-design/basic-css" in urls
+    # A FRAGMENT of the certification's URL. `/learn/<cert>/<block>` is a 404 —
+    # measured, after 1,353 rows shipped pointing at one.
+    assert "https://www.freecodecamp.org/learn/responsive-web-design/#basic-css" in urls
+    assert "https://www.freecodecamp.org/learn/responsive-web-design/basic-css" not in urls
 
 
 def test_a_block_without_its_own_intro_is_skipped_not_given_the_parents():
@@ -258,7 +268,98 @@ def test_a_block_without_its_own_intro_is_skipped_not_given_the_parents():
     data = json.loads(fixture("freecodecamp_intro.json"))
     data["responsive-web-design"]["blocks"]["basic-css"].pop("intro")
     result = FreeCodeCampAdapter(
-        client=FakeClient({"intro.json": json.dumps(data)}), config=Config()).fetch()
+        client=FakeClient({"intro.json": json.dumps(data),
+                           "/learn/": "<html><body>ok</body></html>"}),
+        robots=_AllowAll(), config=Config()).fetch()
 
     assert "Basic CSS" not in [c.name for c in result.courses]
     assert "Basic HTML and HTML5" in [c.name for c in result.courses]
+
+
+# ---------------------------------------------------------------------------
+# every row must lead to a real link
+# ---------------------------------------------------------------------------
+class _Resolver:
+    """A client whose GET 404s for named URLs. Everything else answers."""
+
+    def __init__(self, body: str, missing=(), boom=()):
+        self.body, self.missing, self.boom = body, set(missing), set(boom)
+        self.requests: list[str] = []
+        self.bytes_fetched = 0          # the adapter reads this after each fetch
+
+    def get_text(self, url: str, *, params=None) -> str:
+        self.requests.append(url)
+        if url in self.boom:
+            raise httpx.ConnectTimeout("the site is down")
+        if url in self.missing:
+            raise httpx.HTTPStatusError(
+                "not found", request=httpx.Request("GET", url),
+                response=httpx.Response(404, request=httpx.Request("GET", url)))
+        return self.body
+
+
+def _fcc(client):
+    from agents.agent_d_course_ingest.sources.freecodecamp import FreeCodeCampAdapter
+    return FreeCodeCampAdapter(client=client, robots=_AllowAll(), config=Config()).fetch()
+
+
+class _AllowAll:
+    def can_fetch(self, url): return True
+    def require(self, url): return None
+
+
+def test_a_certification_that_404s_is_dropped_with_its_blocks():
+    """THE check whose absence shipped 1,353 dead links.
+
+    `/learn/daily-coding-challenge` is a real entry in the curriculum file and a
+    404 on the site. Counting rows never noticed; fetching the URL does.
+    """
+    from tests.agent_d.fake_client import fixture
+
+    dead = "https://www.freecodecamp.org/learn/responsive-web-design"
+    result = _fcc(_Resolver(fixture("freecodecamp_intro.json"), missing={dead}))
+
+    urls = {c.source_url for c in result.courses}
+    assert dead not in urls
+    assert not any(u.startswith(dead + "/#") for u in urls), (
+        "the blocks of a dead certification came through anyway")
+    assert result.dead_links == 1
+
+
+def test_the_url_a_block_actually_carries_is_the_one_checked():
+    """A block's server-visible URL is `/learn/<slug>/` — WITH the trailing slash,
+    because the fragment never reaches the server. The certification row carries
+    `/learn/<slug>` without it. Two different strings, and checking one is not
+    checking the other.
+
+    Measured 2026-08-17 both forms answer 200 on the live site, so this guards a
+    property rather than fixing a live break — but blocks are 1,352 of this
+    source's 1,450 rows, and "a trailing slash obviously behaves the same" is the
+    identical assumption that shipped 1,353 dead links.
+    """
+    from tests.agent_d.fake_client import fixture
+
+    cert = "https://www.freecodecamp.org/learn/responsive-web-design"
+    result = _fcc(_Resolver(fixture("freecodecamp_intro.json"), missing={cert + "/"}))
+
+    urls = {c.source_url for c in result.courses}
+    assert cert in urls, "the certification itself resolves and must be kept"
+    assert not any(u.startswith(cert + "/#") for u in urls), (
+        "blocks were emitted against a base URL that 404s")
+    assert result.dead_links == 1
+
+
+def test_the_site_being_down_keeps_rows_rather_than_deleting_them():
+    """The asymmetry that matters. This source is census=True, so staleness may
+    DELETE what a fetch does not return — reading an outage as "these pages are
+    gone" would let one bad afternoon prune the whole source.
+
+    Absence of proof is not proof of absence; only a definite 404 drops a row.
+    """
+    from tests.agent_d.fake_client import fixture
+
+    cert = "https://www.freecodecamp.org/learn/responsive-web-design"
+    result = _fcc(_Resolver(fixture("freecodecamp_intro.json"), boom={cert}))
+
+    assert cert in {c.source_url for c in result.courses}
+    assert result.dead_links == 0
