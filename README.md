@@ -1,6 +1,9 @@
 # Itqan
 
-Two independent LangGraph agents that share nothing but `shared/`:
+> Picking this up on another machine, or after a gap? **[HANDOFF.md](HANDOFF.md)** carries what this
+> file does not: what is live, the rules that are not negotiable, and the hazards that cost time.
+
+Six independent LangGraph agents that share nothing but `shared/`:
 
 - **Agent A** turns a candidate's **CV** (required) and **transcript** (optional) — PDF or image —
   into a verified, provenance-tagged JSON profile.
@@ -14,6 +17,9 @@ Two independent LangGraph agents that share nothing but `shared/`:
 - **Agent E** closes the loop: it recommends **one course per missing skill** from Agent C's gap and
   Agent D's supply, via deterministic coverage-first selection, then writes a short grounded
   rationale per pick (its only LLM call, fenced to the finalized data).
+- **Agent S** is the only interactive one: it answers a signed-in person's questions about **their
+  own results**, from a fact sheet built in code from one user's rows. It can propose re-running the
+  matching; only an explicit confirmation from the user spends the credit.
 
 Built with LangChain + LangGraph, PaddleOCR for scanned documents, OpenAI for extraction and
 embeddings, and Postgres + pgvector for the job-market store, with the EU's ESCO taxonomy as the
@@ -706,7 +712,7 @@ key, so the check is still worth running.
 
 ## System status
 
-One read-only view across all five agents — corpus sizes, how fresh each aggregation window is, how much of
+One read-only view across the agents — corpus sizes, how fresh each aggregation window is, how much of
 each side reached the shared ESCO vocabulary, the course-enrichment backlog, and per-source health:
 
 ```bash
