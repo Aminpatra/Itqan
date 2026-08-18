@@ -822,7 +822,15 @@ def create_app(config: Optional[Config] = None, *,
 
     @app.get("/api/health")
     async def health() -> Any:
-        return {"ok": True}
+        # `mail` is here because an outage in it is otherwise invisible: every
+        # endpoint that sends answers 200 whether or not the message goes
+        # anywhere, by design, so nobody complains. Measured 2026-08-18, mail
+        # stopped for hours and the only detector was a person waiting.
+        #
+        # `lastSendAt` is the one to watch. A rate cannot distinguish "the relay
+        # is broken" from "nobody signed up this hour"; a timestamp that has
+        # stopped moving while signups arrive can.
+        return {"ok": True, "mail": email_module.counters()}
 
     return app
 

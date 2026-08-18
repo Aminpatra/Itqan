@@ -7,9 +7,20 @@ small.
 forgot-password endpoint answers 200 whether or not the address has an account —
 that is what stops the form becoming a way to enumerate who is registered — which
 means a relay that has quietly stopped working looks exactly like a relay that is
-working. Nobody complains, because everybody is told "check your email". So every
-failure here is logged loudly and counted, and `SEND_FAILURES` is the number
-worth alerting on.
+working. Nobody complains, because everybody is told "check your email".
+
+**ACCEPTANCE IS NOT DELIVERY, and this module used to imply otherwise.** It
+counted exceptions and called `SEND_FAILURES` the number worth alerting on.
+Measured 2026-08-18, during a real outage in which no message reached anyone for
+hours: `SEND_FAILURES` was **0**, and had been 0 since the feature shipped. The
+relay accepted every message with a 250 and delivered none, so nothing raised and
+nothing was counted. The docstring above had predicted exactly that failure and
+then instrumented the half of it that does not happen.
+
+A 250 means the relay has QUEUED the message. What these counters measure is the
+hand-off — attempted, accepted, refused, failed — and nothing beyond it. The only
+authority on whether a person received anything is the provider's own log, or a
+delivery webhook (see the note at the end of this module).
 
 **The token exists in this module and nowhere else it could linger.** It is
 interpolated into the message and never logged, never returned, and never stored
@@ -31,10 +42,83 @@ from shared.config import Config
 
 log = logging.getLogger("itqan.email")
 
-# Bumped on every failed send. Read by the health endpoint and worth an alert:
-# see the module docstring for why silence is not evidence of success here.
+# The hand-off, counted. Read by `/api/health`.
+#
+# `SEND_FAILURES` alone was not enough to see an outage — see the docstring. The
+# useful signal is the pair: attempts that are not becoming acceptances, or a
+# `LAST_SEND_AT` that has stopped moving while people are signing up.
+SENDS_ATTEMPTED = 0
+SENDS_ACCEPTED = 0
+SENDS_REFUSED = 0
 SEND_FAILURES = 0
-_FAILURE_LOCK = threading.Lock()
+LAST_SEND_AT: Optional[str] = None
+_COUNTER_LOCK = threading.Lock()
+# Kept as an alias: the old name is referenced by existing tests and reads
+# naturally where only failures matter.
+_FAILURE_LOCK = _COUNTER_LOCK
+
+
+def counters() -> dict:
+    """A snapshot for the health endpoint.
+
+    Deliberately includes `lastSendAt`. A rate is not enough to notice that mail
+    has stopped — zero attempts and zero failures is also what a quiet Tuesday
+    looks like — but a hand-off timestamp that has not moved while signups are
+    arriving is unambiguous.
+    """
+    with _COUNTER_LOCK:
+        return {"attempted": SENDS_ATTEMPTED, "accepted": SENDS_ACCEPTED,
+                "refused": SENDS_REFUSED, "failed": SEND_FAILURES,
+                "lastSendAt": LAST_SEND_AT}
+
+
+# Reserved TLDs. The DNS root guarantees these never resolve (RFC 2606 / 6761),
+# so every message addressed to one is a HARD BOUNCE by construction.
+#
+# This is not hypothetical tidiness. On 2026-08-18 six probe accounts were
+# created on production at `@itqan.test` while testing; the ~7 resulting bounces
+# went against a sender that otherwise handles a handful of real messages a day,
+# and mail stopped being delivered shortly afterwards. A bounce is a charge
+# against sender reputation that every later message pays — including the one a
+# real person is waiting for.
+_UNDELIVERABLE_TLDS = (".test", ".invalid", ".example", ".localhost")
+# Reserved SECOND-level names, matched exactly rather than by suffix: a suffix
+# test would also refuse `myexample.com`, which is somebody's real domain.
+_UNDELIVERABLE_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
+
+
+def is_undeliverable(address: str) -> bool:
+    """True for an address that provably cannot receive mail.
+
+    Reserved TLDs only, and the narrowness is the point: an MX lookup would be
+    cleverer and would fail closed on a real domain having a bad afternoon,
+    silently denying a real person their code. These four can never resolve, on
+    any day, by standard.
+    """
+    _, at, domain = (address or "").strip().lower().rpartition("@")
+    # `rpartition` puts the WHOLE string in the last slot when the separator is
+    # absent, so testing `domain` alone reads "nodomain" as a domain. The
+    # separator is what says an address was even well-formed.
+    if not at or not domain:
+        return True
+    return domain in _UNDELIVERABLE_DOMAINS or domain.endswith(_UNDELIVERABLE_TLDS)
+
+
+class _RecordingSMTP(smtplib.SMTP):
+    """An SMTP client that keeps the relay's reply to DATA.
+
+    `send_message` computes that reply and throws it away, which is why nothing
+    in the log could say what the relay called the message. Brevo returns a queue
+    id in its 250, and that id is the difference between a support ticket that is
+    an argument and one that is a lookup.
+    """
+
+    last_reply: tuple = (0, b"")
+
+    def data(self, msg):                                    # type: ignore[override]
+        code, resp = super().data(msg)
+        self.last_reply = (code, resp)
+        return code, resp
 
 
 class EmailNotConfigured(RuntimeError):
@@ -45,11 +129,48 @@ def is_configured(config: Optional[Config] = None) -> bool:
     return bool((config or Config()).smtp_host)
 
 
-def send(*, to: str, subject: str, body: str, config: Optional[Config] = None) -> None:
-    """Send one plain-text message. Raises on failure; callers decide."""
+class Undeliverable(RuntimeError):
+    """The address cannot receive mail, so nothing was sent."""
+
+
+def _in_production() -> bool:
+    """The same switch `api.main.in_production` reads.
+
+    Duplicated rather than imported: `api.main` imports THIS module, so importing
+    back would be a cycle. Four lines against an import graph that has to stay
+    one-directional is the right trade, and the env var is the contract either
+    way.
+    """
+    import os
+
+    return os.getenv("ITQAN_ENV", "development").lower() == "production"
+
+
+def send(*, to: str, subject: str, body: str, config: Optional[Config] = None,
+         purpose: str = "email") -> None:
+    """Send one plain-text message. Raises on failure; callers decide.
+
+    Returns nothing on success, but LOGS the hand-off — see the module docstring
+    for why a silent success is the thing that hid an outage.
+    """
+    global SENDS_ATTEMPTED, SENDS_ACCEPTED, SENDS_REFUSED, LAST_SEND_AT
+    import time
+    from datetime import datetime, timezone
+
     config = config or Config()
     if not config.smtp_host:
         raise EmailNotConfigured("ITQAN_SMTP_HOST is not set")
+
+    # Refused BEFORE the socket opens, so a guaranteed bounce never reaches the
+    # relay at all. Production only: local runs point at a sink that is happy to
+    # accept `@itqan.test`, and the offline suite must keep working.
+    if _in_production() and is_undeliverable(to):
+        with _COUNTER_LOCK:
+            SENDS_REFUSED += 1
+        log.error("REFUSED to send %s email to %s: that domain can never receive "
+                  "mail, and a hard bounce is charged against this sender's "
+                  "reputation for every later message", purpose, _redact(to))
+        raise Undeliverable(f"{_redact(to)} cannot receive mail")
 
     message = EmailMessage()
     message["From"] = config.smtp_from or config.smtp_user
@@ -57,13 +178,30 @@ def send(*, to: str, subject: str, body: str, config: Optional[Config] = None) -
     message["Subject"] = subject
     message.set_content(body)
 
-    with smtplib.SMTP(config.smtp_host, config.smtp_port,
-                      timeout=config.smtp_timeout_s) as server:
+    with _COUNTER_LOCK:
+        SENDS_ATTEMPTED += 1
+
+    started = time.monotonic()
+    with _RecordingSMTP(config.smtp_host, config.smtp_port,
+                        timeout=config.smtp_timeout_s) as server:
         if config.smtp_starttls:
             server.starttls()
         if config.smtp_user:
             server.login(config.smtp_user, config.smtp_password)
         server.send_message(message)
+        code, reply = server.last_reply
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    with _COUNTER_LOCK:
+        SENDS_ACCEPTED += 1
+        LAST_SEND_AT = datetime.now(timezone.utc).isoformat()
+
+    # The relay's own words for this message. `queued as <id>` is what turns
+    # "we sent it" into something the provider can look up — and the redacted
+    # address is what keeps this log from becoming a mailing list.
+    detail = reply.decode("utf-8", "replace").strip() if isinstance(reply, bytes) else str(reply)
+    log.info("%s email handed to relay for %s in %dms: %s %s",
+             purpose, _redact(to), elapsed_ms, code, detail)
 
 
 def send_in_background(*, to: str, subject: str, body: str,
@@ -92,7 +230,7 @@ def send_in_background(*, to: str, subject: str, body: str,
     def _run() -> None:
         global SEND_FAILURES
         try:
-            send(to=to, subject=subject, body=body, config=config)
+            send(to=to, subject=subject, body=body, config=config, purpose=purpose)
         except Exception as exc:                # noqa: BLE001 - never reaches a user
             with _FAILURE_LOCK:
                 SEND_FAILURES += 1
@@ -200,3 +338,20 @@ def reset_link(*, site_url: str, locale: str, token: str) -> str:
 def reset_message(*, link: str, locale: str, minutes: int) -> tuple[str, str]:
     lang = locale if locale in ("ar", "en") else "en"
     return _SUBJECT[lang], _BODY[lang].format(link=link, minutes=minutes)
+
+
+# ---------------------------------------------------------------------------
+# What is still missing, named so it is a decision rather than an oversight.
+#
+# Nothing in this file can tell whether a message was DELIVERED. The counters
+# above stop at the relay's 250, and 2026-08-18 is the proof that a 250 and a
+# delivery are different events: every message was accepted and none arrived.
+#
+# The answer is the provider's delivery webhook — Brevo will POST delivered,
+# bounced, blocked and complained events. That needs a public endpoint,
+# signature verification and somewhere to put the events, which is a real piece
+# of work and deserves designing rather than being bolted on during an incident.
+# Until it exists, the provider's own dashboard is the only authority on whether
+# anyone received anything, and this module should not be read as claiming
+# otherwise.
+# ---------------------------------------------------------------------------
