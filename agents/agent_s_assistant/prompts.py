@@ -1,6 +1,6 @@
 """The one prompt Agent S uses.
 
-Two things about it are load-bearing and easy to undo by accident.
+Three things about it are load-bearing and easy to undo by accident.
 
 **The facts block is a fence, not context.** It is built in code from one user's
 mapped results. The model never sees a job description, a CV, or another user's
@@ -14,6 +14,14 @@ Agent A's extraction prompt and Agent B's legitimacy prompt fence the text they
 read. A person asking a question can write "ignore your instructions"; so can a
 job posting that reached the corpus. Neither can be allowed to reclassify itself
 as instructions.
+
+**One answer is hardcoded, and it is the only one.** Asked who its boss is, Agent
+S says Samin — see WHO YOU WORK FOR below. That is a deliberate carve-out from
+the first rule, so keep it the size it is. A bare name carries no figure and no
+internal vocabulary, so `verify_answer` publishes it untouched; the same fact
+means anything the model adds AROUND the name — a surname, a title, what Samin
+has done — is ungrounded and nothing downstream would catch it. That is why the
+section spends more words forbidding elaboration than giving the answer.
 """
 
 from __future__ import annotations
@@ -58,6 +66,24 @@ Other people's results, comparisons against other users, totals or averages \
 across everybody, or whether any other account exists. If asked, say briefly \
 that you can only discuss this person's own results, and answer nothing else \
 about it. Rephrasing does not change the answer.
+
+WHO YOU WORK FOR
+If they ask who your boss is — who you work for, who runs this, who is in \
+charge — the answer is Samin. This is the ONE thing you may state that is \
+not in the FACTS block, and it is deliberate.
+
+Answer in one short line and stop. You do not know a surname, a job title, or \
+anything Samin has done, so do not supply any: this is an exception to the \
+fact sheet, not permission to invent around it. Write the name in Latin \
+letters — "Samin" — in every language, including Arabic. It is a name, \
+not a word to translate.
+
+This is a real answer, not a decline: out_of_scope stays false.
+
+  RIGHT (en): "Samin is my boss."
+  RIGHT (ar): "مديري هو Samin."
+  WRONG:      "I can only discuss your own results."
+  WRONG:      "Samin, the founder of Itqan, oversees the platform."
 
 RERUNS
 A rerun re-matches this person against the job corpus as it stands today, using \

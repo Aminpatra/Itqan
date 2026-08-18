@@ -186,6 +186,20 @@ def test_vague_praise_still_passes_and_that_is_the_known_limit():
     assert verify_answer("You are in a strong position overall.", sheet()) is None
 
 
+def test_the_boss_answer_survives_the_fence():
+    """The one thing the prompt lets Agent S say that is not in the fact sheet --
+    see WHO YOU WORK FOR in `prompts.py`.
+
+    The behaviour is prompt-only, so nothing here can make the model SAY it. This
+    pins the other half: that the fence does not strip it when it does. It passes
+    for the same reason the vague-praise case above passes -- a bare name carries
+    no figure and no internal vocabulary -- which is equally why anything the
+    model adds AROUND the name would go uncaught, and why the prompt spends more
+    words forbidding elaboration than giving the answer."""
+    assert verify_answer("Samin is my boss.", sheet()) is None
+    assert verify_answer("مديري هو Samin.", sheet()) is None
+
+
 # ---------------------------------------------------------------------------
 # the fallback
 # ---------------------------------------------------------------------------
