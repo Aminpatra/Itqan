@@ -26,6 +26,26 @@ _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _FORBIDDEN = ("esco", "gap_score", "priority_score", "skill_key", "posting_id",
               "duplicate_of", "final_url", "fact sheet", "facts block")
 
+# A card handle that leaked into user-facing prose.
+#
+# Measured on the real model, 2026-08-18: asked "which jobs fit me right now?"
+# it answered "These jobs matched you right now: [J1], [J2], [J3]..." — naming
+# SEVEN while three were attached. The handles are an internal pointer, like
+# `gap_score`; a person reading "[J1]" has been shown a token that means nothing
+# to them, and a sentence promising seven cards above three cards is worse than
+# meaningless.
+#
+# The prompt now says not to. This is the check that does not depend on the
+# model reading it.
+_HANDLE = re.compile(r"\[[JC]\d+\]")
+# BRACKETED ONLY, and that is a deliberate limit rather than an oversight.
+# A bare `C1` is a CEFR language level and `A2 English for Developers` is a
+# real course in this corpus, so matching unbracketed tokens would reject
+# honest answers about language courses. The observed failure was the
+# bracketed form — the model echoes the notation it was shown — and the
+# prompt covers the rest. A check that fires on true sentences is worse
+# than one with a known edge.
+
 
 def _numbers(text: str) -> set[str]:
     out: set[str] = set()
@@ -104,13 +124,19 @@ def build_fact_sheet(*, readiness: Any, jobs: list[dict[str, Any]],
 
     lines.append("")
     lines.append(f"Matched jobs ({len(jobs)}):" if jobs else "Matched jobs: none yet")
-    for job in jobs:
+    for i, job in enumerate(jobs, 1):
+        # THE HANDLE. The model never writes a job into its prose — it names
+        # `[J2]`, and code turns that into the real card. See `resolve_refs`.
+        #
+        # A short label rather than the row's `job_id`: that id is a sha, and
+        # asking a model to reproduce one exactly invites a near-miss that
+        # resolves to a DIFFERENT posting. `[J2]` either matches or it does not.
         bits = [job.get("title") or "untitled"]
         if job.get("employer"):
             bits.append(f"at {job['employer']}")
         if job.get("location"):
             bits.append(f"in {job['location']}")
-        line = f"- {' '.join(bits)}"
+        line = f"- [J{i}] {' '.join(bits)}"
         if job.get("why"):
             line += f" — why it matched: {job['why']}"
         lines.append(line)
@@ -158,11 +184,11 @@ def build_fact_sheet(*, readiness: Any, jobs: list[dict[str, Any]],
     lines.append("")
     lines.append(f"Recommended courses ({len(courses)}):" if courses
                  else "Recommended courses: none yet")
-    for course in courses:
+    for i, course in enumerate(courses, 1):
         bits = [course.get("title") or "untitled"]
         if course.get("provider"):
             bits.append(f"from {course['provider']}")
-        line = f"- {' '.join(bits)}"
+        line = f"- [C{i}] {' '.join(bits)}"
         if course.get("why"):
             line += f" — {course['why']}"
         lines.append(line)
@@ -180,7 +206,8 @@ def verify_answer(text: str, fact_sheet: str) -> Optional[str]:
        every agent that writes prose.
     2. **No internal vocabulary.** `gap_score` in particular is scaled so that
        0.0 is the best possible result, so a user shown that number reads it
-       backwards.
+       backwards. Card handles count: `[J1]` is a pointer for the code that
+       resolves it, and it means nothing to the person reading the sentence.
 
     What is deliberately NOT checked: vague reassurance ("you're in good shape").
     The record cannot adjudicate it, and a check that pretends to would be
@@ -193,6 +220,10 @@ def verify_answer(text: str, fact_sheet: str) -> Optional[str]:
     for token in _FORBIDDEN:
         if token in lowered:
             return f"uses internal vocabulary: {token!r}"
+
+    leaked = _HANDLE.search(text or "")
+    if leaked:
+        return f"names an internal card handle: {leaked.group(0)!r}"
 
     invented = _numbers(text) - _numbers(fact_sheet)
     if invented:
@@ -213,3 +244,57 @@ def deterministic_answer(fact_sheet: str, *, has_results: bool) -> str:
                 "I can talk you through what it found.")
     return ("I can only go on what your results actually record, and I could not "
             "answer that from them. You can see the full picture on your dashboard.")
+
+
+_REF = re.compile(r"^\s*\[?([JC])(\d+)\]?\s*$", re.IGNORECASE)
+
+
+def clean_suggestions(items: Any) -> list[str]:
+    """Follow-up questions, minus any that leaked a handle.
+
+    `verify_answer` guards the ANSWER; nothing guarded these. The same live run
+    that caught "[J1], [J2]" in the prose also produced the suggestion chip
+    "why did J1 match me?" — which a person would be invited to tap.
+
+    Dropped rather than rewritten: a question with the handle stripped out
+    ("why did match me?") is worse than one fewer chip.
+    """
+    out: list[str] = []
+    for item in (items or []):
+        text = str(item).strip()
+        if text and not _HANDLE.search(text):
+            out.append(text)
+    return out[:3]
+
+
+def resolve_refs(refs: Any, items: list[dict[str, Any]], *, kind: str) -> list[dict[str, Any]]:
+    """Turn the model's handles into real cards, dropping anything invented.
+
+    **This is the anti-fabrication check for attachments**, and it is the same
+    discipline Agent C uses on a cited satisfying skill and Agent E on a claimed
+    figure: the model points at evidence it was shown, and CODE decides whether
+    the pointer resolves. `[J9]` against a sheet listing three jobs yields
+    nothing — not a guess, not the nearest one, nothing.
+
+    The card returned is the very dict `api/mapping` built for `/api/jobs`, so a
+    posting attached to a chat turn and the same posting on the Jobs screen are
+    byte-identical and cannot drift apart. That is what carries `why`, the live
+    `source` and its `retrievedAt` onto this surface — the whole reason a
+    posting may be ATTACHED here while the brand bars Hud from describing one.
+
+    Order and duplicates are the model's to choose but not to abuse: the first
+    mention wins and a repeat is ignored, so a reply naming `[J1]` three times
+    renders one card.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for ref in (refs or []):
+        match = _REF.match(str(ref))
+        if not match or match.group(1).upper() != kind.upper():
+            continue
+        index = int(match.group(2))
+        if index < 1 or index > len(items) or index in seen:
+            continue
+        seen.add(index)
+        out.append(items[index - 1])
+    return out

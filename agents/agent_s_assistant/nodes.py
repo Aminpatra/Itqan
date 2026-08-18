@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 from shared.config import Config
 
-from .facts import deterministic_answer, verify_answer
+from .facts import clean_suggestions, deterministic_answer, verify_answer
 from .prompts import ASSISTANT_PROMPT
 from .schemas import AssistantReply
 from .state import AssistantState
@@ -75,6 +75,16 @@ def make_answer(deps: Deps) -> Callable[[AssistantState], dict[str, Any]]:
             "proposed_rerun": reply.intent == "propose_rerun",
             "rerun_reason": reply.rerun_reason,
             "out_of_scope": reply.out_of_scope,
+            # Handles, not cards. `resolve_refs` decides at the route whether
+            # each one points at something the model was actually shown; an
+            # invented [J9] becomes nothing rather than a fabricated posting.
+            "job_refs": list(reply.job_refs or [])[:3],
+            "course_refs": list(reply.course_refs or [])[:3],
+            # Cleaned, not just trimmed: a suggestion is user-facing text that
+            # never passes through `verify_answer`, and the same live run that
+            # caught handles in the prose produced the chip "why did J1 match
+            # me?" — a tappable question nobody can read.
+            "suggestions": clean_suggestions(reply.suggestions),
         }
 
     return answer
@@ -99,6 +109,13 @@ def make_verify(deps: Deps) -> Callable[[AssistantState], dict[str, Any]]:
                 # that the user spend their one weekly credit.
                 "proposed_rerun": False,
                 "rerun_reason": None,
+                # The cards go with the sentence they belonged to. The
+                # deterministic reply is about a DIFFERENT thing — it says we
+                # could not answer — and leaving two job cards under it would
+                # attach evidence to a claim nobody made.
+                "job_refs": [],
+                "course_refs": [],
+                "suggestions": [],
                 "warnings": [f"answer replaced: {problem}"] if problem else [],
             }
 

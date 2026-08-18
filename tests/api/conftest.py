@@ -31,7 +31,8 @@ from shared.config import Config                # noqa: E402
 # not reach it. Left out, its hourly counters accumulate across tests until the
 # limit is exhausted, and every later test quietly receives no email — which is
 # exactly how it failed the first time, as fifteen unrelated assertions.
-_APP_TABLES = ("app_assistant_messages", "app_assistant_usage", "app_reset_throttle",
+_APP_TABLES = ("app_assistant_messages", "app_chat_threads",
+               "app_assistant_usage", "app_reset_throttle",
                "app_password_resets", "app_email_verifications", "app_profiles",
                "app_onboarding_progress", "app_runs", "app_documents", "app_users")
 
@@ -205,6 +206,19 @@ class FakeAssistantLLM:
     def __call__(self, payload: Any) -> Any:
         self.prompts.append(str(payload))
         return self.reply
+
+    def respond(self, **fields: Any) -> None:
+        """Set the next reply from field values.
+
+        A convenience over assigning `.reply` directly, because the chat tests
+        vary one field at a time — `job_refs`, `suggestions`, `intent` — and
+        rebuilding the whole model object at each call site buries which field
+        the test is actually about.
+        """
+        from agents.agent_s_assistant.schemas import AssistantReply
+
+        fields.setdefault("answer", "Here is what your results say.")
+        self.reply = AssistantReply(**fields)
 
 
 @pytest.fixture

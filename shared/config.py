@@ -425,14 +425,20 @@ class Config:
     # because every other calibrated constant in this file carries the evidence
     # that set it and these two carry none yet.
     #
-    # What to re-measure after a week of real use: how often a user reaches 10,
+    # 30/day (was 10, raised 2026-08-17). Ten was set when this was a Q&A box;
+    # on the chat screen a real conversation is easily ten turns, so the cap was
+    # being hit mid-thought at exactly the moment the feature is most useful. It
+    # is still a cap, and it is still the only thing between ordinary use and an
+    # unbounded model bill — which is why it stays enforced in SQL.
+    #
+    # What to re-measure after a week of real use: how often a user reaches 30,
     # and how often a rerun actually CHANGED anything. A rerun returning
     # identical results is a credit spent for nothing, and at one per week that
     # is the whole allowance.
     #
     # Both are enforced by a guarded UPDATE in `AppStore.claim_quota`, never by
     # asking the model to respect them — see the module docstring there.
-    assistant_daily_messages: int = 10
+    assistant_daily_messages: int = 30
     assistant_weekly_reruns: int = 1
 
     # Quota periods are local days and weeks, NOT UTC ones. Telling a user in

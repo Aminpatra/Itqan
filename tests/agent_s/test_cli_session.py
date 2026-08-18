@@ -38,7 +38,10 @@ class FakeStore:
 
 
 def quota_state(store, config, user_id, kind):
-    limit = 10 if kind == "message" else 1
+    # Read from config rather than restated. A fake that hard-codes the cap
+    # silently stops standing in for the real one the day the number changes —
+    # which is exactly what happened when the daily limit went 10 -> 30.
+    limit = config.assistant_daily_messages if kind == "message" else 1
     return {"used": store.used, "limit": limit,
             "remaining": max(0, limit - store.used),
             "resetsAt": "2026-08-16T00:00:00+04:00"}
@@ -211,8 +214,10 @@ def test_enforce_quota_meters_the_session_exactly_as_the_api_does():
 
 
 def test_hitting_the_limit_under_enforcement_stops_answering_but_not_the_session():
+    from shared.config import Config
+
     store = FakeStore()
-    store.used = 10                      # already at the cap
+    store.used = Config().assistant_daily_messages     # already at the cap
 
     code, asked = session(["one", "two", KeyboardInterrupt],
                           store=store, enforce_quota=True)

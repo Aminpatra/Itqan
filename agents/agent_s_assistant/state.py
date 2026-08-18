@@ -38,12 +38,19 @@ class AssistantState(TypedDict, total=False):
     # refunds the first and charges for the second, and the distinction is
     # deliberate: refunding a rejected answer would let someone chat for free by
     # steering the model into rejections, while charging for an outage takes one
-    # of somebody's ten daily messages for a sentence we generated ourselves.
+    # of somebody's daily messages for a sentence we generated ourselves.
     model_failed: bool
     # The model's suggestion only. Nothing acts on this inside the graph.
     proposed_rerun: bool
     rerun_reason: Optional[str]
     out_of_scope: bool
+    # HANDLES the model named ([J1], [C2]), never cards. The graph deliberately
+    # does not resolve them: it has no results object to resolve against — that
+    # is the API layer's, and keeping it there is what stops this agent needing
+    # a lookup it must not have.
+    job_refs: list[str]
+    course_refs: list[str]
+    suggestions: list[str]
 
     # Why an answer was rejected, when it was. Surfaced in the run log, not to
     # the user — they get the deterministic answer instead.

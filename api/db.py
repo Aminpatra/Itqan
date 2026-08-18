@@ -606,12 +606,71 @@ class AppStore:
 
     def add_assistant_message(self, *, user_id: str, role: str, content: str,
                               run_id: Optional[str] = None,
-                              answer_source: Optional[str] = None) -> dict[str, Any]:
+                              answer_source: Optional[str] = None,
+                              thread_id: Optional[str] = None,
+                              cards: Optional[dict[str, Any]] = None,
+                              suggestions: Optional[list[str]] = None,
+                              attachments: Optional[list[dict[str, Any]]] = None,
+                              ) -> dict[str, Any]:
         return self._one(
             "INSERT INTO app_assistant_messages "
-            "  (message_id, user_id, run_id, role, content, answer_source) "
-            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
-            (f"m_{secrets.token_hex(8)}", user_id, run_id, role, content, answer_source))
+            "  (message_id, user_id, run_id, role, content, answer_source, "
+            "   thread_id, cards, suggestions, attachments) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+            (f"m_{secrets.token_hex(8)}", user_id, run_id, role, content, answer_source,
+             thread_id,
+             json.dumps(cards) if cards is not None else None,
+             json.dumps(suggestions) if suggestions is not None else None,
+             json.dumps(attachments) if attachments is not None else None))
+
+    # --- chat threads -------------------------------------------------------
+    def create_thread(self, *, user_id: str, title: str) -> dict[str, Any]:
+        """Start a thread. The title is the first question and is never rewritten."""
+        return self._one(
+            "INSERT INTO app_chat_threads (thread_id, user_id, title) "
+            "VALUES (%s, %s, %s) RETURNING *",
+            (f"t_{secrets.token_hex(8)}", user_id, title[:120]))
+
+    def thread(self, thread_id: str, user_id: str) -> Optional[dict[str, Any]]:
+        """One thread, and ONLY if it belongs to this user.
+
+        `user_id` is in the WHERE clause rather than checked after the read, so
+        another account's thread is not fetched and then rejected — it is never
+        selected. The route answers 404 rather than 403 for the same reason:
+        confirming that someone else's thread exists is itself a disclosure.
+        """
+        return self._one(
+            "SELECT * FROM app_chat_threads WHERE thread_id = %s AND user_id = %s",
+            (thread_id, user_id))
+
+    def threads(self, user_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._all(
+            "SELECT * FROM app_chat_threads WHERE user_id = %s "
+            "ORDER BY updated_at DESC LIMIT %s",
+            (user_id, limit))
+
+    def touch_thread(self, thread_id: str) -> None:
+        self._exec("UPDATE app_chat_threads SET updated_at = now() WHERE thread_id = %s",
+                   (thread_id,))
+
+    def thread_messages(self, thread_id: str, user_id: str) -> list[dict[str, Any]]:
+        """Both turns, oldest first — the user's questions as well as the answers.
+
+        Rule 4 of the chat contract: a thread resumed on another device has to be
+        a conversation, not a list of answers to questions nobody can see.
+        """
+        return self._all(
+            "SELECT * FROM app_assistant_messages "
+            " WHERE thread_id = %s AND user_id = %s "
+            " ORDER BY created_at, message_id",
+            (thread_id, user_id))
+
+    def rate_message(self, *, message_id: str, user_id: str, verdict: str) -> int:
+        """Record a thumb. Scoped to the owner, and last write wins."""
+        return self._exec(
+            "UPDATE app_assistant_messages SET rating = %s "
+            " WHERE message_id = %s AND user_id = %s",
+            (verdict, message_id, user_id))
 
     def assistant_history(self, user_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         """This user's turns, oldest first.

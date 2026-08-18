@@ -63,7 +63,16 @@ def _await_stage(client, job_id: str, timeout: float = 5.0) -> str:
 # ---------------------------------------------------------------------------
 # quotas — enforced in SQL, not by the model
 # ---------------------------------------------------------------------------
-def test_the_daily_limit_stops_at_ten(signed_in):
+def test_the_daily_limit_stops_at_the_cap(signed_in, monkeypatch):
+    """The cap is PINNED here rather than read from the shipped default.
+
+    These tests are about the rule — the counter holds, and holds atomically —
+    not about the number, which is a product decision that has already moved
+    once (10 -> 30, 2026-08-17). Pinning it keeps them fast and stops a change
+    to the default reading as five broken tests.
+    """
+    monkeypatch.setattr(signed_in.app.state.config, "assistant_daily_messages", 10)
+
     for i in range(10):
         assert _ask(signed_in).status_code == 200, f"message {i + 1} was refused early"
 
@@ -72,7 +81,7 @@ def test_the_daily_limit_stops_at_ten(signed_in):
     assert "10/10" in res.json()["message"]
 
 
-def test_the_limit_holds_when_messages_arrive_together(signed_in):
+def test_the_limit_holds_when_messages_arrive_together(signed_in, monkeypatch):
     """THE test for the counter's design.
 
     A read-then-write check passes when messages arrive one at a time and fails
@@ -80,6 +89,8 @@ def test_the_limit_holds_when_messages_arrive_together(signed_in):
     handlers in a threadpool, so concurrent messages from one person are the
     normal case, not an exotic one.
     """
+    monkeypatch.setattr(signed_in.app.state.config, "assistant_daily_messages", 10)
+
     with ThreadPoolExecutor(max_workers=8) as pool:
         codes = [f.result().status_code
                  for f in [pool.submit(_ask, signed_in, f"q{i}") for i in range(40)]]
@@ -88,7 +99,8 @@ def test_the_limit_holds_when_messages_arrive_together(signed_in):
     assert codes.count(429) == 30
 
 
-def test_a_refused_message_is_not_charged(signed_in):
+def test_a_refused_message_is_not_charged(signed_in, monkeypatch):
+    monkeypatch.setattr(signed_in.app.state.config, "assistant_daily_messages", 10)
     for _ in range(10):
         _ask(signed_in)
     before = signed_in.get("/api/assistant/usage").json()["messages"]["used"]
@@ -449,6 +461,6 @@ def test_usage_reports_what_is_left(signed_in):
     _ask(signed_in)
 
     body = signed_in.get("/api/assistant/usage").json()
-    assert body["messages"] == {"used": 1, "limit": 10, "remaining": 9,
+    assert body["messages"] == {"used": 1, "limit": 30, "remaining": 29,
                                 "resetsAt": body["messages"]["resetsAt"]}
     assert body["reruns"]["limit"] == 1

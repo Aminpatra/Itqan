@@ -9,7 +9,7 @@ build.
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -46,6 +46,33 @@ class AssistantReply(BaseModel):
             "One short sentence saying what a rerun would actually change. "
             "Required when intent is 'propose_rerun', so the user is deciding "
             "on a stated reason rather than on the offer alone."
+        ),
+    )
+
+    job_refs: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Handles of the matched jobs worth showing, e.g. ['J1','J3'], taken "
+            "ONLY from the FACTS block. The screen renders these as real cards "
+            "with their own source and reasoning — so name the handle and do "
+            "NOT write the employer, the title or any match figure into your "
+            "answer. At most 3. A handle that is not in the FACTS is dropped."
+        ),
+    )
+
+    course_refs: List[str] = Field(
+        default_factory=list,
+        description=(
+            "The same, for recommended courses: ['C2']. At most 3."
+        ),
+    )
+
+    suggestions: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Up to 3 follow-up QUESTIONS a person might ask next, phrased as "
+            "they would say them, in their language. Questions, never commands, "
+            "and never an offer to do something you cannot do."
         ),
     )
 

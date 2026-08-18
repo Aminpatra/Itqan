@@ -132,6 +132,65 @@ def _newest(docs: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
     return matches[:1]
 
 
+
+def graph_for(app: Any) -> Any:
+    """Built per request so a config or key change is picked up, and so the LLM
+    is absent in tests unless a test supplies one."""
+    return build_assistant_graph(
+        Deps(config=app.state.config,
+             llm=getattr(app.state, "assistant_llm", None)))
+
+
+def facts_for(store: Any, user_id: str) -> tuple[str, bool, Optional[str],
+                                                 list[dict[str, Any]], list[dict[str, Any]]]:
+    """(fact sheet, has_results, run_id, jobs, courses).
+
+    Module level, and shared by BOTH surfaces — `/api/assistant/*` and
+    `/api/chat/*` — so there is one place that decides what a model may see. A
+    second copy is how the two would eventually disagree about scope, which is
+    the one thing here that must never differ.
+
+    The raw `jobs` and `courses` come back alongside the rendered sheet because
+    the chat needs them: the sheet gives the model handles like `[J2]`, and
+    resolving a handle means indexing these very lists. They are
+    `api/mapping`'s shapes, identical to what `/api/jobs` and `/api/courses`
+    serve.
+
+    Every read is keyed on the session's `user_id`. No branch takes an id from a
+    request, which is what makes cross-user isolation a property of this
+    function rather than of a prompt.
+    """
+    from . import mapping
+
+    row = store.latest_completed_run(user_id)
+    if row is None:
+        return (build_fact_sheet(readiness=None, jobs=[], courses=[], gaps=[],
+                                 suggested_role=None, matched_at=None),
+                False, None, [], [])
+
+    gap = row["skill_gap"] or {}
+    recs = row["recommendations"] or {}
+    board = mapping.dashboard(row["profile"] or {}, gap, recs)
+    finished = row.get("finished_at")
+    jobs = mapping.job_matches(gap, limit=10)
+    courses = mapping.courses(recs)[:10]
+
+    return (
+        build_fact_sheet(
+            readiness=board.get("readiness"),
+            jobs=jobs,
+            courses=courses,
+            gaps=gaps_from(gap),
+            suggested_role=mapping.suggested_role(gap),
+            matched_at=finished.isoformat() if hasattr(finished, "isoformat") else finished,
+        ),
+        True,
+        row.get("run_id"),
+        jobs,
+        courses,
+    )
+
+
 def register(app: Any, *, require_user, jobs_module, mapping) -> None:
     """Mount Agent S's routes. Called from `create_app`."""
 
@@ -142,42 +201,15 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
         return app.state.config
 
     def _graph():
-        """Built per request so a config or key change is picked up, and so the
-        LLM is absent in tests unless a test supplies one."""
-        return build_assistant_graph(
-            Deps(config=_config(), llm=getattr(app.state, "assistant_llm", None)))
+        return graph_for(app)
 
     # ---- the fact sheet: one user's results, assembled in code -------------
     def _facts(user_id: str) -> tuple[str, bool, Optional[str]]:
-        """(fact sheet, has_results, run_id).
-
-        Every read here is keyed on the session's `user_id`. There is no branch
-        that takes an id from the request, which is what makes cross-user
-        isolation a property of this function rather than of the prompt.
-        """
-        row = _store().latest_completed_run(user_id)
-        if row is None:
-            return (build_fact_sheet(readiness=None, jobs=[], courses=[], gaps=[],
-                                     suggested_role=None, matched_at=None),
-                    False, None)
-
-        gap = row["skill_gap"] or {}
-        recs = row["recommendations"] or {}
-        board = mapping.dashboard(row["profile"] or {}, gap, recs)
-        finished = row.get("finished_at")
-
-        return (
-            build_fact_sheet(
-                readiness=board.get("readiness"),
-                jobs=mapping.job_matches(gap, limit=10),
-                courses=mapping.courses(recs)[:10],
-                gaps=gaps_from(gap),
-                suggested_role=mapping.suggested_role(gap),
-                matched_at=finished.isoformat() if hasattr(finished, "isoformat") else finished,
-            ),
-            True,
-            row.get("run_id"),
-        )
+        """Delegates to the shared builder, dropping the raw lists this surface
+        does not use. One implementation, so `/api/assistant/*` and `/api/chat/*`
+        cannot come to disagree about what a model may see."""
+        sheet, has_results, run_id, _jobs, _courses = facts_for(_store(), user_id)
+        return sheet, has_results, run_id
 
     # ---- routes -----------------------------------------------------------
     @app.get("/api/assistant/usage")

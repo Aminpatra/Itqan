@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from shared.config import Config
 
 from . import assistant as assistant_module
+from . import chat as chat_module
 from . import avatars
 from . import email as email_module
 from . import jobs as jobs_module
@@ -813,6 +814,11 @@ def create_app(config: Optional[Config] = None, *,
     # dependency in keeps that visible at the mount point instead of buried.
     assistant_module.register(app, require_user=require_user,
                               jobs_module=jobs_module, mapping=mapping)
+    # Hud's chat, over the SAME engine: one store, one quota, one graph. The
+    # assistant module is passed in rather than imported there, so neither
+    # surface can grow its own idea of what a message costs or what a model may
+    # see.
+    chat_module.register(app, require_user=require_user, assistant=assistant_module)
 
     @app.get("/api/health")
     async def health() -> Any:
