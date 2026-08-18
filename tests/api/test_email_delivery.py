@@ -155,3 +155,19 @@ def test_a_refusal_is_not_counted_as_a_relay_failure(monkeypatch):
 
     assert email_module.SENDS_REFUSED == 1
     assert email_module.SEND_FAILURES == 0
+
+
+def test_the_handoff_line_is_actually_emitted(monkeypatch, capsys):
+    """Instrumentation that cannot be read is not instrumentation.
+
+    Found in production minutes after shipping it: `itqan.email` inherited a root
+    with no handlers, so `logging.lastResort` printed the ERROR refusal and
+    dropped the INFO hand-off — discarding the relay queue id, which was the one
+    artifact worth having.
+    """
+    import logging
+
+    from api.main import _configure_logging
+
+    _configure_logging()
+    assert logging.getLogger("itqan.email").isEnabledFor(logging.INFO)

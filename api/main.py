@@ -104,6 +104,36 @@ def verify_path(locale: str) -> str:
     return f"/{lang}/verify-email/"
 
 
+def _configure_logging() -> None:
+    """Make this application's own log lines actually appear.
+
+    Uvicorn configures ITS loggers and nothing else, so the `itqan.*` namespace
+    inherits a root with no handlers — where `logging.lastResort` prints WARNING
+    and above and drops everything below.
+
+    Measured 2026-08-18, immediately after shipping the mail hand-off log: the
+    REFUSED line (ERROR) appeared and the hand-off line (INFO) did not, so the
+    relay's queue id — the one artifact that makes a provider-side lookup
+    possible — was being computed, formatted and thrown away. Instrumentation
+    that cannot be read is not instrumentation.
+
+    Idempotent: the tests build many apps in one process, and adding a handler
+    per app would multiply every line by the number of apps created.
+    """
+    import logging
+
+    logger = logging.getLogger("itqan")
+    if any(getattr(h, "_itqan", False) for h in logger.handlers):
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    handler._itqan = True                                   # type: ignore[attr-defined]
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    # Uvicorn's own handler would print each line a second time.
+    logger.propagate = False
+
+
 def create_app(config: Optional[Config] = None, *,
                store: Optional[AppStore] = None,
                runner: Optional[jobs_module.PipelineRunner] = None,
@@ -112,6 +142,7 @@ def create_app(config: Optional[Config] = None, *,
     """Dependencies are injected, like every agent's `Deps` — so the tests drive
     the real routes with a fake pipeline and never touch OpenAI or OCR."""
     config = config or Config()
+    _configure_logging()
     # Before anything else, and before a single request can be served.
     assert_deployable()
     app = FastAPI(title="Itqan API", docs_url="/api/docs", openapi_url="/api/openapi.json")
