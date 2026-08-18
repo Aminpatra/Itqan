@@ -382,6 +382,70 @@ def courses(recommendations: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def gap_of_course(recommendations: dict[str, Any], course_id: str):
+    """Which missing skill this course was recommended FOR, or None.
+
+    The link a replacement has to preserve. Agent E assigns one course per gap,
+    so the course alone does not say which gap it was closing — that lives on the
+    recommendation wrapping it.
+    """
+    for rec in recommendations.get("recommendations") or []:
+        if (rec.get("course") or {}).get("course_id") == course_id:
+            return rec.get("skill")
+    return None
+
+
+def esco_of_gap(gap: dict[str, Any], skill: str):
+    """The ESCO code for a missing skill, when it mapped to one.
+
+    Courses are retrieved by concept where a skill mapped and by exact key where
+    it did not, so this decides which of the two pools a replacement comes from.
+    Roughly a quarter of skills map, so the key fallback is the common path, not
+    the exception.
+    """
+    for detail in (gap.get("aggregate") or {}).get("missing_skill_details") or []:
+        if detail.get("skill") == skill:
+            return detail.get("esco_code")
+    return None
+
+
+def course_card(candidate: Any, *, skill: str, retrieved_at: str) -> dict[str, Any]:
+    """A `CourseCandidate` in the same shape `courses()` publishes.
+
+    Deliberately the SAME shape, built from the same rules: a replacement card
+    that carried less than the card it replaced — no duration, no honest price
+    label — would be visibly poorer for no reason the user could understand.
+
+    `unlocks` is the one gap this closes. A recommendation names the other skills
+    a course happens to cover, and that is set-relative to a whole run; claiming
+    it here would assert coverage nothing computed.
+    """
+    price = getattr(candidate, "price", None)
+    amount = getattr(price, "amount", None) if price is not None else None
+    currency = getattr(price, "currency", None) if price is not None else None
+    is_free = bool(getattr(price, "is_free", False)) if price is not None else False
+
+    return {
+        "id": candidate.course_id,
+        "title": candidate.title or "",
+        "provider": candidate.provider or "",
+        "hoursMin": candidate.hours_min,
+        "hoursMax": candidate.hours_max,
+        "durationText": candidate.duration_text,
+        "price": amount,
+        "currency": currency,
+        "priceLabel": _price_label(candidate.source,
+                                   {"amount": amount, "is_free": is_free}),
+        "unlocks": [skill],
+        "recommended": True,
+        "source": {
+            "name": candidate.provider or "",
+            "url": candidate.url or "",
+            "retrievedAt": retrieved_at,
+        },
+    }
+
+
 def dashboard(profile: dict[str, Any], gap: dict[str, Any],
               recommendations: dict[str, Any]) -> dict[str, Any]:
     """`DashboardData`, assembled server-side from Agent C + Agent E."""

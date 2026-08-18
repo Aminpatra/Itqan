@@ -31,6 +31,17 @@ MAX_ATTACHMENTS = 5
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 TITLE_CHARS = 60
 
+# Ends the out-of-messages turn, and ONLY that turn.
+#
+# Written as escapes rather than pasted, because it is two codepoints — U+261D
+# INDEX POINTING UP plus U+1F3FB EMOJI MODIFIER FITZPATRICK TYPE-1-2 — and a lost
+# modifier renders as a different, yellower emoji while looking identical in a
+# diff. A test asserts the exact sequence.
+#
+# In the template we write, never asked of the model: a requirement that depends
+# on a model remembering it is a requirement that holds most of the time.
+OUT_OF_MESSAGES_MARK = "\u261d\U0001f3fb"
+
 
 def _ms(value: Any) -> int:
     """`createdAt` as epoch milliseconds, which is what `ChatMessage` declares."""
@@ -234,9 +245,10 @@ def register(app: Any, *, require_user, assistant) -> None:
             row = store.add_assistant_message(
                 user_id=user["user_id"], role="assistant", thread_id=thread_id,
                 answer_source="limit",
-                content=(f"That is all {limit} messages for today. They come back at "
-                         f"{assistant.resets_at(config, kind='message')}, and your "
-                         f"results are on your dashboard in the meantime."))
+                content=(f"That's all {limit} messages for today \u2014 they come back at "
+                         f"{assistant.resets_at(config, kind='message')}. Your results "
+                         f"are still on your dashboard in the meantime. "
+                         f"{OUT_OF_MESSAGES_MARK}"))
             store.touch_thread(thread_id)
             return {"threadId": thread_id, "message": message_out(row)}
 

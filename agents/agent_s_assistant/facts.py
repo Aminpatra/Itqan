@@ -96,7 +96,8 @@ def _when(value: Any) -> str:
 def build_fact_sheet(*, readiness: Any, jobs: list[dict[str, Any]],
                      courses: list[dict[str, Any]], gaps: list[str],
                      suggested_role: Optional[dict[str, Any]],
-                     matched_at: Optional[str]) -> str:
+                     matched_at: Optional[str],
+                     knows_role: Optional[str] = None) -> str:
     """One user's results, as lines the model may quote from.
 
     Built from `api/mapping`'s already-published shapes, so the honesty work
@@ -121,6 +122,23 @@ def build_fact_sheet(*, readiness: Any, jobs: list[dict[str, Any]],
                      + (f" — {suggested_role['why']}" if suggested_role.get("why") else ""))
     else:
         lines.append("Role the analysis suggests: none yet")
+
+    # Did they say they know what they are aiming for?
+    #
+    # Three states, and the third is not the second. `None` means the question
+    # was never asked — every account that onboarded before it existed — and
+    # reading that as "no" would have Hud offer to explore roles to someone who
+    # never said they were unsure.
+    #
+    # 'no' is the person this product exists for: they stopped and said they do
+    # not know. That is an opening to help, not a blank field to ignore.
+    if knows_role == "no":
+        lines.append("They have said they do NOT yet know which role they want. "
+                     "Offer to help them explore, rather than waiting to be asked.")
+    elif knows_role == "yes":
+        lines.append("They have said they know which role they are aiming for.")
+    else:
+        lines.append("Whether they know which role they want: not asked.")
 
     lines.append("")
     lines.append(f"Matched jobs ({len(jobs)}):" if jobs else "Matched jobs: none yet")

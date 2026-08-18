@@ -623,6 +623,60 @@ class AppStore:
              json.dumps(suggestions) if suggestions is not None else None,
              json.dumps(attachments) if attachments is not None else None))
 
+    # --- recommendation feedback --------------------------------------------
+    def record_feedback(self, *, user_id: str, subject: str, item_id: str,
+                        verdict: str, reason: Optional[str] = None,
+                        note: Optional[str] = None, replaced: bool = False) -> dict[str, Any]:
+        """Append one verdict. Never an UPDATE — see the migration for why."""
+        return self._one(
+            """
+            INSERT INTO app_feedback
+                (feedback_id, user_id, subject, item_id, verdict, reason, note, replaced)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (f"fb_{secrets.token_hex(8)}", user_id, subject, item_id,
+             verdict, reason, note, replaced))
+
+    def latest_feedback(self, user_id: str) -> list[dict[str, Any]]:
+        """The current verdict on each item, one row per item.
+
+        `DISTINCT ON` rather than a subquery with MAX: the table is append-only,
+        so "current" means the newest row per `(subject, item_id)` and Postgres
+        can answer that from the index directly.
+
+        Withdrawing an opinion is therefore just a newer row — which is what
+        makes an accidental dislike recoverable rather than permanent.
+        """
+        return self._all(
+            """
+            SELECT DISTINCT ON (subject, item_id) subject, item_id, verdict, reason, created_at
+              FROM app_feedback
+             WHERE user_id = %s
+             ORDER BY subject, item_id, created_at DESC
+            """,
+            (user_id,))
+
+    def disliked_ids(self, user_id: str, subject: str) -> set[str]:
+        """What to leave out of this user's results.
+
+        Only items whose LATEST verdict is a dislike, so changing your mind
+        genuinely restores the card. A set, because the caller filters a list
+        against it and the membership test should not be linear.
+        """
+        rows = self._all(
+            """
+            SELECT item_id FROM (
+                SELECT DISTINCT ON (item_id) item_id, verdict
+                  FROM app_feedback
+                 WHERE user_id = %s AND subject = %s
+                 ORDER BY item_id, created_at DESC
+            ) current
+            WHERE verdict = 'dislike'
+            """,
+            (user_id, subject))
+        return {r["item_id"] for r in rows}
+
     # --- chat threads -------------------------------------------------------
     def create_thread(self, *, user_id: str, title: str) -> dict[str, Any]:
         """Start a thread. The title is the first question and is never rewritten."""

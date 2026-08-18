@@ -311,3 +311,31 @@ def test_a_real_language_level_is_not_mistaken_for_a_handle():
              "- [C1] A2 English for Developers")
     assert verify_answer("Aim for a C1 level next.", sheet) is None
     assert verify_answer("Look at [C1].", sheet) is not None
+
+
+def test_the_out_of_messages_turn_carries_the_mark(signed_in, monkeypatch):
+    """A specific requirement, so it is asserted on the exact codepoints.
+
+    U+261D INDEX POINTING UP plus U+1F3FB, the skin-tone modifier. Losing the
+    modifier renders a different, yellower emoji while looking identical in a
+    diff — which is precisely why this is checked as codepoints and not by eye.
+
+    It lives in a template we write, never in something the model is asked to
+    remember, so it holds every time rather than most of the time.
+    """
+    from api.chat import OUT_OF_MESSAGES_MARK
+
+    assert [ord(c) for c in OUT_OF_MESSAGES_MARK] == [0x261D, 0x1F3FB]
+
+    monkeypatch.setattr(signed_in.app.state.config, "assistant_daily_messages", 1)
+    _ask(signed_in, "one")
+    message = _ask(signed_in, "two").json()["message"]
+
+    assert message["text"].endswith(OUT_OF_MESSAGES_MARK)
+
+
+def test_an_ordinary_answer_does_not_carry_the_mark(signed_in):
+    """It marks running out, not talking. On every turn it would be noise."""
+    from api.chat import OUT_OF_MESSAGES_MARK
+
+    assert OUT_OF_MESSAGES_MARK not in _ask(signed_in, "hello").json()["message"]["text"]

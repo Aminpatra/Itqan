@@ -14,6 +14,7 @@ surfaces in `shared/`, so the eligibility predicates stay single-sourced.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -57,6 +58,8 @@ def _sha256(value: str) -> str:
     import hashlib
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+log = logging.getLogger("itqan.api")
+
 SESSION_COOKIE = "itqan_session"          # names fixed by dev/site-plugin.ts
 LOCALE_COOKIE = "itqan_locale"
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024       # the UI states 10 MB
@@ -66,6 +69,17 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024       # the UI states 10 MB
 DOCUMENT_KINDS = {"cv", "transcript", "certificate", "certification",
                   "recommendation", "other"}
 REQUIRED_KIND = "cv"
+
+# Fixed ids the client sends verbatim; translated in the front end, never on the
+# wire (BACKEND.md 1.5). Kept here so an unknown value can be DROPPED rather than
+# stored — a reason nothing can render is worse than no reason at all.
+FEEDBACK_SUBJECTS = ("job", "course")
+DISLIKE_REASONS = {
+    "job": ("notInterested", "wrongLocation", "wrongLevel", "wrongField",
+            "employer", "other"),
+    "course": ("notInterested", "alreadyKnow", "tooAdvanced", "tooBasic",
+               "tooLong", "price", "other"),
+}
 
 # Same rule as itqan-website/src/scripts/form.ts and the dev plugin. Three places
 # must agree; if this changes, change all three or dev accepts what prod rejects.
@@ -827,17 +841,148 @@ def create_app(config: Optional[Config] = None, *,
         return mapping.dashboard(row["profile"] or {}, row["skill_gap"] or {},
                                  row["recommendations"] or {})
 
+    def _without_disliked(items, *, user_id: str, subject: str):
+        """Drop what this account has turned down.
+
+        **Filtered HERE rather than inside the agents**, and that is what makes
+        it safe to ship without a before/after on a real profile: removing rows
+        from a published list is subtraction. It cannot move a `gap_score`,
+        cannot reorder a ranking, and leaves the stored envelope exactly as
+        Agent C and Agent E produced it — the record still says what the pipeline
+        concluded, and only the view is narrowed.
+
+        Only the LATEST verdict counts, so withdrawing a dislike restores the
+        card. That matters more than it sounds: an accidental tap would otherwise
+        remove a real vacancy from someone's list for good.
+        """
+        disliked = app.state.store.disliked_ids(user_id, subject)
+        if not disliked:
+            return items
+        return [item for item in items if item.get("id") not in disliked]
+
     @app.get("/api/jobs")
     async def jobs_route(request: Request) -> Any:
+        user = require_user(request)
         row = _envelopes(request)
         # An empty list, not a 404: "no matches yet" is a normal state the UI
         # renders as an empty view, and a 404 would read as a broken route.
-        return mapping.job_matches(row["skill_gap"] or {}) if row else []
+        if not row:
+            return []
+        return _without_disliked(mapping.job_matches(row["skill_gap"] or {}),
+                                 user_id=user["user_id"], subject="job")
 
     @app.get("/api/courses")
     async def courses_route(request: Request) -> Any:
+        user = require_user(request)
         row = _envelopes(request)
-        return mapping.courses(row["recommendations"] or {}) if row else []
+        if not row:
+            return []
+        return _without_disliked(mapping.courses(row["recommendations"] or {}),
+                                 user_id=user["user_id"], subject="course")
+
+    # ---- recommendation feedback -------------------------------------------
+    @app.post("/api/preferences/feedback")
+    async def send_feedback(request: Request) -> Any:
+        """Record a like or a dislike.
+
+        `subject` and `verdict` are rejected outright when unknown, because a row
+        that is neither a like nor a dislike means nothing. An unrecognised
+        REASON is treated differently: it is dropped, counted, and the verdict is
+        kept. The client sends this fire-and-forget and swallows failures, so a
+        400 would discard the thumb along with the reason — losing the part worth
+        having in order to reject the part that was optional anyway.
+        """
+        user = require_user(request)
+        body = await request.json()
+        subject = str(body.get("subject") or "")
+        verdict = str(body.get("verdict") or "")
+        item_id = str(body.get("itemId") or "").strip()
+
+        if subject not in FEEDBACK_SUBJECTS:
+            return JSONResponse({"error": "bad_subject"}, status_code=400)
+        if verdict not in ("like", "dislike"):
+            return JSONResponse({"error": "bad_verdict"}, status_code=400)
+        if not item_id:
+            return JSONResponse({"error": "bad_item"}, status_code=400)
+
+        reason = body.get("reason") or None
+        if reason is not None and reason not in DISLIKE_REASONS[subject]:
+            log.warning("dropping unrecognised %s feedback reason %r", subject, reason)
+            reason = None
+        # A note only means anything alongside `other`, so it is kept out
+        # otherwise rather than letting the column become a second free-text
+        # field nobody renders.
+        note = (body.get("note") or None) if reason == "other" else None
+
+        app.state.store.record_feedback(
+            user_id=user["user_id"], subject=subject, item_id=item_id,
+            verdict=verdict, reason=reason, note=note,
+            replaced=bool(body.get("replaced")))
+        return {"ok": True}
+
+    @app.get("/api/preferences/feedback")
+    async def read_feedback(request: Request) -> Any:
+        """The latest verdict per item, so a card renders the state it was left
+        in. Empty on a new account, and that is a 200 — absent means no opinion,
+        which is not the same as neutral."""
+        user = require_user(request)
+        out: dict[str, dict[str, str]] = {"jobs": {}, "courses": {}}
+        for row in app.state.store.latest_feedback(user["user_id"]):
+            bucket = "jobs" if row["subject"] == "job" else "courses"
+            out[bucket][row["item_id"]] = row["verdict"]
+        return out
+
+    @app.post("/api/courses/similar")
+    async def similar_course(request: Request) -> Any:
+        """A different course closing the SAME gap as the rejected one.
+
+        Matched on the missing skill the rejected course was recommended for, not
+        on provider or title: "similar" has to mean "closes the same gap", or the
+        replacement is just the next row down wearing a different name.
+
+        `exclude` carries every course already on screen and honouring it is not
+        optional — without it the natural implementation hands back the card
+        sitting directly below, and the person watches a course they can already
+        see slide into the slot they just cleared. Anything previously disliked
+        is skipped for the same reason.
+
+        **null is a real answer**, and means nothing else closes that gap. The
+        screen has copy for it. It must never receive an unrelated course dressed
+        up as a match, and never the rejected one back.
+        """
+        user = require_user(request)
+        body = await request.json()
+        course_id = str(body.get("courseId") or "").strip()
+        excluded = {str(x) for x in (body.get("exclude") or [])}
+        excluded.add(course_id)
+        excluded |= app.state.store.disliked_ids(user["user_id"], "course")
+
+        row = _envelopes(request)
+        if not row or not course_id:
+            return None
+
+        recs = row["recommendations"] or {}
+        skill = mapping.gap_of_course(recs, course_id)
+        if not skill:
+            # The course is not one we recommended, so there is no gap to match
+            # a replacement against. Null rather than a guess.
+            return None
+
+        esco = mapping.esco_of_gap(row["skill_gap"] or {}, skill)
+        from shared.course_market import courses_for_skills
+
+        pools = courses_for_skills([esco] if esco else [], [] if esco else [skill],
+                                   config=app.state.config)
+        pool = (pools["by_esco"].get(esco) if esco else pools["by_key"].get(skill)) or []
+
+        for candidate in pool:
+            if candidate.course_id in excluded:
+                continue
+            return mapping.course_card(candidate, skill=skill,
+                                       retrieved_at=recs.get("generated_at") or "")
+        # Nothing else closes this gap. A real answer, and the screen says so —
+        # far better than an unrelated course dressed up as a match.
+        return None
 
     # ---- Agent S -----------------------------------------------------------
     # Registered last, and given `require_user` rather than reaching for it:

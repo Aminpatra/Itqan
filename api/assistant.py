@@ -163,9 +163,13 @@ def facts_for(store: Any, user_id: str) -> tuple[str, bool, Optional[str],
     from . import mapping
 
     row = store.latest_completed_run(user_id)
+    profile_prefs = (store.profile(user_id) or {}).get("payload") or {}
+    knows_role = ((profile_prefs.get("preferences") or {}).get("knowsRole")) or None
+
     if row is None:
         return (build_fact_sheet(readiness=None, jobs=[], courses=[], gaps=[],
-                                 suggested_role=None, matched_at=None),
+                                 suggested_role=None, matched_at=None,
+                                 knows_role=knows_role),
                 False, None, [], [])
 
     gap = row["skill_gap"] or {}
@@ -182,6 +186,7 @@ def facts_for(store: Any, user_id: str) -> tuple[str, bool, Optional[str],
             courses=courses,
             gaps=gaps_from(gap),
             suggested_role=mapping.suggested_role(gap),
+            knows_role=knows_role,
             matched_at=finished.isoformat() if hasattr(finished, "isoformat") else finished,
         ),
         True,
