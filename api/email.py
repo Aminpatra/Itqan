@@ -231,6 +231,13 @@ def send_in_background(*, to: str, subject: str, body: str,
         global SEND_FAILURES
         try:
             send(to=to, subject=subject, body=body, config=config, purpose=purpose)
+        except Undeliverable:
+            # Already counted as `refused` and already logged. NOT a send
+            # failure: `failed` is meant to say "the relay would not take it",
+            # and folding our own deliberate refusals into it would make a burst
+            # of test signups read as a relay outage — blunting the one number
+            # an operator is supposed to trust.
+            return
         except Exception as exc:                # noqa: BLE001 - never reaches a user
             with _FAILURE_LOCK:
                 SEND_FAILURES += 1

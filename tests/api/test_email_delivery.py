@@ -135,3 +135,23 @@ class _FakeSMTP:
         self.sink.append(message)
 
     last_reply = (250, b"2.0.0 Ok: queued as ABC123")
+
+
+def test_a_refusal_is_not_counted_as_a_relay_failure(monkeypatch):
+    """`failed` means "the relay would not take it". Folding our own deliberate
+    refusals into it would make a burst of test signups read as an outage,
+    blunting the one number an operator is meant to trust.
+
+    Found live: the first production signup to a .test address after the guard
+    shipped reported refused=1 AND failed=1.
+    """
+    monkeypatch.setenv("ITQAN_ENV", "production")
+    from shared.config import Config
+
+    thread = email_module.send_in_background(
+        to="probe@itqan.test", subject="s", body="b",
+        config=Config(smtp_host="relay.test"), purpose="verification")
+    thread.join(timeout=3)
+
+    assert email_module.SENDS_REFUSED == 1
+    assert email_module.SEND_FAILURES == 0
