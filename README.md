@@ -666,7 +666,7 @@ those tests are opt-in and skip cleanly when no database is configured:
 ```bash
 docker exec itqan-pg psql -U postgres -c "CREATE DATABASE itqan_test;"
 ITQAN_TEST_DATABASE_URL=postgresql://postgres:itqan_dev@localhost:5432/itqan_test \
-  python -m pytest tests/ -q          # ~365 tests including the database suite
+  python -m pytest tests/ -q          # 1,262 tests; 417 of them need this database
 ```
 
 The database tests use a **separate** database from `ITQAN_DATABASE_URL` — they truncate between

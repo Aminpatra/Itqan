@@ -22,6 +22,39 @@ Live at **tryitqan.com** — one OVH box, three containers (api, db, caddy), ~$6
 
 *(README's status section says "five agents". There are six: Agent S shipped after it was written.)*
 
+## Working on another machine
+
+**Docker is not required to work on this project.** It runs exactly one thing here — a Postgres
+container with pgvector. It is not a build system and not a runtime: `python main.py`, every agent,
+the API and both front ends run natively.
+
+Measured with the database switched off:
+
+```bash
+unset ITQAN_TEST_DATABASE_URL && python -m pytest tests/ -q   # 845 passed, 417 skipped
+python -m pytest tests/ -q                                    # 1,262 with a database
+```
+
+So a laptop with only Python and Node installed can write code, run the agents' logic, build both
+front ends, and pass two thirds of the suite. What the other 417 need — `tests/api/` and the three
+`tests/*/db/` suites — is **a Postgres with the pgvector extension**. Two ways to get one:
+
+* the container README documents under "Agent B needs Postgres with the **pgvector** extension",
+  plus its `CREATE DATABASE itqan_test` line;
+* **any hosted Postgres that offers pgvector.** The migrations build the schema on first connect and
+  the suites seed their own fixtures, so nothing has to be copied for tests to run. The choice is
+  about the extension, not about Docker.
+
+> **Never point `ITQAN_TEST_DATABASE_URL` at the VPS.** `tests/api/conftest.py` `TRUNCATE`s every
+> `app_*` table between tests. Aimed at production it would delete every account, every uploaded CV
+> and every stored profile — the same deletion that was once done deliberately, done here by
+> accident, in the time it takes one test to run. A throwaway database, always.
+
+**A fresh database is empty, and that surprises people.** Tests do not care. Running the agents or
+the API against real data does: the corpus is roughly **1.7 GB**, of which `esco_labels` is 1,706 MB
+(DEPLOY.md §4). That is a `pg_dump` to move between machines, not something a free tier will hold —
+and without it Agent C retrieves nothing, so the dashboard is empty rather than broken.
+
 ## State, measured rather than remembered
 
 Numbers rot. These two commands print the current ones:
