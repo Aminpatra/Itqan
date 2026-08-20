@@ -446,9 +446,28 @@ def course_card(candidate: Any, *, skill: str, retrieved_at: str) -> dict[str, A
     }
 
 
+def _drop(items: list[dict[str, Any]],
+          excluded: Optional[set[str]]) -> list[dict[str, Any]]:
+    """Remove what this account has turned down. Empty set, same list."""
+    if not excluded:
+        return items
+    return [item for item in items if item.get("id") not in excluded]
+
+
 def dashboard(profile: dict[str, Any], gap: dict[str, Any],
-              recommendations: dict[str, Any]) -> dict[str, Any]:
-    """`DashboardData`, assembled server-side from Agent C + Agent E."""
+              recommendations: dict[str, Any], *,
+              exclude_jobs: Optional[set[str]] = None,
+              exclude_courses: Optional[set[str]] = None) -> dict[str, Any]:
+    """`DashboardData`, assembled server-side from Agent C + Agent E.
+
+    The exclusions are what a person has turned down. They are taken HERE rather
+    than filtered by the caller because this function builds its own lists —
+    `topMatches` calls `job_matches` and `nextStep` calls `courses` — so a caller
+    filtering the returned dict would have to know that, and would have to keep
+    knowing it. That is exactly the miss this argument exists to fix: `/api/jobs`
+    and `/api/courses` were filtered, the dashboard was not, and a disliked
+    posting vanished from the Jobs screen while sitting on the front page.
+    """
     aggregate = gap.get("aggregate") or {}
     average = aggregate.get("average_gap_score")
 
@@ -473,9 +492,13 @@ def dashboard(profile: dict[str, Any], gap: dict[str, Any],
         "readinessNote": _readiness_note(average, len(missing)),
         "strengths": held[:5],
         "standings": standings,
-        "topMatches": job_matches(gap, limit=2),
+        # Filtered BEFORE the limit, not after: taking the top two and then
+        # dropping a disliked one would leave a single card where two were
+        # asked for, which reads as "we ran out of matches" rather than "you
+        # hid one".
+        "topMatches": _drop(job_matches(gap), exclude_jobs)[:2],
         "gaps": missing[:8],
-        "nextStep": _next_step(courses(recommendations), uncovered),
+        "nextStep": _next_step(_drop(courses(recommendations), exclude_courses), uncovered),
         "journey": _journey(gap, recommendations),
     }
 

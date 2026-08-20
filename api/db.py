@@ -313,6 +313,23 @@ class AppStore:
     def profile(self, user_id: str) -> Optional[dict[str, Any]]:
         return self._one("SELECT * FROM app_profiles WHERE user_id = %s", (user_id,))
 
+    def document(self, document_id: str, user_id: str) -> Optional[dict[str, Any]]:
+        """One document, and only if it belongs to this user.
+
+        `user_id` is in the WHERE clause rather than checked afterwards, so
+        another account's row is never fetched — the same shape `thread()` uses.
+        """
+        return self._one(
+            "SELECT * FROM app_documents WHERE document_id = %s AND user_id = %s",
+            (document_id, user_id))
+
+    def delete_document(self, document_id: str, user_id: str) -> int:
+        """Remove the row. The caller removes the file — see the route for why
+        both have to happen and why the file failing is not a user-facing error."""
+        return self._exec(
+            "DELETE FROM app_documents WHERE document_id = %s AND user_id = %s",
+            (document_id, user_id))
+
     def all_documents(self, user_id: str) -> list[dict[str, Any]]:
         """Every document this user has uploaded, newest first.
 

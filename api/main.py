@@ -633,6 +633,41 @@ def create_app(config: Optional[Config] = None, *,
             size_bytes=len(payload), kind=kind, stored_path=str(target))
         return mapping.uploaded_document(row)
 
+    @app.delete("/api/documents/{document_id}", status_code=204)
+    async def delete_document(request: Request, document_id: str) -> Response:
+        """Remove one uploaded document — the row AND the bytes.
+
+        Deleting the row while the file stays on disk is the privacy half done,
+        and the half nobody notices is the one still holding somebody's CV.
+
+        404 rather than 403 for another account's id, the same rule the chat
+        threads follow: confirming that a document exists is itself a disclosure.
+
+        **A completed run is not invalidated.** Its results are already stored as
+        an envelope, so removing the source changes nothing about what was
+        concluded. What it does change is a later re-run, which reads whatever
+        documents remain — which is the correct behaviour and the reason someone
+        deletes a file in the first place.
+        """
+        user = require_verified_user(request)
+        row = app.state.store.document(document_id, user["user_id"])
+        if row is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)  # type: ignore[return-value]
+
+        stored = row.get("stored_path")
+        app.state.store.delete_document(document_id, user["user_id"])
+        if stored:
+            try:
+                Path(stored).unlink(missing_ok=True)
+            except OSError as exc:
+                # The row is gone, so the document is gone as far as the product
+                # is concerned. A file we could not unlink is an operational
+                # problem, not a reason to tell the user their delete failed —
+                # and it must be visible to somebody, hence the log.
+                log.error("deleted document %s but could not remove %s: %s",
+                          document_id, stored, exc)
+        return Response(status_code=204)
+
     # ---- analysis: async job, real stage-driven progress -------------------
     @app.post("/api/analysis")
     async def start_analysis(request: Request) -> Any:
@@ -647,6 +682,37 @@ def create_app(config: Optional[Config] = None, *,
             # Agent A cannot run without a CV, so refuse here with a nameable
             # reason rather than letting the pipeline fail three stages in.
             return JSONResponse({"error": "cv_required"}, status_code=400)
+
+        # A RE-RUN COSTS THE WEEKLY CREDIT, whichever screen started it.
+        #
+        # The credit used to be claimed only inside POST /api/assistant/rerun, so
+        # it bound the chat and nothing else. The Documents screen calls this
+        # route through `beginReupload()` — re-reading the documents, showing
+        # Confirm and re-matching — for free and without limit. The chat asked
+        # permission and charged; the profile did the same work repeatedly for
+        # nothing.
+        #
+        # So the limit lives where the WORK starts rather than where one button
+        # is. A first analysis is free: no completed run means this is onboarding,
+        # including for someone who abandoned it half way and came back. Once a
+        # run has completed, every further one is a re-run by definition.
+        #
+        # The assistant's `full` mode claims before spawning and does not come
+        # through here, so nothing is charged twice — pinned by a test, because
+        # "these two paths do not overlap" is exactly the claim that quietly
+        # stops being true.
+        if app.state.store.latest_completed_run(user["user_id"]) is not None:
+            period = assistant_module.week_start(config)
+            if app.state.store.claim_quota(
+                    user["user_id"], kind="rerun",
+                    limit=config.assistant_weekly_reruns, period_start=period) is None:
+                return JSONResponse(
+                    {"error": "rerun_limit_reached",
+                     "message": ("You have used your re-run for this week. It comes back "
+                                 f"on {assistant_module.resets_at(config, kind='rerun')}."),
+                     "usage": assistant_module.quota_state(
+                         app.state.store, config, user["user_id"], "rerun")},
+                    status_code=429)
 
         run_id = _new_run_id()
         job_id = app.state.store.create_run(
@@ -835,11 +901,17 @@ def create_app(config: Optional[Config] = None, *,
 
     @app.get("/api/dashboard")
     async def dashboard(request: Request) -> Any:
+        user = require_user(request)
         row = _envelopes(request)
         if row is None:
             return JSONResponse({"error": "no_analysis"}, status_code=404)
-        return mapping.dashboard(row["profile"] or {}, row["skill_gap"] or {},
-                                 row["recommendations"] or {})
+        # The same source of truth the list screens use, so what is hidden
+        # cannot differ between the dashboard and the page it links to.
+        store: AppStore = app.state.store
+        return mapping.dashboard(
+            row["profile"] or {}, row["skill_gap"] or {}, row["recommendations"] or {},
+            exclude_jobs=store.disliked_ids(user["user_id"], "job"),
+            exclude_courses=store.disliked_ids(user["user_id"], "course"))
 
     def _without_disliked(items, *, user_id: str, subject: str):
         """Drop what this account has turned down.

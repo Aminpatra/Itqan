@@ -204,3 +204,36 @@ def test_not_asked_is_distinguishable_from_no(signed_in):
                                          "preferences": {**CONFIRMED["preferences"],
                                                          "knowsRole": None}})
     assert signed_in.get("/api/profile").json()["preferences"]["knowsRole"] is None
+
+
+def test_a_disliked_job_leaves_the_dashboard_too(signed_in):
+    """The miss that caused this bug. `/api/jobs` and `/api/courses` were
+    filtered and the dashboard was not — so a disliked posting vanished from the
+    Jobs screen and carried on sitting on the front page, which is the screen
+    people read first.
+
+    Asserted on `topMatches`, the surface that was wrong, rather than on the one
+    that was already right.
+    """
+    _finished_run(signed_in)
+    top = signed_in.get("/api/dashboard").json()["topMatches"]
+    if not top:
+        pytest.skip("the fixture run matched no jobs")
+
+    _feedback(signed_in, itemId=top[0]["id"], verdict="dislike")
+
+    after = signed_in.get("/api/dashboard").json()["topMatches"]
+    assert top[0]["id"] not in [j["id"] for j in after]
+
+
+def test_the_dashboard_still_offers_two_matches_when_it_can(signed_in):
+    """Filtered BEFORE the limit, not after. Taking the top two and then dropping
+    a disliked one leaves a single card where two were asked for, which reads as
+    "we ran out of matches" rather than "you hid one"."""
+    _finished_run(signed_in)
+    all_jobs = signed_in.get("/api/jobs").json()
+    if len(all_jobs) < 3:
+        pytest.skip("needs at least three matches to tell the two cases apart")
+
+    _feedback(signed_in, itemId=all_jobs[0]["id"], verdict="dislike")
+    assert len(signed_in.get("/api/dashboard").json()["topMatches"]) == 2

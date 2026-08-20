@@ -7,7 +7,8 @@ that succeeds and is wrong, which is silent and would corrupt the scam filter.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -16,8 +17,40 @@ from shared.config import Config
 from tests.agent_b.fake_source_client import AllowAllRobots, FakeClient, fixture
 
 
+_STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{2}:\d{2}"
+
+
+def recent(feed: str) -> str:
+    """Shift the fixture's timestamps so they sit inside the lookback window.
+
+    THE FIXTURE HAD ABSOLUTE DATES AND THE ADAPTER ONLY READS BACK
+    `blogger_lookback_days` (30). So these tests passed until the calendar walked
+    past the window and then failed with nobody having touched a line of code —
+    measured 2026-08-20, green on the 18th, entries dated 2026-07-20/21.
+
+    A suite that goes red on a date it was never told about is a suite people
+    stop trusting, and the failure looks exactly like a real regression while
+    somebody hunts for it.
+
+    Every stamp moves by the SAME offset, so the entries keep their order and
+    their spacing relative to each other; only their distance from today changes.
+    Nothing here asserts on the window itself — checked before doing this — so
+    the dates are incidental to what these tests are actually about.
+    """
+    stamps = re.findall(_STAMP, feed)
+    if not stamps:
+        return feed
+    newest = max(datetime.fromisoformat(x) for x in stamps)
+    # Yesterday, so "newest" is unambiguously inside any sane window without
+    # being in the future, which a feed parser would be right to distrust.
+    offset = (datetime.now(timezone.utc) - timedelta(days=1)) - newest
+    for stamp in set(stamps):
+        feed = feed.replace(stamp, (datetime.fromisoformat(stamp) + offset).isoformat())
+    return feed
+
+
 def build(feed: str | list[str] | None = None, **kwargs) -> El7farAdapter:
-    client = FakeClient({"/feeds/posts/default": feed or fixture("el7far_feed.xml")})
+    client = FakeClient({"/feeds/posts/default": feed or recent(fixture("el7far_feed.xml"))})
     return El7farAdapter(
         base_url="https://example.test",
         client=client,
@@ -62,9 +95,18 @@ def test_alternate_link_is_the_posting_not_the_comments_page():
 def test_dates_are_real_timestamps_normalized_to_utc():
     """A real ``published`` value means there is no relative-date string to
     re-resolve on each fetch — the trap that re-hashes every posting per cycle."""
-    posting = build().fetch().postings[0]
+    feed = recent(fixture("el7far_feed.xml"))
+    # Computed from the feed rather than hard-coded, so this asserts the PARSE —
+    # a real timestamp, converted from the feed's +03:00 to UTC — instead of a
+    # fixed instant that stops being reachable once the fixture ages out of the
+    # lookback window. See `recent`.
+    expected = max(datetime.fromisoformat(x)
+                   for x in re.findall(_STAMP, feed)).astimezone(timezone.utc)
 
-    assert posting.posted_date == datetime(2026, 7, 21, 7, 18, 24, 984000, tzinfo=timezone.utc)
+    posting = build(feed).fetch().postings[0]
+
+    assert posting.posted_date == expected
+    assert posting.posted_date.tzinfo == timezone.utc
     assert posting.posted_date_text is None
 
 
