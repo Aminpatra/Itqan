@@ -678,9 +678,31 @@ def create_app(config: Optional[Config] = None, *,
         docs = app.state.store.documents(user["user_id"], list(ids))
         if not docs:
             return JSONResponse({"error": "no_documents"}, status_code=400)
-        if not any(d["kind"] == REQUIRED_KIND for d in docs):
-            # Agent A cannot run without a CV, so refuse here with a nameable
-            # reason rather than letting the pipeline fail three stages in.
+
+        # THE NEWEST OF EACH KIND, NOT EVERY ONE SUBMITTED.
+        #
+        # `cv_paths` used to take every CV in the request, which was harmless only
+        # while two CVs never arrived together. The Documents screen now shows what
+        # is already on file, so replacing a CV submits the old one alongside the
+        # new one -- and Agent A reading both would blend two resumes into a
+        # profile describing nobody. It fails silently, too: there is no error, the
+        # details just quietly belong to a person who does not exist.
+        cvs = assistant_module.newest_of_kind(docs, REQUIRED_KIND)
+        transcripts = assistant_module.newest_of_kind(docs, "transcript")
+
+        # A REQUEST WITHOUT A CV IS NOT THE SAME AS AN ACCOUNT WITHOUT ONE.
+        #
+        # Someone who finished onboarding and later adds their transcript submits
+        # exactly one id, and it is not a CV. Judging the request alone refused
+        # them -- telling a person whose CV we are holding that a CV is required.
+        # A run is built from what is ON FILE, which is how the assistant's full
+        # re-run has always worked (`api/assistant.py`).
+        if not cvs:
+            cvs = assistant_module.newest_of_kind(
+                app.state.store.all_documents(user["user_id"]), REQUIRED_KIND)
+        if not cvs:
+            # No CV anywhere on the account: Agent A genuinely cannot run. Named
+            # here rather than failing three stages in.
             return JSONResponse({"error": "cv_required"}, status_code=400)
 
         # A RE-RUN COSTS THE WEEKLY CREDIT, whichever screen started it.
@@ -715,12 +737,18 @@ def create_app(config: Optional[Config] = None, *,
                     status_code=429)
 
         run_id = _new_run_id()
+        # What the run was actually built from, which now includes a CV the request
+        # did not name. Recording only the submitted ids would leave the run
+        # claiming it read documents it did not, and omitting the one it did.
+        submitted = {d["document_id"] for d in docs}
+        recorded = [d for d in cvs if d["document_id"] not in submitted] + docs
         job_id = app.state.store.create_run(
-            user_id=user["user_id"], run_id=run_id, document_ids=[d["document_id"] for d in docs])
+            user_id=user["user_id"], run_id=run_id,
+            document_ids=[d["document_id"] for d in recorded])
         jobs_module.spawn(
             app.state.store, app.state.runner, job_id=job_id, run_id=run_id,
-            cv_paths=[d["stored_path"] for d in docs if d["kind"] == REQUIRED_KIND],
-            transcript_paths=[d["stored_path"] for d in docs if d["kind"] == "transcript"])
+            cv_paths=[d["stored_path"] for d in cvs],
+            transcript_paths=[d["stored_path"] for d in transcripts])
         return {"jobId": job_id}
 
     @app.get("/api/analysis/{job_id}")

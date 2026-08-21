@@ -121,10 +121,18 @@ def gaps_from(gap: dict[str, Any]) -> list[Any]:
     return list(aggregate.get("most_common_missing_skills") or [])[:10]
 
 
-def _newest(docs: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+def newest_of_kind(docs: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
     """The most recent document of one kind, or none.
 
-    `all_documents` returns newest first, so this takes the head. One CV, not
+    Public because `POST /api/analysis` needs the SAME answer this route does:
+    two paths that pick different CVs for the same account would be a genuinely
+    confusing bug, and the way to prevent it is one function rather than two that
+    agree today.
+
+    Callers must pass a newest-first list -- `all_documents` and `documents` both
+    order that way.
+
+    One CV, not
     every CV a person has ever uploaded: re-reading three old resumes alongside
     the current one would blend them into a profile that describes nobody.
     """
@@ -416,8 +424,8 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
                 run_id = f"run_{uuid.uuid4().hex[:12]}"
                 # The newest of each kind, so a CV uploaded since the last run is
                 # what gets read — which is the main reason to want this at all.
-                cvs = _newest(docs, "cv")
-                transcripts = _newest(docs, "transcript")
+                cvs = newest_of_kind(docs, "cv")
+                transcripts = newest_of_kind(docs, "transcript")
                 job_id = store.create_run(
                     user_id=user["user_id"], run_id=run_id,
                     document_ids=[d["document_id"] for d in cvs + transcripts])

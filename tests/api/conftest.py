@@ -85,9 +85,14 @@ class FakeRunner(PipelineRunner):
         # check that the user's answers actually reached the pipeline rather than
         # being written to a table and forgotten.
         self.flags: dict[str, list[str]] = {}
+        # The files Agent A was actually handed. "It returned 200" would pass even
+        # if the transcript were silently dropped, or if two resumes were read
+        # together -- neither of which surfaces as an error anywhere.
+        self.read: dict[str, list[str]] = {"cv": [], "transcript": []}
 
     def run_agent_a(self, *, cv_paths, transcript_paths, run_id, on_node) -> dict[str, Any]:
         self.calls.append("A")
+        self.read = {"cv": list(cv_paths), "transcript": list(transcript_paths)}
         # Replays the REAL node names in the real order, so the tests drive the
         # actual checkpoint schedule rather than a made-up one. A rename in Agent
         # A's graph that the progress policy has not been told about shows up here

@@ -182,11 +182,18 @@ class AppStore:
 
     def documents(self, user_id: str, ids: list[str]) -> list[dict[str, Any]]:
         """Scoped to the owner on purpose: a document id in someone else's
-        request must not be readable just because it exists."""
+        request must not be readable just because it exists.
+
+        **Newest first, like `all_documents`.** Without the ORDER BY the row order
+        was whatever Postgres felt like returning, which was harmless while every
+        caller treated the result as a set -- and stops being harmless the moment
+        one of them asks for "the newest CV" and silently gets an arbitrary one.
+        """
         if not ids:
             return []
         return self._all(
-            "SELECT * FROM app_documents WHERE user_id = %s AND document_id = ANY(%s)",
+            "SELECT * FROM app_documents WHERE user_id = %s AND document_id = ANY(%s) "
+            "ORDER BY created_at DESC",
             (user_id, ids))
 
     # --- runs ---------------------------------------------------------------
