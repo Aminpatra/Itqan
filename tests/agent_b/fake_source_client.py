@@ -13,6 +13,9 @@ silently reaching the real implementation.
 
 from __future__ import annotations
 
+import re
+from datetime import datetime, timedelta, timezone
+
 from pathlib import Path
 
 import httpx
@@ -72,3 +75,38 @@ class AllowAllRobots:
 
     def require(self, url: str) -> None:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Fixture dates that do not rot
+# ---------------------------------------------------------------------------
+_STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{2}:\d{2}"
+
+
+def recent(feed: str) -> str:
+    """Shift the fixture's timestamps so they sit inside the lookback window.
+
+    THE FIXTURE HAD ABSOLUTE DATES AND THE ADAPTER ONLY READS BACK
+    `blogger_lookback_days` (30). So these tests passed until the calendar walked
+    past the window and then failed with nobody having touched a line of code —
+    measured 2026-08-20, green on the 18th, entries dated 2026-07-20/21.
+
+    A suite that goes red on a date it was never told about is a suite people
+    stop trusting, and the failure looks exactly like a real regression while
+    somebody hunts for it.
+
+    Every stamp moves by the SAME offset, so the entries keep their order and
+    their spacing relative to each other; only their distance from today changes.
+    Nothing here asserts on the window itself — checked before doing this — so
+    the dates are incidental to what these tests are actually about.
+    """
+    stamps = re.findall(_STAMP, feed)
+    if not stamps:
+        return feed
+    newest = max(datetime.fromisoformat(x) for x in stamps)
+    # Yesterday, so "newest" is unambiguously inside any sane window without
+    # being in the future, which a feed parser would be right to distrust.
+    offset = (datetime.now(timezone.utc) - timedelta(days=1)) - newest
+    for stamp in set(stamps):
+        feed = feed.replace(stamp, (datetime.fromisoformat(stamp) + offset).isoformat())
+    return feed

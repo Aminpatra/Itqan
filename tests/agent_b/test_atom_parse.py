@@ -8,45 +8,15 @@ that succeeds and is wrong, which is silent and would corrupt the scam filter.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
 from agents.agent_b_job_ingest.sources.el7far import El7farAdapter, canonical_url
 from shared.config import Config
-from tests.agent_b.fake_source_client import AllowAllRobots, FakeClient, fixture
+from tests.agent_b.fake_source_client import _STAMP, recent, AllowAllRobots, FakeClient, fixture
 
 
-_STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{2}:\d{2}"
-
-
-def recent(feed: str) -> str:
-    """Shift the fixture's timestamps so they sit inside the lookback window.
-
-    THE FIXTURE HAD ABSOLUTE DATES AND THE ADAPTER ONLY READS BACK
-    `blogger_lookback_days` (30). So these tests passed until the calendar walked
-    past the window and then failed with nobody having touched a line of code —
-    measured 2026-08-20, green on the 18th, entries dated 2026-07-20/21.
-
-    A suite that goes red on a date it was never told about is a suite people
-    stop trusting, and the failure looks exactly like a real regression while
-    somebody hunts for it.
-
-    Every stamp moves by the SAME offset, so the entries keep their order and
-    their spacing relative to each other; only their distance from today changes.
-    Nothing here asserts on the window itself — checked before doing this — so
-    the dates are incidental to what these tests are actually about.
-    """
-    stamps = re.findall(_STAMP, feed)
-    if not stamps:
-        return feed
-    newest = max(datetime.fromisoformat(x) for x in stamps)
-    # Yesterday, so "newest" is unambiguously inside any sane window without
-    # being in the future, which a feed parser would be right to distrust.
-    offset = (datetime.now(timezone.utc) - timedelta(days=1)) - newest
-    for stamp in set(stamps):
-        feed = feed.replace(stamp, (datetime.fromisoformat(stamp) + offset).isoformat())
-    return feed
 
 
 def build(feed: str | list[str] | None = None, **kwargs) -> El7farAdapter:

@@ -18,7 +18,8 @@ from agents.agent_b_job_ingest.sources.el7far import El7farAdapter
 from agents.agent_b_job_ingest.sources.telegram import TelegramAdapter
 from shared.config import Config
 from shared.scraping.http import Blocked, decode_body
-from tests.agent_b.fake_source_client import AllowAllRobots, FakeClient, fixture
+from tests.agent_b.fake_source_client import (AllowAllRobots, FakeClient, fixture,
+                                              recent)
 
 ATOM_EMPTY = (
     '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">'
@@ -40,7 +41,12 @@ def test_a_capped_fetch_must_not_age_inventory():
     """--limit truncates the fetch but the source is still healthy. Ageing on it
     marks live postings as missing: a run of capped cycles pushed 139 real
     postings to missed_cycles=2, one short of stale, on the live corpus."""
-    feed = fixture("el7far_feed.xml")
+    # `recent()`, not the raw fixture: its entries carry absolute dates from
+    # 2026-07-20/21 against a 30-day lookback, so this test went red on
+    # 2026-08-21 with nobody having touched the code -- the feed simply aged
+    # out of the window, the adapter returned no postings, and the cap it is
+    # meant to trip was never reached.
+    feed = recent(fixture("el7far_feed.xml"))
     full = _el7far(feed).fetch()
     capped = _el7far(feed).fetch(limit=1)
 
