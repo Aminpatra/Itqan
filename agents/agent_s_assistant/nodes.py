@@ -58,6 +58,10 @@ def make_answer(deps: Deps) -> Callable[[AssistantState], dict[str, Any]]:
             chain = ASSISTANT_PROMPT | deps.llm
             reply: AssistantReply = chain.invoke({
                 "facts": state.get("fact_sheet", ""),
+                # "" when nothing cleared the similarity floor, which the prompt
+                # reads as "the documentation does not cover this" rather than as
+                # an invitation to answer from general knowledge.
+                "about": state.get("knowledge", ""),
                 "history": _history_text(
                     state.get("history") or [],
                     limit=deps.config.assistant_history_turns),
@@ -94,10 +98,15 @@ def make_verify(deps: Deps) -> Callable[[AssistantState], dict[str, Any]]:
     def verify(state: AssistantState) -> dict[str, Any]:
         text = state.get("answer") or ""
         fact_sheet = state.get("fact_sheet", "")
+        knowledge = state.get("knowledge", "")
 
         problem: Optional[str] = None
         if state.get("answer_source") == "model":
-            problem = verify_answer(text, fact_sheet)
+            # BOTH blocks. The rule is unchanged — the model may state only what
+            # it was shown — and the documentation is now part of what it was
+            # shown. Checking against the fact sheet alone would reject every
+            # correct answer about the product itself.
+            problem = verify_answer(text, fact_sheet, knowledge)
 
         if state.get("answer_source") == "template" or problem:
             return {

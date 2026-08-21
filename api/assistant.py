@@ -28,6 +28,7 @@ controls.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -40,6 +41,11 @@ from agents.agent_s_assistant.facts import build_fact_sheet
 from agents.agent_s_assistant.graph import build_assistant_graph
 from agents.agent_s_assistant.nodes import Deps
 from shared.config import Config
+
+# `itqan.*` so `_configure_logging` in api/main.py picks it up at INFO. A logger
+# outside that namespace inherits a root with no handlers and its warnings are
+# dropped — which is how the mail hand-off line went missing once already.
+log = logging.getLogger("itqan.assistant")
 
 MAX_QUESTION_CHARS = 2_000
 
@@ -147,6 +153,41 @@ def graph_for(app: Any) -> Any:
     return build_assistant_graph(
         Deps(config=app.state.config,
              llm=getattr(app.state, "assistant_llm", None)))
+
+
+def knowledge_for(app: Any, question: str, *, locale: str = "en") -> str:
+    """Itqan's own documentation, the part relevant to this question, or "".
+
+    **Retrieved here rather than inside the graph, and that placement is the
+    point.** `agents/agent_s_assistant/graph.py` states that no node of Agent S
+    reads a database — which is what makes "the model cannot act" a fact about
+    the code instead of a promise in a prompt. The fact sheet is assembled at
+    this layer for the same reason; this joins it.
+
+    **Never raises.** The knowledge base is an addition to what Hud can answer,
+    not a dependency of answering at all. An unreachable database, a missing
+    extension or an embedding call that times out must cost the ABOUT block and
+    nothing else: Hud then answers from the fact sheet exactly as it did before
+    any of this existed, rather than the whole turn failing over documentation
+    the person may not even have asked about.
+    """
+    embedder = getattr(app.state, "knowledge_embedder", None)
+    if embedder is None:
+        return ""
+    try:
+        from . import knowledge as knowledge_module
+
+        passages = knowledge_module.search(
+            question,
+            dsn=app.state.config.require_database_url(),
+            embedder=embedder,
+            locale=locale if locale in ("en", "ar") else "en",
+            config=app.state.config)
+        return knowledge_module.knowledge_block(passages)
+    except Exception as exc:  # noqa: BLE001 - an enhancement must not take the turn down
+        log.warning("knowledge lookup failed, answering without it: %s: %s",
+                    type(exc).__name__, exc)
+        return ""
 
 
 def facts_for(store: Any, user_id: str) -> tuple[str, bool, Optional[str],
@@ -282,6 +323,8 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
             result = _graph().invoke({
                 "question": question,
                 "fact_sheet": fact_sheet,
+                "knowledge": knowledge_for(app, question,
+                                           locale=user.get("locale") or "en"),
                 "history": [{"role": r["role"], "content": r["content"]}
                             for r in history_rows],
                 "has_results": has_results,

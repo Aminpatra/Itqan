@@ -721,3 +721,29 @@ python main.py status
 
 Reach for it before asking "why did the recommendations change?": a stale aggregation window, a degraded
 source, or a drop in ESCO coverage all show up here, and each of them moves the output.
+
+---
+
+## The assistant's knowledge base
+
+Agent S answers questions about a person's own results from a fact sheet, and questions about **Itqan
+itself** — what it is, how the matching works, what happens to a CV — from documents in
+`docs/knowledge/`, retrieved per question.
+
+```bash
+python main.py knowledge --dry-run     # what would be ingested, and how it splits
+python main.py knowledge --ingest      # chunk, embed, store
+```
+
+**Run the ingest after editing anything under `docs/knowledge/`, and once on any new deployment.** The
+table is created by the API's boot-time migration but ships empty, so until it is loaded Hud answers
+every product question with "I do not have anything on that." Unchanged passages are not re-embedded,
+so re-running it costs nothing.
+
+Two rules for that content, both enforced by `tests/test_knowledge_documents.py`:
+
+- **English and Arabic in step.** Files are `<slug>.<en|ar>.md`, and a document present in one language
+  only fails the suite — the same parity rule the interface's i18n files are held to.
+- **No figure that rots.** Anything written there becomes quotable by Hud as present-tense fact, because
+  `verify_answer` accepts a figure that appears in a retrieved passage. Corpus sizes and test counts stay
+  out; live numbers come from the fact sheet, which is measured per request.

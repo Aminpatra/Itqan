@@ -39,3 +39,8 @@ Thumbs.db
 # Real CVs kept beside the project for manual runs — not fixtures.
 *.pdf
 !tests/**/*.pdf
+# The assistant's knowledge base ships, PDFs included. Without this exception a
+# PDF added to docs/knowledge/ would ingest perfectly on a laptop and be missing
+# from the image — so `knowledge --ingest` on the box would quietly load fewer
+# documents than the author saw, with nothing anywhere reporting a difference.
+!docs/knowledge/**/*.pdf

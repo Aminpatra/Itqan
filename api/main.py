@@ -152,6 +152,7 @@ def create_app(config: Optional[Config] = None, *,
                store: Optional[AppStore] = None,
                runner: Optional[jobs_module.PipelineRunner] = None,
                assistant_llm: Any = None,
+               knowledge_embedder: Any = None,
                migrate: bool = True) -> FastAPI:
     """Dependencies are injected, like every agent's `Deps` — so the tests drive
     the real routes with a fake pipeline and never touch OpenAI or OCR."""
@@ -182,6 +183,15 @@ def create_app(config: Optional[Config] = None, *,
         from agents.agent_s_assistant.schemas import AssistantReply
         from shared.llm import build_llm, structured
         app.state.assistant_llm = structured(build_llm(config), AssistantReply)
+
+    # The embedder that turns a question into a knowledge-base lookup. Same
+    # posture as the model above: injected in tests, built lazily otherwise, and
+    # its absence degrades rather than raises — no embedder means no ABOUT block,
+    # so Hud answers from the fact sheet exactly as it did before this existed.
+    app.state.knowledge_embedder = knowledge_embedder
+    if knowledge_embedder is None and os.getenv("OPENAI_API_KEY"):
+        from shared.embeddings import build_embedder
+        app.state.knowledge_embedder = build_embedder(config)
 
     # ---- session plumbing -------------------------------------------------
     def current_user(request: Request) -> Optional[dict[str, Any]]:

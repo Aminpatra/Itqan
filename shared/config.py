@@ -452,6 +452,37 @@ class Config:
     # user controls how often we call a model.
     assistant_history_turns: int = 10
 
+    # --- the knowledge base ("what is Itqan?") ---
+    #
+    # How many passages from `docs/knowledge/` may reach the prompt, and how
+    # similar one must be to get there.
+    #
+    # THE FLOOR CANNOT SEPARATE PRODUCT QUESTIONS FROM RESULTS QUESTIONS, and it
+    # was designed on the assumption that it could. Measured 2026-08-21 over all
+    # 42 passages, the two populations OVERLAP:
+    #
+    #   0.561  "what are my gaps?"          -> your-results      (a results question)
+    #   0.462  "do employers see my CV?"    -> privacy           (a product question)
+    #   0.330  "هل يرى أصحاب العمل سيرتي؟"  -> what-is-itqan     (a product question)
+    #
+    # The overlap is structural, not noise: the documentation EXPLAINS the results
+    # features, so a question about your own gaps genuinely matches the page about
+    # gaps. No threshold can split them, and one chosen high enough to try would
+    # cut off real product questions in Arabic, which score lower throughout.
+    #
+    # So the floor does the job it can actually do — dropping turns with no
+    # question in them — and the separation is the PROMPT's, which tells the model
+    # to answer from the FACTS when the question is about the person's own
+    # results. Measured at this value:
+    #
+    #   dropped: "Hi" 0.294, "thanks" 0.234, "كيف حالي؟" 0.227
+    #   kept:    every product question, the lowest being 0.330
+    #
+    # Re-measure when documents are added: the number to watch is the lowest true
+    # product question, and Arabic sets it.
+    assistant_knowledge_top_k: int = 4
+    assistant_knowledge_min_similarity: float = 0.30
+
     # --- scraping ---
     user_agent: str = field(
         default_factory=lambda: os.getenv(

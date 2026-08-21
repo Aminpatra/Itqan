@@ -51,6 +51,11 @@ AGENTS = {
         "agents.agent_s_assistant.cli",
         "Ask about a user's own results (reads what A/C/E produced; spends no quota)",
     ),
+    "knowledge": (
+        "api.knowledge_cli",
+        "Load docs/knowledge/ into the assistant's knowledge base, so Hud can "
+        "answer questions about Itqan itself",
+    ),
     "status": (
         "agents.status",
         "One read-only view of the whole system: corpus, aggregation freshness, "

@@ -158,6 +158,17 @@ a stale `origin/main`, and a fast-forward then swept in an unrelated tree.
 
 ## Open threads
 
+- **The knowledge base must be loaded on every deployment**, and nothing does it automatically.
+  `api/migrations/0010` creates the table on boot; `python main.py knowledge --ingest` fills it from
+  `docs/knowledge/`. Until it is run, Agent S answers every question about Itqan itself with "I do not
+  have anything on that" — which looks exactly like the feature not having shipped. Re-run it after
+  editing any document; unchanged passages cost nothing.
+- **The retrieval floor cannot separate product questions from results questions**, and it was designed
+  on the assumption that it could. Measured 2026-08-21: "what are my gaps?" scores 0.561 against the
+  page explaining gaps, higher than "do employers see my CV?" scores against the privacy page (0.462).
+  The overlap is structural — the documentation explains the results features — so the separation is the
+  prompt's job and the floor only drops greetings. The numbers are in `shared/config.py`; the one to
+  watch when documents are added is the lowest true Arabic question, which sets it.
 - **SPF is broken.** `tryitqan.com` publishes `v=spf1 -all`, which authorises *nobody* to send as the
   domain. DKIM (`brevo1` / `brevo2` selectors) and the Brevo verification token are present, so the
   fix is one record — Brevo documents `include:spf.brevo.com`. Confirm the exact value on Brevo's

@@ -15,6 +15,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from shared.text_norm import fold_digits
+
 # Reused from Agent E's verifier, deliberately identical in behaviour: comma
 # stripping and trailing-zero normalisation so "1,919" and "1919" — and "4.70"
 # and "4.7" — are the same token.
@@ -22,9 +24,26 @@ _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 # Internal vocabulary that must never reach a user. `gap_score` is a number
 # whose scale is backwards from intuition (0.0 is the BEST), and a user reading
-# "your gap score is 0.0" would draw exactly the wrong conclusion.
-_FORBIDDEN = ("esco", "gap_score", "priority_score", "skill_key", "posting_id",
+# "your gap score is 0.0" would draw exactly the wrong conclusion. The rest are
+# identifiers — a sha or a column name — that mean nothing to the person reading
+# them and cannot be made to mean anything.
+_FORBIDDEN = ("gap_score", "priority_score", "skill_key", "posting_id",
               "duplicate_of", "final_url", "fact sheet", "facts block")
+
+# Allowed ONLY when the retrieved documentation names it.
+#
+# `esco` was on the list above, and in a sentence about someone's results that
+# was right: there it is plumbing, and a person told their skills were "mapped to
+# ESCO" has been shown a word that explains nothing. But it is not an internal
+# identifier — it is a real, public vocabulary published by the EU, and
+# `docs/knowledge/how-it-works` names it because it is the honest answer to "how
+# does the matching actually work?".
+#
+# So the test is not the word, it is whether we showed it to the model. Named in
+# a retrieved passage, it may be repeated; otherwise the old rule stands and the
+# answer is rejected. Same principle as every other check here — the model may
+# say what it was shown.
+_FORBIDDEN_UNLESS_DOCUMENTED = ("esco",)
 
 # A card handle that leaked into user-facing prose.
 #
@@ -48,8 +67,21 @@ _HANDLE = re.compile(r"\[[JC]\d+\]")
 
 
 def _numbers(text: str) -> set[str]:
+    """Every figure in the text, as comparable tokens.
+
+    **Arabic-Indic digits are folded first**, and that is a fix rather than a
+    nicety. The regex digit class matches Unicode decimal digits, so a reply
+    written in Arabic numerals produced tokens the fact sheet could never hold:
+    the sheet is built in code and is always ASCII. Every figure in an Arabic
+    answer therefore read as invented, and the person silently received the
+    deterministic fallback instead of the answer they asked for. Measured
+    2026-08-21, before any of it reached a user.
+
+    `fold_digits` is the same helper Agent A's grounding and Agent B's legitimacy
+    scoring already use, for the same reason.
+    """
     out: set[str] = set()
-    for raw in _NUMBER.findall(text or ""):
+    for raw in _NUMBER.findall(fold_digits(text or "")):
         token = raw.replace(",", "")
         if "." in token:
             token = token.rstrip("0").rstrip(".")
@@ -214,14 +246,22 @@ def build_fact_sheet(*, readiness: Any, jobs: list[dict[str, Any]],
     return "\n".join(lines)
 
 
-def verify_answer(text: str, fact_sheet: str) -> Optional[str]:
+def verify_answer(text: str, fact_sheet: str, knowledge: str = "") -> Optional[str]:
     """Why this answer must not be published, or None if it may be.
+
+    `knowledge` is the documentation retrieved for this turn, and passing it
+    WIDENS the evidence set without changing the rule. The rule was never "only
+    the fact sheet" — it is "only what we actually showed the model", and from
+    here that includes passages we wrote, reviewed and version-controlled in
+    `docs/knowledge/`. Without this, a correct sentence built from the handbook
+    ("Itqan refreshes job postings every 12 hours") is rejected for stating a
+    figure nobody measured, and the person is told we could not answer.
 
     Two checks, both of which the record can settle:
 
-    1. **Every number must appear in the fact sheet.** A figure the model
-       produced that nobody measured is the failure mode this project has hit in
-       every agent that writes prose.
+    1. **Every number must appear in the fact sheet or the documentation.** A
+       figure the model produced that appears in NEITHER is the failure mode this
+       project has hit in every agent that writes prose.
     2. **No internal vocabulary.** `gap_score` in particular is scaled so that
        0.0 is the best possible result, so a user shown that number reads it
        backwards. Card handles count: `[J1]` is a pointer for the code that
@@ -239,11 +279,16 @@ def verify_answer(text: str, fact_sheet: str) -> Optional[str]:
         if token in lowered:
             return f"uses internal vocabulary: {token!r}"
 
+    documented = (knowledge or "").lower()
+    for token in _FORBIDDEN_UNLESS_DOCUMENTED:
+        if token in lowered and token not in documented:
+            return f"uses internal vocabulary: {token!r}"
+
     leaked = _HANDLE.search(text or "")
     if leaked:
         return f"names an internal card handle: {leaked.group(0)!r}"
 
-    invented = _numbers(text) - _numbers(fact_sheet)
+    invented = _numbers(text) - _numbers(fact_sheet) - _numbers(knowledge)
     if invented:
         return f"states figures not in the record: {', '.join(sorted(invented))}"
 

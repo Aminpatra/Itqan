@@ -24,6 +24,14 @@ class AssistantState(TypedDict, total=False):
     # never assembles this itself, because assembling it is where a scoping
     # mistake would be made.
     fact_sheet: str
+    # Passages from `docs/knowledge/` that the API layer retrieved for THIS
+    # question, or "" when nothing was close enough to be worth showing.
+    #
+    # Retrieved by the caller for the same reason the fact sheet is built there:
+    # this graph has no database and must not grow one. An empty string is a
+    # meaningful value — it says the documentation has nothing on this — and the
+    # prompt then carries no ABOUT block at all.
+    knowledge: str
     history: list[dict[str, Any]]
     has_results: bool
 

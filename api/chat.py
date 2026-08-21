@@ -259,6 +259,11 @@ def register(app: Any, *, require_user, assistant) -> None:
             result = assistant.graph_for(app).invoke({
                 "question": question_with_attachments(question, attachments),
                 "fact_sheet": fact_sheet,
+                # Retrieved on the RAW question, not the attachment-annotated
+                # one: "(attached: cv.pdf)" is noise to a similarity search and
+                # would drag the lookup away from what was actually asked.
+                "knowledge": assistant.knowledge_for(
+                    app, question, locale=user.get("locale") or "en"),
                 # THIS thread's turns, not the account's whole history: two
                 # conversations about different things must not bleed into each
                 # other's context.
