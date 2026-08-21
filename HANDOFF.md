@@ -113,10 +113,21 @@ fences him away from.
 **The model proposes, the user disposes, code executes.** Nothing a model returns spends a credit,
 starts a run, or reaches another user's data.
 
-**Never send mail to a reserved TLD from production.** `.test`, `.invalid`, `.example` and
-`.localhost` can never resolve, so each message is a guaranteed hard bounce charged against sender
-reputation. Enforced by `is_undeliverable` in `api/email.py` — added after roughly seven such bounces
-from test accounts preceded a delivery outage.
+**This box does not send mail unless it is production.** `shared/config.py` calls `load_dotenv()`
+unconditionally, so a developer machine and the test suite read the SAME relay credentials the live
+site uses. On **2026-08-20 one run of `tests/api` delivered ~200 messages** to `@itqan.test` through
+the live Brevo account: `signed_in` signs a user up, signup mails a code, and the fixture is
+function-scoped. Enforced in four independent places, because the previous single guard had a gap:
+
+| | |
+|---|---|
+| `mail_enabled()` in `api/email.py` | off unless `ITQAN_ENV=production`; `ITQAN_SMTP_ENABLED=1` forces it on for one deliberate run. Suppressed messages are logged (code included) so local signup stays walkable, and counted as `suppressed` on `/api/health` |
+| `is_undeliverable` in `api/email.py` | refuses reserved TLDs in **every** environment. It used to be gated on production, which is how the above was possible |
+| `tests/conftest.py` | blanks the relay env vars and patches `smtplib.SMTP.__init__` to fail the test. On the **constructor**, not the name: `send` calls `_RecordingSMTP`, a subclass bound at import, so patching the name would leave the socket open |
+| `relay` in `tests/api/conftest.py` | applied by the `client` fixture, so every file inherits it. It used to be a module-scoped autouse fixture, protecting two files out of twelve |
+
+`tests/test_no_mail_escapes_the_suite.py` pins all of it and lives at the top level deliberately —
+everything under `tests/api/` skips without a database, which is most runs.
 
 ## Hazards that cost real time
 

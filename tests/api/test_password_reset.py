@@ -23,18 +23,6 @@ EMAIL = "maryam@itqan.test"
 GOOD = "N3w!passw0rd"
 
 
-@pytest.fixture(autouse=True)
-def relay(monkeypatch):
-    """Capture what would have been sent instead of opening a socket.
-
-    Patched at `send`, not at `send_in_background`, so the threading and the
-    failure handling around it stay under test.
-    """
-    sent: list[dict] = []
-    monkeypatch.setattr("api.email.send",
-                        lambda **kw: sent.append(kw))
-    return sent
-
 
 def _forgot(client, email=EMAIL):
     return client.post("/api/auth/forgot-password", data={"email": email})

@@ -24,17 +24,6 @@ import pytest
 EMAIL = "maryam@itqan.test"
 
 
-@pytest.fixture(autouse=True)
-def relay(monkeypatch):
-    """Capture what would have been sent instead of opening a socket.
-
-    Patched at `send`, so the threading and failure handling around it stay under
-    test — the same seam `test_password_reset.py` uses.
-    """
-    sent: list[dict] = []
-    monkeypatch.setattr("api.email.send", lambda **kw: sent.append(kw))
-    return sent
-
 
 def _wait_for_mail(sent: list[dict], count: int = 1) -> None:
     deadline = time.time() + 3.0

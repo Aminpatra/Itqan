@@ -236,8 +236,32 @@ def store(dsn: str) -> AppStore:
 
 
 @pytest.fixture
+def relay(monkeypatch) -> list[dict]:
+    """Capture what would have been sent, instead of opening a socket.
+
+    **Wired into `client` below, so every test file gets it whether or not it
+    asks.** It used to live in two test modules as an autouse fixture, and a
+    module-scoped autouse fixture protects exactly that module: the other ten
+    files signed users up straight through the real mail path. On 2026-08-20 that
+    delivered ~200 messages to reserved-TLD addresses through the live Brevo
+    account, each one a hard bounce charged against the sender real users depend
+    on.
+
+    So protection stops being something a file has to opt into. `tests/conftest.py`
+    takes the socket away as the backstop; this is what keeps the sends readable
+    and assertable rather than merely blocked.
+
+    Patched at `send`, not at `send_in_background`, so the threading and the
+    failure handling around it stay under test.
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr("api.email.send", lambda **kw: sent.append(kw))
+    return sent
+
+
+@pytest.fixture
 def client(dsn: str, store: AppStore, runner: FakeRunner,
-           assistant_llm: "FakeAssistantLLM") -> TestClient:
+           assistant_llm: "FakeAssistantLLM", relay: list[dict]) -> TestClient:
     app = create_app(Config(database_url=dsn), store=store, runner=runner,
                      assistant_llm=assistant_llm, migrate=False)
     return TestClient(app)

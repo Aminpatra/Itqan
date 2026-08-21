@@ -22,6 +22,16 @@ hand-off — attempted, accepted, refused, failed — and nothing beyond it. The
 authority on whether a person received anything is the provider's own log, or a
 delivery webhook (see the note at the end of this module).
 
+**MAIL IS OFF UNLESS THIS IS PRODUCTION.** See `mail_enabled` below. Measured
+2026-08-20: one run of the API test suite delivered ~200 messages to reserved-TLD
+addresses through the live Brevo account, because `shared/config` calls
+`load_dotenv()` unconditionally and therefore a test run reads the SAME relay
+credentials the live site does. Nothing here was misconfigured -- there was simply
+no switch that said "this box does not send", and every guard that existed had
+been written on the assumption that local runs point somewhere harmless. They do
+not. A hard bounce is charged against the sender that real users' codes depend
+on, so the default had to become silence.
+
 **The token exists in this module and nowhere else it could linger.** It is
 interpolated into the message and never logged, never returned, and never stored
 — `AppStore` only ever sees its hash. The same rule governs the verification
@@ -50,6 +60,12 @@ log = logging.getLogger("itqan.email")
 SENDS_ATTEMPTED = 0
 SENDS_ACCEPTED = 0
 SENDS_REFUSED = 0
+# Messages this process deliberately did not send because sending is switched off
+# outside production. Kept separate from `refused` (the address cannot receive)
+# and from `failed` (the relay would not take it): all three mean "nothing went
+# out", and collapsing them would destroy the only distinction an operator cares
+# about -- whether the silence is chosen or broken.
+SENDS_SUPPRESSED = 0
 SEND_FAILURES = 0
 LAST_SEND_AT: Optional[str] = None
 _COUNTER_LOCK = threading.Lock()
@@ -68,8 +84,8 @@ def counters() -> dict:
     """
     with _COUNTER_LOCK:
         return {"attempted": SENDS_ATTEMPTED, "accepted": SENDS_ACCEPTED,
-                "refused": SENDS_REFUSED, "failed": SEND_FAILURES,
-                "lastSendAt": LAST_SEND_AT}
+                "refused": SENDS_REFUSED, "suppressed": SENDS_SUPPRESSED,
+                "failed": SEND_FAILURES, "lastSendAt": LAST_SEND_AT}
 
 
 # Reserved TLDs. The DNS root guarantees these never resolve (RFC 2606 / 6761),
@@ -146,6 +162,63 @@ def _in_production() -> bool:
     return os.getenv("ITQAN_ENV", "development").lower() == "production"
 
 
+def mail_enabled() -> bool:
+    """Whether this process may put a message on the wire at all.
+
+    **Off unless this is production, or someone has explicitly said otherwise.**
+
+    The reason is measured, not precautionary. `shared/config.py` calls
+    `load_dotenv()` unconditionally, so a developer machine and the test suite
+    read the SAME relay credentials the live site uses -- and on 2026-08-20 that
+    meant a single test run delivered ~200 messages to reserved-TLD addresses
+    through the production Brevo account, every one a hard bounce charged against
+    the sender that real users' verification codes depend on. Nothing in the code
+    was wrong on its own; there was simply no switch that said "this box does not
+    send".
+
+    Derived from `ITQAN_ENV` rather than requiring a new variable to be set in
+    production, DELIBERATELY: a switch that defaulted off everywhere would mean
+    the next API deploy quietly stopped mailing real users unless the VPS `.env`
+    were edited first, and this project has already had one outage from a deploy
+    landing ahead of its precondition. Nothing on the box has to change.
+
+    `ITQAN_SMTP_ENABLED=1` forces it on for the rare case of testing a real relay
+    deliberately -- and it must be typed by a person, on purpose, for that one run.
+    """
+    import os
+
+    if _in_production():
+        return True
+    return os.getenv("ITQAN_SMTP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _suppress(*, to: str, subject: str, body: str, purpose: str) -> None:
+    """Record a message that was not sent, and show it to whoever is running this.
+
+    **This is the one place the verification code is written to a log, and the
+    exception is deliberate rather than an oversight.** The rule everywhere else
+    in this module is that the code never appears in a log line, because six
+    digits is a working credential for its ten minutes. Here nothing is being
+    delivered, so the log is the ONLY way to walk a signup on a developer machine
+    -- and the alternative is reading it out of the database by hand, which is the
+    kind of friction that ends with someone switching real sending back on.
+
+    Production can never reach this branch: `mail_enabled()` is true there by
+    construction. So the rule stays absolute exactly where it protects anybody.
+    """
+    global SENDS_SUPPRESSED
+    with _COUNTER_LOCK:
+        SENDS_SUPPRESSED += 1
+    lines = [
+        "mail is OFF outside production, so this %s message was NOT sent.",
+        "  to:      %s",
+        "  subject: %s",
+        "%s",
+        "  (set ITQAN_SMTP_ENABLED=1 to send for real -- see mail_enabled)",
+    ]
+    log.info("\n".join(lines), purpose, to, subject, body)
+
+
 def send(*, to: str, subject: str, body: str, config: Optional[Config] = None,
          purpose: str = "email") -> None:
     """Send one plain-text message. Raises on failure; callers decide.
@@ -158,13 +231,36 @@ def send(*, to: str, subject: str, body: str, config: Optional[Config] = None,
     from datetime import datetime, timezone
 
     config = config or Config()
+
+    # Checked FIRST, ahead of both the relay check and the address check, and
+    # both orderings carry a reason.
+    #
+    # Ahead of `smtp_host`, so a machine with no relay configured shows the
+    # message instead of raising -- which is the normal state of a dev box now
+    # that the test suite blanks those variables.
+    #
+    # Ahead of `is_undeliverable`, so a local signup at `@itqan.test` -- which is
+    # exactly what a developer types -- still prints its code. Refusing it for a
+    # bounce that cannot happen when nothing is sent would make the local flow
+    # untestable, and an untestable local flow is what gets real sending switched
+    # back on.
+    if not mail_enabled():
+        _suppress(to=to, subject=subject, body=body, purpose=purpose)
+        return
+
     if not config.smtp_host:
         raise EmailNotConfigured("ITQAN_SMTP_HOST is not set")
 
     # Refused BEFORE the socket opens, so a guaranteed bounce never reaches the
-    # relay at all. Production only: local runs point at a sink that is happy to
-    # accept `@itqan.test`, and the offline suite must keep working.
-    if _in_production() and is_undeliverable(to):
+    # relay at all.
+    #
+    # This used to be gated on `_in_production()`, on the assumption that local
+    # runs point at a sink happy to accept `@itqan.test`. They do not: dev, tests
+    # and production all read the same `.env`, so the gate held the door open for
+    # the ~200 test-suite bounces of 2026-08-20. A reserved TLD cannot resolve on
+    # any host, in any environment, on any day -- the environment was never
+    # relevant to the fact, only to my assumption about the relay.
+    if is_undeliverable(to):
         with _COUNTER_LOCK:
             SENDS_REFUSED += 1
         log.error("REFUSED to send %s email to %s: that domain can never receive "
