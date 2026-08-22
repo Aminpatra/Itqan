@@ -50,9 +50,11 @@ def build_llm(config: Config | None = None, **overrides: Any) -> ChatOpenAI:
     # — see `max_output_tokens` for the measurement.
     if config.max_output_tokens > 0:
         params["max_tokens"] = config.max_output_tokens
-    # Only when set, because a model without a reasoning mode rejects it outright.
-    # Empty is the escape hatch for exactly that case — see `reasoning_effort`.
-    if config.reasoning_effort:
+    # Only when asked for, because a model without a reasoning mode rejects the
+    # parameter outright. `off` is the escape hatch for exactly that case; empty
+    # means "use the default", because compose delivers empty for every unset
+    # optional variable — see `env_or` in shared/config.py.
+    if config.reasoning_effort and config.reasoning_effort.strip().lower() != "off":
         params["reasoning_effort"] = config.reasoning_effort
     if config.api_base:
         params["base_url"] = config.api_base

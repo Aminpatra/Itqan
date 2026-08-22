@@ -141,7 +141,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # this is an agent, so the dependency is deliberate and worth being able to
     # see. Agents A-E do the same with their stores.
     from api import mapping
-    from api.assistant import day_start, gaps_from, quota_state
+    from api.assistant import day_start, gaps_from, limit_for, quota_state
     from api.db import AppStore
 
     store = AppStore(config.require_database_url())
@@ -190,7 +190,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _session(
             answer=answer, style=style, store=store, config=config, user=user,
             fact_sheet=fact_sheet, has_results=has_results,
-            quota_state=quota_state, day_start=day_start,
+            quota_state=quota_state, day_start=day_start, limit_for=limit_for,
             enforce_quota=args.enforce_quota, offline=args.no_llm,
             runner=runner,
         )
@@ -199,7 +199,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 def _session(*, answer, style: _Style, store: Any, config: Config, user: dict,
-             fact_sheet: str, has_results: bool, quota_state, day_start,
+             fact_sheet: str, has_results: bool, quota_state, day_start, limit_for,
              enforce_quota: bool, offline: bool, runner=None) -> int:
     """The conversation loop. Ends on Ctrl+C, Ctrl+D, or /quit — never on a
     traceback: an interrupted session should look like leaving a room, not like
@@ -271,11 +271,11 @@ def _session(*, answer, style: _Style, store: Any, config: Config, user: dict,
             continue
 
         if enforce_quota:
+            limit = limit_for(config, "message", user.get("email"))
             used = store.claim_quota(user["user_id"], kind="message",
-                                     limit=config.assistant_daily_messages,
+                                     limit=limit,
                                      period_start=day_start(config))
             if used is None:
-                limit = config.assistant_daily_messages
                 print(style.yellow(
                     f"  Daily limit reached ({limit}/{limit}). This is what a real "
                     f"user would see. Run without --enforce-quota to keep testing."))
@@ -314,7 +314,7 @@ def _rerun(store: Any, config: Config, user: dict, style: _Style, *, full: bool,
 
     Asking Agent S to "do it" in prose still does nothing, and that stays true.
     """
-    from api.assistant import week_start
+    from api.assistant import limit_for, week_start
     from api.jobs import spawn, spawn_phase_two
 
     quota = quota_state(store, config, user["user_id"], "rerun")
@@ -353,7 +353,7 @@ def _rerun(store: Any, config: Config, user: dict, style: _Style, *, full: bool,
         return
 
     used = store.claim_quota(user["user_id"], kind="rerun",
-                             limit=config.assistant_weekly_reruns,
+                             limit=limit_for(config, "rerun", user.get("email")),
                              period_start=week_start(config))
     if used is None:
         print(style.yellow("  No rerun credits left."))

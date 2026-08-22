@@ -158,6 +158,13 @@ a stale `origin/main`, and a fast-forward then swept in an unrelated tree.
 
 ## Open threads
 
+- **`ITQAN_UNLIMITED_EMAILS` must be set on the VPS**, or the developer accounts are rationed like
+  everyone else — 30 assistant messages a day and one re-run a week — and nothing says so. The list is
+  in the environment rather than the repository because this repo is public and committed personal
+  addresses are scrapeable for ever, including out of the history. The API logs how many accounts are
+  exempt at boot (the count, never the addresses), so `0 exempt` in the deploy log is the tell.
+  Exempt means a very high ceiling, not a bypass: `claim_quota` still runs and still counts, so what
+  testing costs stays measurable. It does **not** relax the outbound-mail rate limits, deliberately.
 - **The knowledge base must be loaded on every deployment**, and nothing does it automatically.
   `api/migrations/0010` creates the table on boot; `python main.py knowledge --ingest` fills it from
   `docs/knowledge/`. Until it is run, Agent S answers every question about Itqan itself with "I do not

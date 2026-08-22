@@ -174,6 +174,16 @@ def create_app(config: Optional[Config] = None, *,
     _configure_logging()
     # Before anything else, and before a single request can be served.
     assert_deployable()
+
+    # The COUNT, never the addresses.
+    #
+    # The exempt list lives in the environment so four personal addresses stay
+    # out of a public repository — and the cost of that is a variable the VPS can
+    # miss, whose symptom is developers quietly rationed again and nothing
+    # anywhere saying so. One line in the deploy log tells "3 exempt" from "0
+    # exempt" without publishing anyone.
+    if config.unlimited_emails:
+        log.info("quota exemptions active for %d account(s)", len(config.unlimited_emails))
     app = FastAPI(title="Itqan API", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
     if migrate:
@@ -755,13 +765,15 @@ def create_app(config: Optional[Config] = None, *,
             period = assistant_module.week_start(config)
             if app.state.store.claim_quota(
                     user["user_id"], kind="rerun",
-                    limit=config.assistant_weekly_reruns, period_start=period) is None:
+                    limit=assistant_module.limit_for(config, "rerun", user.get("email")),
+                    period_start=period) is None:
                 return JSONResponse(
                     {"error": "rerun_limit_reached",
                      "message": ("You have used your re-run for this week. It comes back "
                                  f"on {assistant_module.resets_at(config, kind='rerun')}."),
                      "usage": assistant_module.quota_state(
-                         app.state.store, config, user["user_id"], "rerun")},
+                         app.state.store, config, user["user_id"], "rerun",
+                         user.get("email"))},
                     status_code=429)
 
         run_id = _new_run_id()

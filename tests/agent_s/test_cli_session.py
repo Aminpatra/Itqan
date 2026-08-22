@@ -47,6 +47,18 @@ def quota_state(store, config, user_id, kind):
             "resetsAt": "2026-08-16T00:00:00+04:00"}
 
 
+def limit_for(config, kind, email=None):
+    # The real one raises the ceiling for developer accounts. Read from config
+    # for the same reason the stub above does: a fake that hard-codes the cap
+    # stops standing in for the real one the day the number changes.
+    from shared.config import Config as _C
+    if _C.is_unlimited(config, email):
+        return (config.unlimited_daily_messages if kind == "message"
+                else config.unlimited_weekly_reruns)
+    return (config.assistant_daily_messages if kind == "message"
+            else config.assistant_weekly_reruns)
+
+
 def day_start(config):
     from datetime import date
     return date(2026, 8, 15)
@@ -85,7 +97,7 @@ def session(inputs: list[Any], *, answers=None, answer=None, enforce_quota=False
             answer=record, style=cli._Style(False), store=store or FakeStore(),
             config=Config(), user={"full_name": "Maryam", "user_id": "u_1"},
             fact_sheet="Readiness score: 42/100", has_results=True,
-            quota_state=quota_state, day_start=day_start,
+            quota_state=quota_state, day_start=day_start, limit_for=limit_for,
             enforce_quota=enforce_quota, offline=False,
         )
         kwargs.update(over)

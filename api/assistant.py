@@ -94,13 +94,32 @@ def _period(config: Config, kind: str) -> date:
     return day_start(config) if kind == "message" else week_start(config)
 
 
-def _limit(config: Config, kind: str) -> int:
+def limit_for(config: Config, kind: str, email: Optional[str] = None) -> int:
+    """The ceiling for this account and this kind of quota.
+
+    **One function, read by both the claim and the number shown to the user.**
+    Raising only the claim would leave a developer looking at "0 of 30 remaining"
+    while their messages kept working — the product lying to the four people
+    most likely to believe it.
+
+    `email` must come from the session-resolved user row. See
+    `Config.is_unlimited`.
+    """
+    if config.is_unlimited(email):
+        return (config.unlimited_daily_messages if kind == "message"
+                else config.unlimited_weekly_reruns)
     return (config.assistant_daily_messages if kind == "message"
             else config.assistant_weekly_reruns)
 
 
-def quota_state(store: Any, config: Config, user_id: str, kind: str) -> dict[str, Any]:
-    limit = _limit(config, kind)
+# The old name, kept because it reads better where the account is irrelevant.
+def _limit(config: Config, kind: str) -> int:
+    return limit_for(config, kind)
+
+
+def quota_state(store: Any, config: Config, user_id: str, kind: str,
+                email: Optional[str] = None) -> dict[str, Any]:
+    limit = limit_for(config, kind, email)
     used = store.quota_used(user_id, kind=kind, period_start=_period(config, kind))
     return {"used": used, "limit": limit, "remaining": max(0, limit - used),
             "resetsAt": resets_at(config, kind=kind)}
@@ -271,8 +290,8 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
         user = require_user(request)
         config = _config()
         return {
-            "messages": quota_state(_store(), config, user["user_id"], "message"),
-            "reruns": quota_state(_store(), config, user["user_id"], "rerun"),
+            "messages": quota_state(_store(), config, user["user_id"], "message", user.get("email")),
+            "reruns": quota_state(_store(), config, user["user_id"], "rerun", user.get("email")),
         }
 
     @app.get("/api/assistant/messages")
@@ -299,17 +318,17 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
 
         period = day_start(config)
         used = store.claim_quota(user["user_id"], kind="message",
-                                 limit=config.assistant_daily_messages,
+                                 limit=limit_for(config, "message", user.get("email")),
                                  period_start=period)
         if used is None:
             # The spec's wording, and no part of the request is processed. The
             # model is not called; nothing is logged against the user.
-            limit = config.assistant_daily_messages
+            limit = limit_for(config, "message", user.get("email"))
             return JSONResponse(
                 {"error": "message_limit_reached",
                  "message": (f"You've reached today's message limit ({limit}/{limit}). "
                              f"It resets at {resets_at(config, kind='message')}."),
-                 "usage": quota_state(store, config, user["user_id"], "message")},
+                 "usage": quota_state(store, config, user["user_id"], "message", user.get("email"))},
                 status_code=429)
 
         try:
@@ -352,10 +371,10 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
             user_id=user["user_id"], role="assistant", content=answer,
             run_id=run_id, answer_source=result.get("answer_source") or "template")
 
-        rerun_quota = quota_state(store, config, user["user_id"], "rerun")
+        rerun_quota = quota_state(store, config, user["user_id"], "rerun", user.get("email"))
         payload: dict[str, Any] = {
             "answer": answer,
-            "usage": quota_state(store, config, user["user_id"], "message"),
+            "usage": quota_state(store, config, user["user_id"], "message", user.get("email")),
         }
         # Only ever a suggestion, and only offered when there is actually a
         # credit to spend — proposing something the user cannot do is worse than
@@ -405,7 +424,7 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
                              if mode == "match" else
                              "This will use your rerun credit for this week, re-read "
                              "your documents, and ask you to confirm the details again."),
-                 "usage": quota_state(store, config, user["user_id"], "rerun")},
+                 "usage": quota_state(store, config, user["user_id"], "rerun", user.get("email"))},
                 status_code=400)
 
         # Everything that makes a run impossible is checked BEFORE the credit is
@@ -440,14 +459,14 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
 
         period = week_start(config)
         used = store.claim_quota(user["user_id"], kind="rerun",
-                                 limit=config.assistant_weekly_reruns,
+                                 limit=limit_for(config, "rerun", user.get("email")),
                                  period_start=period)
         if used is None:
             return JSONResponse(
                 {"error": "rerun_limit_reached",
                  "message": (f"You have no rerun credits left. They reset at "
                              f"{resets_at(config, kind='rerun')}."),
-                 "usage": quota_state(store, config, user["user_id"], "rerun")},
+                 "usage": quota_state(store, config, user["user_id"], "rerun", user.get("email"))},
                 status_code=429)
 
         try:
@@ -485,4 +504,4 @@ def register(app: Any, *, require_user, jobs_module, mapping) -> None:
                 # Load-bearing for the caller's wording: a full rerun is NOT
                 # finished when this returns, it is waiting for a person.
                 "awaitingConfirmation": awaiting,
-                "usage": quota_state(store, config, user["user_id"], "rerun")}
+                "usage": quota_state(store, config, user["user_id"], "rerun", user.get("email"))}

@@ -221,7 +221,7 @@ def register(app: Any, *, require_user, assistant) -> None:
 
         period = assistant.day_start(config)
         used = store.claim_quota(user["user_id"], kind="message",
-                                 limit=config.assistant_daily_messages,
+                                 limit=assistant.limit_for(config, "message", user.get("email")),
                                  period_start=period)
 
         # Stored before the answer exists, so the question survives whatever
@@ -241,7 +241,7 @@ def register(app: Any, *, require_user, assistant) -> None:
             # scrollback still shows what they asked. It costs no message, and
             # `answer_source='limit'` keeps it countable rather than letting it
             # pass for a model answer.
-            limit = config.assistant_daily_messages
+            limit = assistant.limit_for(config, "message", user.get("email"))
             row = store.add_assistant_message(
                 user_id=user["user_id"], role="assistant", thread_id=thread_id,
                 answer_source="limit",
@@ -300,7 +300,7 @@ def register(app: Any, *, require_user, assistant) -> None:
         store.touch_thread(thread_id)
 
         out = message_out(row)
-        rerun_quota = assistant.quota_state(store, config, user["user_id"], "rerun")
+        rerun_quota = assistant.quota_state(store, config, user["user_id"], "rerun", user.get("email"))
         # A SUGGESTION, and only when there is genuinely a credit to spend —
         # proposing something the user cannot do is worse than not proposing it.
         # Nothing here spends anything: only POST /api/assistant/rerun with an

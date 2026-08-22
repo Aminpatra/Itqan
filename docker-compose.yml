@@ -103,6 +103,26 @@ services:
       # Where the emailed reset link points — the SITE, which owns the
       # forgot-password page, not this API's origin.
       ITQAN_SITE_URL: ${ITQAN_SITE_URL:?set ITQAN_SITE_URL in .env, e.g. https://itqan.example}
+
+      # Developer accounts exempt from the assistant's quotas. Optional, and
+      # empty by default so nobody is exempt unless the box says so.
+      #
+      # Listed here because THIS FILE ENUMERATES WHAT REACHES THE CONTAINER, and
+      # a variable that exists only in .env silently does not — which is exactly
+      # what happened to ITQAN_USER_AGENT above, where the crawler could not run
+      # on the box at all until it was added here.
+      ITQAN_UNLIMITED_EMAILS: ${ITQAN_UNLIMITED_EMAILS:-}
+
+      # The model, and how it is reached. All optional: unset, the defaults in
+      # shared/config.py apply and everything goes straight to OpenAI on the key
+      # above. Passed through so a model can be changed on the box after a
+      # bake-off without rebuilding an image, and so that pointing ITQAN_API_BASE
+      # at a gateway actually works rather than being quietly ignored.
+      ITQAN_MODEL: ${ITQAN_MODEL:-}
+      ITQAN_REASONING_EFFORT: ${ITQAN_REASONING_EFFORT:-}
+      ITQAN_MAX_OUTPUT_TOKENS: ${ITQAN_MAX_OUTPUT_TOKENS:-}
+      ITQAN_API_BASE: ${ITQAN_API_BASE:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     volumes:
       # Uploads and per-run artifacts. A named volume rather than an anonymous
       # one so `up -d --build` keeps them: phase two reads a file phase one wrote,

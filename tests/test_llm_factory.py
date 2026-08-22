@@ -63,8 +63,12 @@ def test_reasoning_effort_is_set_not_inherited():
 
 def test_reasoning_effort_can_be_disabled_for_a_model_without_one(monkeypatch):
     """A model with no reasoning mode rejects the parameter outright rather than
-    ignoring it, so there has to be a way to not send it."""
-    monkeypatch.setenv("ITQAN_REASONING_EFFORT", "")
+    ignoring it, so there has to be a way to not send it.
+
+    The sentinel is the word `off`, not an empty string: compose passes optional
+    variables as `${VAR:-}`, so empty arrives for every unset variable and must
+    mean "use the default" rather than "change the behaviour"."""
+    monkeypatch.setenv("ITQAN_REASONING_EFFORT", "off")
     llm = build_llm(Config())
     assert not getattr(llm, "reasoning_effort", None)
 
@@ -75,3 +79,26 @@ def test_the_gateway_is_off_unless_configured():
     config = Config()
     assert config.api_base == ""
     assert config.require_chat_key() == config.require_api_key()
+
+
+def test_an_empty_env_var_does_not_override_a_default(monkeypatch):
+    """THE compose trap, pinned.
+
+    `docker-compose.yml` passes optional variables through as `${VAR:-}`, so a
+    variable that is simply unset on the host arrives in the container as an
+    empty STRING. `os.getenv(name, default)` returns that empty string rather
+    than the default, which would have meant: every call naming an empty model,
+    reasoning silently disabled on every deploy, and `int("")` raising at import
+    so the API never booted at all.
+    """
+    for name in ("ITQAN_MODEL", "ITQAN_REASONING_EFFORT", "ITQAN_MAX_OUTPUT_TOKENS",
+                 "ITQAN_API_BASE", "ITQAN_UNLIMITED_EMAILS"):
+        monkeypatch.setenv(name, "")
+
+    config = Config()                      # must not raise
+    assert config.model == "gpt-5.6-luna"
+    assert config.reasoning_effort == "low"
+    assert config.max_output_tokens == 0
+    # These two read empty as "none", which is the right answer for both.
+    assert config.api_base == ""
+    assert config.unlimited_emails == ()

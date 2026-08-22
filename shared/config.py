@@ -47,6 +47,27 @@ warnings.filterwarnings("ignore", category=UserWarning, module="paddle.*")
 load_dotenv(PROJECT_ROOT / ".env")
 
 
+def env_or(name: str, default: str) -> str:
+    """An environment variable, treating empty as ABSENT rather than as a value.
+
+    `os.getenv(name, default)` returns "" when the variable exists and is empty,
+    which is not what any caller here means. It matters because
+    `docker-compose.yml` passes optional variables through as `${VAR:-}`, so an
+    unset variable on the host arrives in the container as an empty STRING — and
+    the defaults below would all be silently overridden by it.
+
+    Concretely, without this: `ITQAN_MODEL` becomes "" and every call names an
+    empty model; `ITQAN_REASONING_EFFORT` becomes "" and reasoning is disabled on
+    every deploy without anyone choosing that; and `int("")` on
+    `ITQAN_MAX_OUTPUT_TOKENS` raises at import, so the API does not boot at all.
+
+    Deliberately used only where empty is meaningless. `ITQAN_API_BASE` and
+    `ITQAN_UNLIMITED_EMAILS` read empty as "none", which is correct for both.
+    """
+    value = os.getenv(name)
+    return value if value is not None and value.strip() else default
+
+
 @dataclass
 class Config:
     """Tunables shared by every agent.
@@ -101,7 +122,7 @@ class Config:
     #
     # NOT tiered per agent: every candidate scored full marks on every probe, so
     # there is still no measured evidence a stronger model improves any output.
-    model: str = field(default_factory=lambda: os.getenv("ITQAN_MODEL", "gpt-5.6-luna"))
+    model: str = field(default_factory=lambda: env_or("ITQAN_MODEL", "gpt-5.6-luna"))
 
     # How hard the model thinks before answering, and it is set rather than
     # inherited on purpose: the GPT-5.6 family defaults to `medium`, which measured
@@ -112,10 +133,15 @@ class Config:
     # thousand calls: subsumption is the one genuinely judgement-shaped task here,
     # and it is where the newer models pulled ahead of the incumbent.
     #
-    # Empty string disables it entirely, which is what a model with no reasoning
-    # mode needs — it rejects the parameter outright rather than ignoring it.
+    # `off` disables it entirely, which is what a model with no reasoning mode
+    # needs — such a model rejects the parameter outright rather than ignoring it.
+    #
+    # A WORD rather than an empty string, because empty now means "use the
+    # default": docker-compose passes optional variables through as `${VAR:-}`,
+    # so an unset variable arrives as "" and would otherwise disable reasoning on
+    # every deploy without anyone choosing that. See `env_or`.
     reasoning_effort: str = field(
-        default_factory=lambda: os.getenv("ITQAN_REASONING_EFFORT", "low"))
+        default_factory=lambda: env_or("ITQAN_REASONING_EFFORT", "low"))
     temperature: float = 0.0
 
     # Where the CHAT model is served from. Empty = straight to OpenAI, which is
@@ -157,7 +183,7 @@ class Config:
     # puts a pre-authorising gateway in front of it — where it should be set from
     # that gateway's limits rather than from a guess about this system.
     max_output_tokens: int = field(
-        default_factory=lambda: int(os.getenv("ITQAN_MAX_OUTPUT_TOKENS", "0")))
+        default_factory=lambda: int(env_or("ITQAN_MAX_OUTPUT_TOKENS", "0")))
 
     # --- grounding thresholds (see shared/grounding.py) ---
     # >= grounded_threshold          -> accepted outright
@@ -507,6 +533,46 @@ class Config:
     # asking the model to respect them — see the module docstring there.
     assistant_daily_messages: int = 30
     assistant_weekly_reruns: int = 1
+
+    # Accounts that build this product, and therefore hit its limits while
+    # testing it rather than while using it.
+    #
+    # A comma-separated list of email addresses, from the environment and NOT
+    # from this file: the repository is public, and four personal addresses
+    # committed here would be scrapeable for ever, including out of the history
+    # after any later deletion.
+    #
+    # Unset — the default, and the state of every fresh clone and CI run — nobody
+    # is exempt and every limit behaves exactly as it does for a real user.
+    unlimited_emails: tuple[str, ...] = field(default_factory=lambda: tuple(
+        part.strip().casefold()
+        for part in os.getenv("ITQAN_UNLIMITED_EMAILS", "").split(",")
+        if part.strip()))
+
+    # What "unlimited" actually means: a ceiling too high to reach, not the
+    # absence of one.
+    #
+    # `claim_quota` still runs, so usage is still COUNTED for these accounts —
+    # which is what keeps "what did our own testing cost?" answerable, and is the
+    # thing a bypass would have thrown away. It also means a looping or
+    # compromised developer account meets a wall eventually instead of a bill.
+    unlimited_daily_messages: int = 10_000
+    unlimited_weekly_reruns: int = 1_000
+
+    def is_unlimited(self, email: Optional[str]) -> bool:
+        """Whether this account is exempt from the assistant's quotas.
+
+        **The address must come from the session-resolved user row, never from a
+        request.** That is the same rule every store method here follows — none of
+        them takes a user id from the request — and it is what stops "unlimited
+        access" being something a caller can simply ask for.
+
+        Exact match after casefolding, deliberately: a substring or suffix test
+        would make `someone@gmail.com.attacker.net` a developer account.
+        """
+        if not email or not self.unlimited_emails:
+            return False
+        return email.strip().casefold() in self.unlimited_emails
 
     # Quota periods are local days and weeks, NOT UTC ones. Telling a user in
     # Muscat that their quota resets at midnight and having it reset at 4am is a

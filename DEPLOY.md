@@ -87,6 +87,14 @@ Fill in `.env`:
 | `POSTGRES_PASSWORD` | anything long and random |
 | `ITQAN_SESSION_SECRET` | `python -c "import secrets;print(secrets.token_hex(32))"` |
 | `OPENAI_API_KEY` | your key |
+| `ITQAN_UNLIMITED_EMAILS` | comma-separated developer addresses, exempt from the assistant quotas |
+
+`ITQAN_UNLIMITED_EMAILS` is optional and easy to forget, and forgetting it is
+silent: the developers are simply rationed like everyone else — 30 assistant
+messages a day, one re-run a week — with nothing anywhere saying why. The API
+logs how many accounts are exempt at boot, so `0` in the deploy log is the tell.
+It lives in the environment rather than the repository because this repository is
+public and committed personal addresses stay scrapeable, history included.
 
 `ITQAN_SESSION_SECRET` is not optional: session cookies are
 `user_id.HMAC(secret, user_id)` and the development fallback is public in this

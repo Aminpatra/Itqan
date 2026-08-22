@@ -48,6 +48,18 @@ os.environ["ITQAN_USER_AGENT"] = "ItqanTestBot/0.0 (+tests@itqan.invalid)"
 # 1. Blank the relay settings, for the same reason and by the same mechanism as
 #    the user agent above: `load_dotenv` does not override an existing variable,
 #    so this beats .env on every machine including this one.
+# Nobody is exempt from a quota during a test run.
+#
+# `ITQAN_UNLIMITED_EMAILS` lists the developer accounts that skip the assistant's
+# limits, and a developer's own `.env` supplies it. Left alone, a test asserting
+# "a new account gets 30 messages" would pass or fail depending on whose laptop
+# it ran on -- the same defect this file already fixes for the user agent, and
+# the reason that comment says a suite depending on an untracked file is not
+# telling you what you think it is.
+#
+# Any test that WANTS an exemption sets it explicitly with monkeypatch.
+os.environ["ITQAN_UNLIMITED_EMAILS"] = ""
+
 for _smtp in ("ITQAN_SMTP_HOST", "ITQAN_SMTP_USER", "ITQAN_SMTP_PASSWORD",
               "ITQAN_SMTP_FROM"):
     os.environ[_smtp] = ""
