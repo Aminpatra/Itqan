@@ -135,24 +135,29 @@ class Config:
     # vectors from both paths.
     api_base: str = field(default_factory=lambda: os.getenv("ITQAN_API_BASE", ""))
 
-    # A ceiling on generated tokens, and it is not only a cost control.
+    # A ceiling on generated tokens. **0 means no ceiling, and that is the
+    # default, because capping this cost a real user their transcript skills.**
     #
-    # We never set this, so each call inherited the model's entire output window —
-    # 65,536 tokens on Gemini 3.7 Flash. Direct to OpenAI that is invisible,
-    # because you are billed for what is produced. A GATEWAY PRE-AUTHORISES
-    # AGAINST THE RESERVATION: measured 2026-08-21, every OpenRouter call was
-    # refused 402 "you requested up to 65536 tokens, but can only afford 10666"
-    # while the account had credit and the real answers are a few hundred tokens.
+    # The cap was introduced for a gateway, not for this system: OpenRouter
+    # PRE-AUTHORISES against the reservation rather than billing what is produced,
+    # so an uncapped call was refused 402 "you requested up to 65536 tokens, but
+    # can only afford 10666" while the account had credit. 8192 looked generous —
+    # ordinary calls here produce a few hundred tokens.
     #
-    # 8192 is sized on the largest thing this system legitimately generates: Agent
-    # B splitting a roundup posting into one record per vacancy, and the biggest
-    # roundup in this corpus held 38 of them. Ordinary calls are an order of
-    # magnitude below it.
+    # Then, measured 2026-08-22 on a real CV and transcript: Agent A's coursework
+    # derivation consumed the ENTIRE 8192 on reasoning alone
+    # (`completion_tokens=8192, reasoning_tokens=8192`), produced nothing
+    # parseable, and fell open — so 15 skills the transcript evidenced silently
+    # did not reach the profile. The user noticed; nothing else did.
     #
-    # If something ever does exceed it the structured output is truncated and
-    # fails to parse, which Agent B's per-posting error boundary counts and
-    # reports — one posting lost and visible, rather than a silent short answer.
-    max_output_tokens: int = 8192
+    # Reasoning tokens count against this limit, so a ceiling sized on OUTPUT is
+    # sized on the wrong quantity, and the amount of reasoning is not knowable in
+    # advance. Direct to OpenAI there is nothing to buy by guessing: usage is
+    # billed as produced. So the default is off, and the knob stays for whoever
+    # puts a pre-authorising gateway in front of it — where it should be set from
+    # that gateway's limits rather than from a guess about this system.
+    max_output_tokens: int = field(
+        default_factory=lambda: int(os.getenv("ITQAN_MAX_OUTPUT_TOKENS", "0")))
 
     # --- grounding thresholds (see shared/grounding.py) ---
     # >= grounded_threshold          -> accepted outright

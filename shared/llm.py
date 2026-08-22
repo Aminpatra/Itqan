@@ -44,11 +44,12 @@ def build_llm(config: Config | None = None, **overrides: Any) -> ChatOpenAI:
         "temperature": config.temperature,
         # The CHAT key, which is not necessarily the embedding key any more.
         "api_key": config.require_chat_key(),
-        # Bounded deliberately — see `max_output_tokens`. Unset, every call
-        # reserves the model's whole output window, which a gateway charges
-        # against up front even though the answer is a few hundred tokens.
-        "max_tokens": config.max_output_tokens,
     }
+    # Only when someone asked for a ceiling. Capping this by default truncated
+    # Agent A's coursework derivation mid-reasoning and cost a profile 15 skills
+    # — see `max_output_tokens` for the measurement.
+    if config.max_output_tokens > 0:
+        params["max_tokens"] = config.max_output_tokens
     # Only when set, because a model without a reasoning mode rejects it outright.
     # Empty is the escape hatch for exactly that case — see `reasoning_effort`.
     if config.reasoning_effort:
