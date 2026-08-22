@@ -61,36 +61,98 @@ class Config:
     threaded through every factory.
     """
 
-    # Chosen on measurement, 2026-07-29, by running THIS system's real prompts and
-    # schemas (n=5) rather than on reputation. Two probes, both places where a
-    # silent failure is expensive: Agent C's subsumption boundary (TensorFlow
-    # satisfies "machine learning", JavaScript does NOT satisfy Java) and Agent
-    # D's canonical-naming fold ("MS Excel" -> excel, which is what stops the
-    # demand<->supply join fragmenting).
+    # Chosen on measurement, re-run 2026-08-21 with `python main.py bakeoff`.
+    # That command IS this comment's evidence and takes a minute — re-run it
+    # before changing this line, rather than trusting the table below to have
+    # aged well. The previous one was a year of model-generations out of date.
     #
-    #   model           canonical  subsumption  median   est. $/month
-    #   gpt-4o-mini       5/5         5/5        1.50s      1.41     (previous)
-    #   gpt-5.4-mini      5/5         5/5        0.93s      8.32     <- chosen
-    #   gpt-5.4           5/5         5/5        1.38s     27.74
-    #   gpt-5.4-nano      0/5         5/5        0.97s      2.26     disqualified
-    #   gpt-5-nano         -          5/5      12-19s        -       disqualified
+    # The probes are the failures this system has actually had: Agent D's
+    # canonical fold ("MS Excel" -> excel, which is what stops the demand<->supply
+    # join fragmenting), Agent C's subsumption boundary (TensorFlow satisfies
+    # "machine learning"; JavaScript does NOT satisfy Java), and — new this round,
+    # for a product that is half Arabic — extraction from an Arabic job ad, an
+    # Arabic CV whose values must still GROUND against the Arabic source, and Hud
+    # answering in Arabic without its own verifier rejecting the answer.
     #
-    # gpt-5.4-mini strictly dominates the previous default on both measurable
-    # axes — 1.6x faster, identical on every quality probe — for a price
-    # difference that is immaterial: the WHOLE system costs single-digit dollars
-    # a month, so speed and quality are the real axes, not price.
+    #   model         effort   probes  median   in/call  out  reasoning
+    #   gpt-5.4-mini  -        5/5      1.34s    1683    114      0      (previous)
+    #   gpt-5.6-luna  none     5/5      1.50s    1683    107      0
+    #   gpt-5.6-luna  low      5/5      1.42s    1683    129     20      <- chosen
+    #   gpt-5.6-luna  medium   5/5      2.76s    1683    201     86      (its default)
+    #   gemini-3.7-flash  -    5/5      3.85s      -       -      -      via OpenRouter
     #
-    # Two traps worth recording. `gpt-5.4-nano` is cheap and fast and fails the
-    # canonical rule 0/5, which would quietly undo an Agent D fix. And the
-    # GPT-5.0 generation's list price lies: `gpt-5-nano` is priced BELOW
-    # gpt-4o-mini yet cost 9.4x more per call, because it emitted 4,480 reasoning
-    # tokens across two trivial calls — billed at the output rate — and took
-    # 12-19s, which would turn a 1,335-course backfill into 4-7 hours.
+    # gpt-5.6-luna at `low` matches the incumbent's speed and every quality probe
+    # at roughly a QUARTER of the cost per call ($0.0005 vs $0.0018 on measured
+    # tokens at $0.20/$1.20 against $0.75/$4.50).
     #
-    # NOT tiered per agent: every candidate scored 5/5 on both probes, so there
-    # is no measured evidence a stronger model improves any output here.
-    model: str = field(default_factory=lambda: os.getenv("ITQAN_MODEL", "gpt-5.4-mini"))
+    # Gemini 3.7 Flash was tried because the Arabic benchmark rankings favour it
+    # and this bake-off had never tested Arabic. It passed everything, including
+    # 6/6 grounded values from an Arabic CV — and beat nothing, at 2.7x the
+    # latency. Recorded so it is not re-litigated: the Arabic advantage did not
+    # survive contact with this system's own Arabic tasks.
+    #
+    # Two traps still worth recording. `gpt-5.4-nano` fails the canonical rule
+    # 0/5, which would quietly undo an Agent D fix. And list price lies for
+    # reasoning models: `gpt-5-nano` was priced BELOW gpt-4o-mini yet cost 9.4x
+    # more per call on 4,480 reasoning tokens across two trivial calls, billed at
+    # the output rate, at 12-19s each — which is why the table above measures
+    # tokens rather than quoting a rate, and why `reasoning_effort` is set here
+    # instead of inherited.
+    #
+    # NOT tiered per agent: every candidate scored full marks on every probe, so
+    # there is still no measured evidence a stronger model improves any output.
+    model: str = field(default_factory=lambda: os.getenv("ITQAN_MODEL", "gpt-5.6-luna"))
+
+    # How hard the model thinks before answering, and it is set rather than
+    # inherited on purpose: the GPT-5.6 family defaults to `medium`, which measured
+    # 2.76s and 86 reasoning tokens per call against `low`'s 1.42s and 20 — twice
+    # the latency and four times the reasoning, for identical probe results.
+    #
+    # `low` over `none` is a hedge that costs about two hundredths of a cent per
+    # thousand calls: subsumption is the one genuinely judgement-shaped task here,
+    # and it is where the newer models pulled ahead of the incumbent.
+    #
+    # Empty string disables it entirely, which is what a model with no reasoning
+    # mode needs — it rejects the parameter outright rather than ignoring it.
+    reasoning_effort: str = field(
+        default_factory=lambda: os.getenv("ITQAN_REASONING_EFFORT", "low"))
     temperature: float = 0.0
+
+    # Where the CHAT model is served from. Empty = straight to OpenAI, which is
+    # the behaviour every existing install already has, so this is inert until
+    # somebody sets it.
+    #
+    # Set to https://openrouter.ai/api/v1 it reaches any model OpenRouter serves,
+    # and `model` becomes a `provider/model` id like `google/gemini-3.7-flash`.
+    # No second SDK and no provider dispatch: OpenRouter speaks the OpenAI API, so
+    # `ChatOpenAI` is already the right client.
+    #
+    # EMBEDDINGS DELIBERATELY DO NOT FOLLOW THIS. `embedding_model` is schema, not
+    # a tunable, and a gateway that returned even slightly different vectors would
+    # not raise anything — it would leave every similarity score, and the near-dup
+    # threshold that decides whether two postings are the same job, quietly
+    # meaning something else. They move only once identity is proven by comparing
+    # vectors from both paths.
+    api_base: str = field(default_factory=lambda: os.getenv("ITQAN_API_BASE", ""))
+
+    # A ceiling on generated tokens, and it is not only a cost control.
+    #
+    # We never set this, so each call inherited the model's entire output window —
+    # 65,536 tokens on Gemini 3.7 Flash. Direct to OpenAI that is invisible,
+    # because you are billed for what is produced. A GATEWAY PRE-AUTHORISES
+    # AGAINST THE RESERVATION: measured 2026-08-21, every OpenRouter call was
+    # refused 402 "you requested up to 65536 tokens, but can only afford 10666"
+    # while the account had credit and the real answers are a few hundred tokens.
+    #
+    # 8192 is sized on the largest thing this system legitimately generates: Agent
+    # B splitting a roundup posting into one record per vacancy, and the biggest
+    # roundup in this corpus held 38 of them. Ordinary calls are an order of
+    # magnitude below it.
+    #
+    # If something ever does exceed it the structured output is truncated and
+    # fails to parse, which Agent B's per-posting error boundary counts and
+    # reports — one posting lost and visible, rather than a silent short answer.
+    max_output_tokens: int = 8192
 
     # --- grounding thresholds (see shared/grounding.py) ---
     # >= grounded_threshold          -> accepted outright
@@ -610,12 +672,42 @@ class Config:
         return max(2, int(self.stats_retention_windows))
 
     def require_api_key(self) -> str:
+        """The EMBEDDING key, and it is deliberately still OpenAI's.
+
+        Agent C calls this for embeddings and never builds a chat model at all,
+        so it must not be made to demand a gateway key it has no use for.
+        """
         key = os.getenv("OPENAI_API_KEY")
         if not key:
             raise RuntimeError(
                 "OPENAI_API_KEY is not set. Copy .env.example to .env and fill it in."
             )
         return key
+
+    def require_chat_key(self) -> str:
+        """The key for whatever serves `model`, which may not be OpenAI any more.
+
+        With `ITQAN_API_BASE` pointed at OpenRouter this is `OPENROUTER_API_KEY`;
+        unset, it falls back to `OPENAI_API_KEY` and nothing about a existing
+        install changes.
+
+        Separate from `require_api_key` because embeddings and chat stopped being
+        the same purchase. `embedding_model` is schema — every vector in
+        `job_postings`, `courses`, `esco_labels` and `app_knowledge_chunks` was
+        written by it, and vectors from different models are not comparable — so
+        the chat model can move while embeddings stay exactly where they are.
+        """
+        if self.api_base:
+            key = os.getenv("OPENROUTER_API_KEY") or os.getenv("ITQAN_CHAT_API_KEY")
+            if not key:
+                raise RuntimeError(
+                    f"ITQAN_API_BASE is set to {self.api_base!r} but no key for it is. "
+                    "Set OPENROUTER_API_KEY (or ITQAN_CHAT_API_KEY). Without it the "
+                    "assistant answers from its deterministic template and looks "
+                    "perfectly healthy while doing it."
+                )
+            return key
+        return self.require_api_key()
 
     def require_database_url(self) -> str:
         if not self.database_url:

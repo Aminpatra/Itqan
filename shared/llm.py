@@ -5,6 +5,13 @@ The only subtlety here is ``structured``. Our schemas are deliberately
 whole anti-hallucination mechanism. OpenAI's strict ``json_schema`` mode is picky
 about optional-with-default fields, so we fall back to function calling rather
 than letting a schema quirk take down the run.
+
+**That fallback matters more now that the model may not be OpenAI's.** With
+``Config.api_base`` pointed at a gateway, ``model`` can name any provider's model,
+and how faithfully each one honours a JSON schema is exactly the thing that
+varies. Every LLM call in this system except Agent E's rationale is structured, so
+a model that cannot be constrained is not a degraded model here — it is an
+unusable one, which is why the last line raises rather than returning prose.
 """
 
 from __future__ import annotations
@@ -20,12 +27,34 @@ TSchema = TypeVar("TSchema", bound=BaseModel)
 
 
 def build_llm(config: Config | None = None, **overrides: Any) -> ChatOpenAI:
+    """The chat model, from OpenAI or from a gateway that speaks its API.
+
+    `ChatOpenAI` regardless, and that is the point rather than a shortcut:
+    OpenRouter is OpenAI-API-shaped, so pointing `base_url` at it reaches any
+    model it serves — `google/gemini-3.7-flash`, a Claude, anything — without a
+    second SDK, a provider registry, or a prefix parser. Trying a different model
+    becomes one config value, which is what makes a bake-off cheap enough to
+    actually re-run.
+
+    With `api_base` unset this is byte-for-byte the previous behaviour.
+    """
     config = config or Config()
-    config.require_api_key()
     params: dict[str, Any] = {
         "model": config.model,
         "temperature": config.temperature,
+        # The CHAT key, which is not necessarily the embedding key any more.
+        "api_key": config.require_chat_key(),
+        # Bounded deliberately — see `max_output_tokens`. Unset, every call
+        # reserves the model's whole output window, which a gateway charges
+        # against up front even though the answer is a few hundred tokens.
+        "max_tokens": config.max_output_tokens,
     }
+    # Only when set, because a model without a reasoning mode rejects it outright.
+    # Empty is the escape hatch for exactly that case — see `reasoning_effort`.
+    if config.reasoning_effort:
+        params["reasoning_effort"] = config.reasoning_effort
+    if config.api_base:
+        params["base_url"] = config.api_base
     params.update(overrides)
     return ChatOpenAI(**params)
 

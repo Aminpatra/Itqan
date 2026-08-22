@@ -148,6 +148,20 @@ def _configure_logging() -> None:
     logger.propagate = False
 
 
+def _has_chat_key(config: Config) -> bool:
+    """Whether a chat model can be built at all, without raising if it cannot.
+
+    `require_chat_key` is the loud version and is right everywhere a model is
+    actually needed. Here the absence is a legitimate state — an API that only
+    serves the dashboard should boot — so this asks rather than demands.
+    """
+    try:
+        config.require_chat_key()
+        return True
+    except RuntimeError:
+        return False
+
+
 def create_app(config: Optional[Config] = None, *,
                store: Optional[AppStore] = None,
                runner: Optional[jobs_module.PipelineRunner] = None,
@@ -179,7 +193,11 @@ def create_app(config: Optional[Config] = None, *,
     # 'template', so a key that silently stops working is visible in one query
     # instead of looking like a model that got terser.
     app.state.assistant_llm = assistant_llm
-    if assistant_llm is None and os.getenv("OPENAI_API_KEY"):
+    # The CHAT key, which stopped being the same as the embedding key when the
+    # model moved behind a gateway. Gating this on OPENAI_API_KEY would mean an
+    # install with only an OpenRouter key silently never builds a model — and
+    # this particular failure is designed to look healthy, so nothing would say so.
+    if assistant_llm is None and _has_chat_key(config):
         from agents.agent_s_assistant.schemas import AssistantReply
         from shared.llm import build_llm, structured
         app.state.assistant_llm = structured(build_llm(config), AssistantReply)

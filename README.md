@@ -724,6 +724,30 @@ source, or a drop in ESCO coverage all show up here, and each of them moves the 
 
 ---
 
+## Choosing the model
+
+The model is picked by measurement, not reputation, and the command that does it is committed:
+
+```bash
+python main.py bakeoff                       # the current model plus this round's candidates
+python main.py bakeoff --effort none,low,medium
+```
+
+It builds the real chains — the same `prompt | structured(llm, Schema)` every agent builds — and runs
+the failures this system has actually had: Agent D's canonical fold (`MS Excel` → `excel`), Agent C's
+subsumption boundary (TensorFlow satisfies "machine learning"; JavaScript does **not** satisfy Java),
+extraction from an Arabic job ad, an Arabic CV whose values must still ground against the Arabic
+source, and Hud answering in Arabic without its own verifier rejecting the answer.
+
+It reports **tokens, including reasoning tokens** — not a rate card. That distinction is why the
+column exists: `gpt-5-nano` was priced below gpt-4o-mini and cost 9.4× more per call, on reasoning
+nobody asked for.
+
+The chosen model and the table that chose it live together in `shared/config.py`. Re-run the command
+before changing that line; the previous table went a year of model-generations stale.
+
+---
+
 ## The assistant's knowledge base
 
 Agent S answers questions about a person's own results from a fact sheet, and questions about **Itqan
